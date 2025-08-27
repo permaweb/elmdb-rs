@@ -21,7 +21,7 @@
 -export([list/2]).
 
 %% Pattern matching operations
--export([match/2]).
+-export([match_prefix/2, match/2]).
 
 
 %% NIF loading
@@ -189,6 +189,11 @@ list(_DBInstance, _Key) ->
 %%% Pattern Matching Operations
 %%%===================================================================
 
+-spec match_prefix(DBInstance :: term(), Pattern :: binary()) -> 
+    {ok, [binary()]} | not_found | {error, term(), binary()}.
+match_prefix(_DBInstance, _Patterns) ->
+    erlang:nif_error(nif_not_loaded).
+
 %% @doc Match database entries against a set of key-value patterns
 %% @param DBInstance Database handle
 %% @param Patterns List of {KeySuffix, Value} tuples to match against
@@ -204,10 +209,10 @@ list(_DBInstance, _Key) ->
 -spec match(DBInstance :: term(), Patterns :: [{binary(), binary()}]) -> 
     {ok, [binary()]} | not_found | {error, term(), binary()}.
 match(DBInstance, Patterns) ->
-    match_pattern(DBInstance, Patterns).
+    match_suffixes(DBInstance, Patterns).
 
-%% Internal NIF stub for match_pattern
-match_pattern(_DBInstance, _Patterns) ->
+%% Internal NIF stub for match_suffixes
+match_suffixes(_DBInstance, _Patterns) ->
     erlang:nif_error(nif_not_loaded).
 
 %% @doc Explicitly flush any buffered writes to disk

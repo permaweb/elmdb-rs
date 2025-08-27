@@ -650,3 +650,40 @@ match_concurrent_test_() ->
                  end)
          ]
      end}.
+
+%%%===================================================================
+%%% Match Prefix Tests
+%%%===================================================================
+
+match_prefix_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     % Setup test data
+                     ok = elmdb:put(DB, <<"abc">>, <<"value1">>),
+                     ok = elmdb:put(DB, <<"group:123">>, <<>>),
+                     ok = elmdb:put(DB, <<"users/alice/name">>, <<"Alice">>),
+                     ok = elmdb:put(DB, <<"users/bob/name">>, <<"Bob">>),
+                     ok = elmdb:put(DB, <<"users/charlie/name">>, <<"Charlie">>),
+                     ok = elmdb:flush(DB),
+                     
+                     % Test 1: returns not_found on prefix mismatch
+                     ?assertEqual(not_found, elmdb:match_prefix(DB, <<"nonexistent">>)),
+                     
+                     % Test 2: returns a single key
+                     {ok, SingleResult} = elmdb:match_prefix(DB, <<"group:">>),
+                     ?assertEqual([<<"group:123">>], SingleResult),
+
+                     ok = elmdb:put(DB, <<"group:345">>, <<>>),
+                     ok = elmdb:put(DB, <<"group:234">>, <<>>),
+                     ok = elmdb:flush(DB),
+                     
+                     % Test 3: returns 3 matching keys
+                     {ok, MultipleResult} = elmdb:match_prefix(DB, <<"group:">>),
+                     ?assertEqual([<<"group:123">>, <<"group:234">>, <<"group:345">>], MultipleResult)
+                 end)
+         ]
+     end}.
