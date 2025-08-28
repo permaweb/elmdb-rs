@@ -209,10 +209,10 @@ match_prefix(_DBInstance, _Patterns) ->
 -spec match(DBInstance :: term(), Patterns :: [{binary(), binary()}]) -> 
     {ok, [binary()]} | not_found | {error, term(), binary()}.
 match(DBInstance, Patterns) ->
-    match_suffixes(DBInstance, Patterns).
+    match_pattern(DBInstance, Patterns).
 
-%% Internal NIF stub for match_suffixes
-match_suffixes(_DBInstance, _Patterns) ->
+%% Internal NIF stub for match_pattern
+match_pattern(_DBInstance, _Patterns) ->
     erlang:nif_error(nif_not_loaded).
 
 %% @doc Explicitly flush any buffered writes to disk

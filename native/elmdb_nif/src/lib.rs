@@ -792,18 +792,16 @@ fn list<'a>(
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
     
+    let prefix_bytes = key_prefix.as_slice();
+    
     // Only flush write buffer if there are pending writes
     if db_handle.has_pending_writes() {
         if let Err(error_msg) = db_handle.force_flush_buffer() {
             return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
         }
     }
-
-    // Return not_found if key_prefix is empty
-    if key_prefix.is_empty() {
-        return Ok(atoms::not_found().encode(env));
-    }
-
+    
+    // Create a read-only transaction
     let txn = match (*db_handle).env.env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
@@ -818,21 +816,30 @@ fn list<'a>(
             return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
         }
     };
-
-    // Check if cursor is positioned at the prefix
-    let prefix_bytes = key_prefix.as_slice();
-    if cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_err() {
-        return Ok(atoms::not_found().encode(env));
-    }
+    
     // OPTIMIZATION: Use Vec instead of HashSet for better performance with small collections
     // Pre-allocate with reasonable capacity to avoid reallocations
     let mut children = Vec::with_capacity(64);
     let prefix_len = prefix_bytes.len();
     
     // OPTIMIZATION: Start cursor at prefix position instead of scanning from beginning
+    // This dramatically reduces iterations for sparse data
+    
+    // Safe iteration approach that handles empty databases and missing prefixes
+    // First, try to position cursor at prefix using MDB_SET_RANGE to check if key exists
+    // First, try to position cursor at prefix using MDB_SET_RANGE to check if key exists
+    let cursor_positioned = cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok();
+    
+    if !cursor_positioned {
+        // No keys >= prefix exist, return not_found immediately
+        return Ok(atoms::not_found().encode(env));
+    }
+    
     // Keys exist that are >= prefix, now safely use iter_from
+    let cursor_iter = cursor.iter_from(prefix_bytes);
+    
     // Iterate through keys starting from the prefix
-    for (key, _value) in cursor.iter_from(prefix_bytes) {
+    for (key, _value) in cursor_iter {
         
         // OPTIMIZATION: Early termination - if key doesn't start with prefix and we've already
         // found matches, we can break since keys are sorted
@@ -974,7 +981,7 @@ fn match_prefix<'a>(
 }
 
 #[rustler::nif]
-fn match_suffixes<'a>(
+fn match_pattern<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
     patterns: Vec<(Binary, Binary)>
@@ -1001,21 +1008,23 @@ fn match_suffixes<'a>(
             return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
         }
     }
-        
+    
+    // Create a read-only transaction
     let txn = match (*db_handle).env.env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
             return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
         }
     };
-
+    
+    // Open a cursor for the database
     let mut cursor = match txn.open_ro_cursor((*db_handle).db) {
         Ok(cursor) => cursor,
         Err(_) => {
             return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
         }
     };
-
+    
     // Data structures for tracking matches
     const MAX_RESULTS: usize = 100000;  // Reasonable limit to prevent unbounded memory growth
     let mut matching_ids: Vec<Vec<u8>> = Vec::new();
@@ -1029,7 +1038,7 @@ fn match_suffixes<'a>(
         // Parse key to extract ID and suffix
         // Find the position of the last '/' to extract the ID and suffix
         let last_slash_pos = key_bytes.iter().rposition(|&b| b == b'/');
-
+        
         let (id, suffix) = if let Some(pos) = last_slash_pos {
             // Has hierarchy - split into ID and suffix
             let id = key_bytes[..pos].to_vec();
@@ -1079,14 +1088,15 @@ fn match_suffixes<'a>(
         Ok(atoms::not_found().encode(env))
     } else {
         // Convert matching IDs to Erlang binaries
-        let mut ids_list = Vec::with_capacity(matching_ids.len());
+        let mut result_binaries = Vec::with_capacity(matching_ids.len());
         for id in matching_ids {
-            let mut binary = OwnedBinary::new(id.len()).ok_or(Error::BadArg)?;
-            binary.clone_from_slice(&id);
-            ids_list.push(binary.release(env));
+            let mut binary = OwnedBinary::new(id.len())
+                .ok_or(Error::BadArg)?;
+            binary.as_mut_slice().copy_from_slice(&id);
+            result_binaries.push(binary.release(env));
         }
-
-        Ok((atoms::ok(), ids_list).encode(env))
+        
+        Ok((atoms::ok(), result_binaries).encode(env))
     }
 }
 
