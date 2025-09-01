@@ -120,6 +120,66 @@ list_operations_test_() ->
      end}.
 
 %%%===================================================================
+%%% Iteration Operation Tests  
+%%%===================================================================
+
+iterate_start_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                    elmdb:put(DB, <<"key_before">>, <<"some_value">>),
+                    KVList = [
+                         {<<"users/bill/name">>, <<"Bill">>},
+                         {<<"users/bill/email">>, <<"bill@example.com">>},
+                         {<<"users/Ann/name">>, <<"Ann">>},
+                         {<<"users/Ann/email">>, <<"ann@example.com">>}
+                     ],
+                    elmdb:put(DB, <<"key_after">>, <<"some_value">>),
+                     % Setup hierarchical data
+                     lists:foreach(fun({Key, Value}) ->
+                         ok = elmdb:put(DB, Key, Value)
+                     end, KVList),
+                     elmdb:flush(DB),
+                     {ok, {Users, Continuation}} = elmdb:iterate_start(DB, <<"users">>, 100),
+                     ?assertEqual(lists:sort(KVList), Users),
+                     ?assertEqual(Continuation, not_found)
+                 end)
+         ]
+     end}.
+
+iterate_cont_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     % Setup hierarchical data
+                     AllKV = 
+                        lists:map(fun(Index) ->
+                            IndexBin = list_to_binary(io_lib:format("~3..0B", [Index])),
+                            Key = <<"users/user_", IndexBin/binary>>,
+                            Value = <<"User ", IndexBin/binary>>,
+                            ok = elmdb:put(DB, Key, Value),
+                            {Key, Value}
+                        end, lists:seq(1, 200)),
+                    {KVList1, KVList2} = lists:split(100, AllKV),
+                     elmdb:flush(DB),
+                     {ok, {Users1, Continuation1}} = elmdb:iterate_start(DB, <<"">>, 100),
+                     ?assertEqual(hd(Users1), hd(KVList1)),
+                     ?assertEqual(lists:last(Users1), lists:last(KVList1)),
+                     ?assertEqual(KVList1, Users1),
+                     {ok, {Users2, Continuation2}} = elmdb:iterate_cont(DB, Continuation1, 100),
+                     ?assertEqual(KVList2, Users2),
+                     ?assertEqual(Continuation2, not_found)
+                 end)
+         ]
+     end}.
+
+%%%===================================================================
 %%% Error Handling Tests
 %%%===================================================================
 
