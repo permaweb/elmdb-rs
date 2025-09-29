@@ -147,6 +147,18 @@ pub struct LmdbDatabase {
     closed: Arc<Mutex<bool>>,
 }
 
+/// LMDB Iterator resource
+pub struct LmdbIterator {
+    /// Reference to the database
+    db_handle: ResourceArc<LmdbDatabase>,
+    /// Current key position (None means start of iteration)  
+    current_key: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Key prefix for filtering (empty means no prefix)
+    key_prefix: Vec<u8>,
+    /// Flag indicating if iterator has been closed
+    closed: Arc<Mutex<bool>>,
+}
+
 // Global registry of open environments
 // 
 // Ensures that each directory path has at most one environment open,
@@ -160,8 +172,11 @@ lazy_static::lazy_static! {
 /// 
 /// Registers resource types with the Erlang runtime.
 /// This function is called automatically when the NIF is loaded.
+#[allow(non_local_definitions)]
 fn init(env: Env, _info: Term) -> bool {
-    rustler::resource!(LmdbEnv, env) && rustler::resource!(LmdbDatabase, env)
+    rustler::resource!(LmdbEnv, env) && 
+    rustler::resource!(LmdbDatabase, env) && 
+    rustler::resource!(LmdbIterator, env)
 }
 
 ///===================================================================
@@ -917,6 +932,7 @@ fn list<'a>(
     
     Ok((atoms::ok(), result_binaries).encode(env))
 }
+
 #[rustler::nif]
 fn iterate_from<'a>(
     env: Env<'a>,
@@ -1220,6 +1236,189 @@ struct EnvOptions {
 #[derive(Default)]
 struct DbOptions {
     create: bool,
+}
+
+///===================================================================
+/// Iterator Operations  
+///===================================================================
+
+/// Create a new iterator for database traversal
+/// 
+/// If KeyPrefix is not empty, seeks to this prefix first.
+/// Returns an iterator resource that can be used with iterator_next.
+#[rustler::nif]
+fn iterator<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>,
+    key_prefix: Binary
+) -> NifResult<Term<'a>> {
+    // Validate database and environment status
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+
+    // Flush write buffer before reading
+    if let Err(error_msg) = db_handle.force_flush_buffer() {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    }
+
+    let key_prefix_vec = key_prefix.as_slice().to_vec();
+    let start_key = if !key_prefix_vec.is_empty() {
+        Some(key_prefix_vec.clone())
+    } else {
+        None
+    };
+
+    let iterator = ResourceArc::new(LmdbIterator {
+        db_handle: db_handle.clone(),
+        current_key: Arc::new(Mutex::new(start_key)),
+        key_prefix: key_prefix_vec,
+        closed: Arc::new(Mutex::new(false)),
+    });
+
+    Ok((atoms::ok(), iterator).encode(env))
+}
+
+/// Get next entry from iterator
+/// 
+/// Returns the next key-value pair and updates iterator position.
+#[rustler::nif]
+fn iterator_next<'a>(
+    env: Env<'a>,
+    iterator: ResourceArc<LmdbIterator>
+) -> NifResult<Term<'a>> {
+    // Check if iterator is closed
+    {
+        let closed = iterator.closed.lock().map_err(|_| Error::BadArg)?;
+        if *closed {
+            return Ok((atoms::error(), atoms::database_error(), "Iterator is closed".to_string()).encode(env));
+        }
+    }
+
+    // Validate database and environment status
+    if let Err(error_msg) = iterator.db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+
+    // Begin read transaction
+    let txn = match (*iterator.db_handle).env.env.begin_ro_txn() {
+        Ok(txn) => txn,
+        Err(_) => {
+            return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
+        }
+    };
+
+    // Open cursor
+    let mut cursor = match txn.open_ro_cursor((*iterator.db_handle).db) {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
+        }
+    };
+
+    // Get cursor state from iterator fields
+    let closed_guard = iterator.closed.lock().map_err(|_| Error::BadArg)?;
+    if *closed_guard {
+        return Ok(atoms::not_found().encode(env));
+    }
+    drop(closed_guard);
+    
+    let prefix_iteration = !iterator.key_prefix.is_empty();
+    let prefix_bytes = iterator.key_prefix.clone();
+    let start_key = {
+        let current_key_guard = iterator.current_key.lock().map_err(|_| Error::BadArg)?;
+        current_key_guard.clone()
+    };
+
+    // Position cursor - similar to iterate_from logic
+    let cursor_from: Option<&[u8]> = if let Some(ref key) = start_key {
+        Some(key.as_slice())
+    } else if !prefix_bytes.is_empty() {
+        Some(prefix_bytes.as_slice())
+    } else {
+        None
+    };
+
+    let cursor_positioned = if cursor_from != None {
+        cursor.get(cursor_from, None, MDB_SET_RANGE).is_ok()
+    } else {
+        cursor.get(None, None, MDB_FIRST).is_ok()
+    };
+
+    if !cursor_positioned {
+        return Ok(atoms::not_found().encode(env));
+    }
+
+    // Iterate and collect results
+    let mut iterator_impl = if let Some(ref key) = start_key {
+        // If we have a start key, position after it to get the next entry
+        let mut iter = cursor.iter_from(key.as_slice());
+        // Skip the current key since we want the NEXT one
+        if let Some((current_key, _)) = iter.next() {
+            if current_key == key.as_slice() {
+                // We found our current position, now iter is positioned for next entry
+                iter
+            } else {
+                // Key changed, start from where we are now
+                cursor.iter_from(current_key)
+            }
+        } else {
+            // No entries found
+            iter
+        }
+    } else if !prefix_bytes.is_empty() {
+        cursor.iter_from(prefix_bytes.as_slice())
+    } else {
+        cursor.iter_start()
+    };
+
+    let mut result_entry: Option<(Vec<u8>, Vec<u8>)> = None;
+
+    // Get the next entry
+    if let Some((key_bytes, value)) = iterator_impl.next() {
+        if !prefix_iteration || key_bytes.starts_with(&prefix_bytes) {
+            result_entry = Some((key_bytes.to_vec(), value.to_vec()));
+        }
+    }
+
+    // Update iterator position for next call
+    {
+        let mut current_key_guard = iterator.current_key.lock().map_err(|_| Error::BadArg)?;
+        if let Some((ref key, _)) = result_entry {
+            // Set current position to the key we just returned
+            *current_key_guard = Some(key.clone());
+        } else {
+            // No more entries, mark as exhausted
+            *current_key_guard = None;
+        }
+    }
+
+    // Return results
+    if let Some((key, value)) = result_entry {
+        // Convert key-value pair to Erlang binaries
+        let mut key_binary = OwnedBinary::new(key.len()).ok_or(Error::BadArg)?;
+        key_binary.clone_from_slice(&key);
+        let mut value_binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
+        value_binary.clone_from_slice(&value);
+        let kv_tuple = (key_binary.release(env), value_binary.release(env)).encode(env);
+        Ok((atoms::ok(), kv_tuple).encode(env))
+    } else {
+        Ok(atoms::not_found().encode(env))
+    }
+}
+
+/// Close iterator and free resources
+#[rustler::nif]
+fn iterator_close<'a>(
+    env: Env<'a>,
+    iterator: ResourceArc<LmdbIterator>
+) -> NifResult<Term<'a>> {
+    {
+        let mut closed = iterator.closed.lock().map_err(|_| Error::BadArg)?;
+        *closed = true;
+    }
+    
+    Ok(atoms::ok().encode(env))
 }
 
 ///===================================================================

@@ -22,6 +22,8 @@
 
 %% Pattern matching operations
 -export([iterate_start/3, iterate_cont/3, match/2]).
+%% Iterator operations
+-export([iterator/2, iterator_next/1, iterator_close/1]).
 
 
 %% NIF loading
@@ -204,6 +206,31 @@ iterate_cont(DBInstance, {KeyPrefix, ContinuationKey}, Limit) ->
     iterate_from(DBInstance, KeyPrefix, ContinuationKey, Limit).
 
 iterate_from(_DBInstance, _KeyPrefix, _ContinuationKey, _Limit) ->
+    erlang:nif_error(nif_not_loaded).
+
+%%%===================================================================
+%%% Iterator Operations
+%%%===================================================================
+
+%% @doc Create a new iterator for database traversal.
+%% If KeyPrefix is not empty, seeks to this prefix first.
+%% Returns an iterator resource that can be used with iterator_next/1.
+-spec iterator(DBInstance :: term(), KeyPrefix :: binary()) -> 
+    {ok, term()} | {error, term(), binary()}.
+iterator(_DBInstance, _KeyPrefix) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Get next entry from iterator.
+%% Returns the next key-value pair and updates iterator position.
+-spec iterator_next(Iterator :: term()) -> 
+    {ok, key_value()} | not_found | {error, term(), binary()}.
+iterator_next(_Iterator) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Close iterator and free resources.
+-spec iterator_close(Iterator :: term()) -> 
+    ok | {error, term(), binary()}.
+iterator_close(_Iterator) ->
     erlang:nif_error(nif_not_loaded).
 
 

@@ -710,3 +710,89 @@ match_concurrent_test_() ->
                  end)
          ]
      end}.
+
+%%%===================================================================
+%%% Iterator Tests
+%%%===================================================================
+
+iterator_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          % Test basic iterator functionality
+          ?_test(begin
+                     % Add some test data
+                     ?assertEqual(ok, elmdb:put(DB, <<"key1">>, <<"value1">>)),
+                     ?assertEqual(ok, elmdb:put(DB, <<"key2">>, <<"value2">>)),
+                     ?assertEqual(ok, elmdb:put(DB, <<"prefix/key1">>, <<"pvalue1">>)),
+                     ?assertEqual(ok, elmdb:put(DB, <<"prefix/key2">>, <<"pvalue2">>)),
+                     
+                     % Create iterator for all keys
+                     {ok, Iterator} = elmdb:iterator(DB, <<"">>),
+                     
+                     % Get first entry
+                     {ok, FirstEntry} = elmdb:iterator_next(Iterator),
+                     ?assertMatch({_, _}, FirstEntry),
+                     
+                     % Get next entry
+                     {ok, SecondEntry} = elmdb:iterator_next(Iterator),
+                     ?assertMatch({_, _}, SecondEntry),
+                     
+                     % Get third entry  
+                     {ok, ThirdEntry} = elmdb:iterator_next(Iterator),
+                     ?assertMatch({_, _}, ThirdEntry),
+                     
+                     % Get fourth entry
+                     {ok, FourthEntry} = elmdb:iterator_next(Iterator),
+                     ?assertMatch({_, _}, FourthEntry),
+                     
+                     % Close iterator
+                     ?assertEqual(ok, elmdb:iterator_close(Iterator))
+                 end),
+          
+          % Test iterator with prefix
+          ?_test(begin
+                     % Add some test data with prefix
+                     ?assertEqual(ok, elmdb:put(DB, <<"test/1">>, <<"value1">>)),
+                     ?assertEqual(ok, elmdb:put(DB, <<"test/2">>, <<"value2">>)),
+                     ?assertEqual(ok, elmdb:put(DB, <<"other/1">>, <<"other1">>)),
+                     
+                     % Create iterator for specific prefix
+                     {ok, Iterator} = elmdb:iterator(DB, <<"test/">>),
+                     
+                     % Get first entry with prefix
+                     {ok, {Key1, _Value1}} = elmdb:iterator_next(Iterator),
+                     ?assert(binary:match(Key1, <<"test/">>) =/= nomatch),
+                     
+                     % Get second entry with prefix
+                     {ok, {Key2, _Value2}} = elmdb:iterator_next(Iterator),
+                     ?assert(binary:match(Key2, <<"test/">>) =/= nomatch),
+                     
+                     % Try to get third entry (should be not_found or different prefix)
+                     Result = elmdb:iterator_next(Iterator),
+                     case Result of
+                         not_found -> ok;
+                         {ok, {Key3, _Value3}} -> 
+                             ?assert(binary:match(Key3, <<"test/">>) =/= nomatch)
+                     end,
+                     
+                     % Close iterator
+                     ?assertEqual(ok, elmdb:iterator_close(Iterator))
+                 end),
+                 
+          % Test iterator close and reuse prevention
+          ?_test(begin
+                     % Create iterator
+                     {ok, Iterator} = elmdb:iterator(DB, <<"">>),
+                     
+                     % Close iterator
+                     ?assertEqual(ok, elmdb:iterator_close(Iterator)),
+                     
+                     % Using closed iterator should return error
+                     Result = elmdb:iterator_next(Iterator),
+                     ?assertMatch({error, _, _}, Result)
+                 end)
+         ]
+     end}.
