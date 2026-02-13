@@ -58,6 +58,14 @@ mod atoms {
         key_exist,
         map_full,
         txn_full,
+        page_not_found,
+        panic,
+        invalid,
+        dbs_full,
+        readers_full,
+        tls_full,
+        cursor_full,
+        page_full,
         // Specific environment errors
         directory_not_found,
         no_space,
@@ -65,6 +73,11 @@ mod atoms {
         corrupted,
         version_mismatch,
         map_resized,
+        incompatible,
+        bad_rslot,
+        bad_txn,
+        bad_val_size,
+        bad_dbi,
     }
 }
 
@@ -209,6 +222,9 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
     if parsed_options.no_sync {
         flags |= EnvironmentFlags::NO_SYNC;
     }
+    if parsed_options.no_lock {
+        flags |= EnvironmentFlags::NO_LOCK;
+    }
     if parsed_options.write_map {
         flags |= EnvironmentFlags::WRITE_MAP;
     }
@@ -235,13 +251,8 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
                     Ok(_) => {
                         // Clean up test file
                         let _ = std::fs::remove_file(path.join(".lmdb_test"));
-                        // Permission is OK, must be another LMDB error
-                        match e {
-                            lmdb::Error::Corrupted => atoms::corrupted(),
-                            lmdb::Error::VersionMismatch => atoms::version_mismatch(),
-                            lmdb::Error::MapFull => atoms::map_full(),
-                            _ => atoms::environment_error()
-                        }
+                        // Permission is OK, surface the specific LMDB error atom.
+                        lmdb_error_to_atom(e)
                     },
                     Err(io_err) => {
                         match io_err.kind() {
@@ -428,12 +439,7 @@ fn db_open<'a>(
     let database = match database_result {
         Ok(db) => db,
         Err(lmdb_err) => {
-            return match lmdb_err {
-                lmdb::Error::NotFound if !parsed_options.create => {
-                    Ok((atoms::error(), atoms::not_found()).encode(env))
-                },
-                _ => Ok((atoms::error(), atoms::database_error()).encode(env))
-            };
+            return Ok((atoms::error(), lmdb_error_to_atom(lmdb_err)).encode(env));
         }
     };
     
@@ -1058,6 +1064,33 @@ fn flush<'a>(
 /// Helper Functions
 ///===================================================================
 
+fn lmdb_error_to_atom(error: lmdb::Error) -> rustler::Atom {
+    match error {
+        lmdb::Error::KeyExist => atoms::key_exist(),
+        lmdb::Error::NotFound => atoms::not_found(),
+        lmdb::Error::PageNotFound => atoms::page_not_found(),
+        lmdb::Error::Corrupted => atoms::corrupted(),
+        lmdb::Error::Panic => atoms::panic(),
+        lmdb::Error::VersionMismatch => atoms::version_mismatch(),
+        lmdb::Error::Invalid => atoms::invalid(),
+        lmdb::Error::MapFull => atoms::map_full(),
+        lmdb::Error::DbsFull => atoms::dbs_full(),
+        lmdb::Error::ReadersFull => atoms::readers_full(),
+        lmdb::Error::TlsFull => atoms::tls_full(),
+        lmdb::Error::TxnFull => atoms::txn_full(),
+        lmdb::Error::CursorFull => atoms::cursor_full(),
+        lmdb::Error::PageFull => atoms::page_full(),
+        lmdb::Error::MapResized => atoms::map_resized(),
+        lmdb::Error::Incompatible => atoms::incompatible(),
+        lmdb::Error::BadRslot => atoms::bad_rslot(),
+        lmdb::Error::BadTxn => atoms::bad_txn(),
+        lmdb::Error::BadValSize => atoms::bad_val_size(),
+        lmdb::Error::BadDbi => atoms::bad_dbi(),
+        lmdb::Error::Other(28) => atoms::no_space(),
+        lmdb::Error::Other(_) => atoms::io_error(),
+    }
+}
+
 fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
     let mut env_opts = EnvOptions::default();
     
@@ -1081,6 +1114,7 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
             match name {
                 "no_mem_init" => env_opts.no_mem_init = true,
                 "no_sync" => env_opts.no_sync = true,
+                "no_lock" => env_opts.no_lock = true,
                 "write_map" => env_opts.write_map = true,
                 _ => {} // Ignore unknown options
             }
@@ -1113,6 +1147,7 @@ struct EnvOptions {
     map_size: Option<u64>,
     no_mem_init: bool,
     no_sync: bool,
+    no_lock: bool,
     write_map: bool,
 }
 
