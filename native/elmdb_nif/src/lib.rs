@@ -209,6 +209,9 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
     if parsed_options.no_sync {
         flags |= EnvironmentFlags::NO_SYNC;
     }
+    if parsed_options.no_lock {
+        flags |= EnvironmentFlags::NO_LOCK;
+    }
     if parsed_options.write_map {
         flags |= EnvironmentFlags::WRITE_MAP;
     }
@@ -240,6 +243,7 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
                             lmdb::Error::Corrupted => atoms::corrupted(),
                             lmdb::Error::VersionMismatch => atoms::version_mismatch(),
                             lmdb::Error::MapFull => atoms::map_full(),
+                            lmdb::Error::Other(28) => atoms::no_space(),
                             _ => atoms::environment_error()
                         }
                     },
@@ -1081,6 +1085,7 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
             match name {
                 "no_mem_init" => env_opts.no_mem_init = true,
                 "no_sync" => env_opts.no_sync = true,
+                "no_lock" => env_opts.no_lock = true,
                 "write_map" => env_opts.write_map = true,
                 _ => {} // Ignore unknown options
             }
@@ -1113,6 +1118,7 @@ struct EnvOptions {
     map_size: Option<u64>,
     no_mem_init: bool,
     no_sync: bool,
+    no_lock: bool,
     write_map: bool,
 }
 
