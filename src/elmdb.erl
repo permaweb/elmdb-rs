@@ -21,7 +21,7 @@
 -export([list/2]).
 
 %% Pattern matching operations
--export([iterate_start/3, iterate_cont/3, match/2]).
+-export([match/2]).
 
 
 %% NIF loading
@@ -188,24 +188,6 @@ list(_DBInstance, _Key) ->
 %%%===================================================================
 %%% Pattern Matching Operations
 %%%===================================================================
-
--type key_value() :: {binary(), binary()}.
--type continuation() :: {binary(), binary()} | not_found.
--type ok_iteration() :: {ok, [key_value()], continuation()}.
-
--spec iterate_start(DBInstance :: term(), KeyPrefix :: binary(), Limit :: integer()) -> 
-    ok_iteration() | not_found | {error, term(), binary()}.
-iterate_start(DBInstance, KeyPrefix, Limit) ->
-    iterate_from(DBInstance, KeyPrefix, <<>>, Limit).
-
--spec iterate_cont(DBInstance :: term(), Continuation :: continuation(), Limit :: integer()) -> 
-    ok_iteration() | not_found | {error, term(), binary()}.
-iterate_cont(DBInstance, {KeyPrefix, ContinuationKey}, Limit) ->
-    iterate_from(DBInstance, KeyPrefix, ContinuationKey, Limit).
-
-iterate_from(_DBInstance, _KeyPrefix, _ContinuationKey, _Limit) ->
-    erlang:nif_error(nif_not_loaded).
-
 
 %% @doc Match database entries against a set of key-value patterns
 %% @param DBInstance Database handle

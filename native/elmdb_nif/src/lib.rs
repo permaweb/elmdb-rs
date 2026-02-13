@@ -34,7 +34,6 @@ use lmdb::{Environment, EnvironmentFlags, Database, DatabaseFlags, Transaction, 
 
 // LMDB constant for cursor positioning (instead of importing lmdb-sys only for a constant from lmdb_sys::ffi). 
 // To be improved in the future.
-const MDB_FIRST: u32 = 0;
 const MDB_SET_RANGE: u32 = 17;
 
 mod atoms {
@@ -828,6 +827,7 @@ fn list<'a>(
     
     // Safe iteration approach that handles empty databases and missing prefixes
     // First, try to position cursor at prefix using MDB_SET_RANGE to check if key exists
+    // First, try to position cursor at prefix using MDB_SET_RANGE to check if key exists
     let cursor_positioned = cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok();
     
     if !cursor_positioned {
@@ -916,107 +916,6 @@ fn list<'a>(
     }
     
     Ok((atoms::ok(), result_binaries).encode(env))
-}
-#[rustler::nif]
-fn iterate_from<'a>(
-    env: Env<'a>,
-    db_handle: ResourceArc<LmdbDatabase>,
-    key_prefix: Binary,
-    continuation_key: Binary,
-    limit: usize
-) -> NifResult<Term<'a>> {
-    // Validate database and environment status
-    if let Err(error_msg) = db_handle.validate_database() {
-        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
-    }
-
-    let prefix_iteration = !key_prefix.is_empty();
-    let prefix_bytes = key_prefix.as_slice();
-    
-    let txn = match (*db_handle).env.env.begin_ro_txn() {
-        Ok(txn) => txn,
-        Err(_) => {
-            return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
-        }
-    };
-
-    let mut cursor = match txn.open_ro_cursor((*db_handle).db) {
-        Ok(cursor) => cursor,
-        Err(_) => {
-            return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
-        }
-    };
-
-    let cursor_from = if !continuation_key.is_empty() {
-        Some(continuation_key.as_slice())
-    } else if !prefix_bytes.is_empty() {
-        Some(prefix_bytes)
-    } else {
-        None
-    };
-
-    let cursor_positioned = if cursor_from != None {
-        cursor.get(cursor_from, None, MDB_SET_RANGE).is_ok()
-    } else {
-        cursor.get(None, None, MDB_FIRST).is_ok()
-    };
-
-    if !cursor_positioned {
-        return Ok(atoms::not_found().encode(env));
-    }
-
-    // Iterate either from a specific key (prefix or continuation) or from first key (start)
-    let iterator = if let Some(key_bytes) = cursor_from {
-        cursor.iter_from(key_bytes)
-    } else {
-        cursor.iter_start()
-    };
-
-    let mut matching_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut ret_continuation_key = None;
-
-    for (key_bytes, value) in iterator {
-        if matching_entries.len() == limit {
-            ret_continuation_key = Some(key_bytes.to_vec());
-            break;
-        }
-        
-        if prefix_iteration {
-            if key_bytes.starts_with(prefix_bytes) {
-                matching_entries.push((key_bytes.to_vec(), value.to_vec()));
-            }
-        } else {
-            matching_entries.push((key_bytes.to_vec(), value.to_vec()));
-        }
-        
-    }
-
-    // Return results
-    if matching_entries.is_empty() {
-        Ok(atoms::not_found().encode(env))
-    } else {
-        // Convert matching keys to Erlang binaries
-        let mut key_value_list = Vec::with_capacity(matching_entries.len());
-
-        for (key, value) in matching_entries {
-            let mut key_binary = OwnedBinary::new(key.len()).ok_or(Error::BadArg)?;
-            key_binary.clone_from_slice(&key);
-            let mut value_binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
-            value_binary.clone_from_slice(&value);
-            let tuple = (key_binary.release(env), value_binary.release(env)).encode(env);
-            key_value_list.push(tuple);
-        }
-
-        match ret_continuation_key {
-            Some(key_bytes) => {
-                let mut key_binary = OwnedBinary::new(key_bytes.len()).ok_or(Error::BadArg)?;
-                key_binary.clone_from_slice(&key_bytes);
-                let continuation_tuple = (key_prefix, key_binary.release(env));
-                Ok((atoms::ok(), (key_value_list, continuation_tuple)).encode(env))
-            }
-            None => Ok((atoms::ok(), (key_value_list, atoms::not_found())).encode(env))
-        }
-    }
 }
 
 #[rustler::nif]

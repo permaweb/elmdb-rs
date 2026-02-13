@@ -9,5 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 rustler = { version = "0.36.2", features = ["nif_version_2_16"] }
-lmdb = { git = "https://github.com/permaweb/lmdb-master-rs.git" }
+lmdb = "0.8"
 lazy_static = "1.4"
