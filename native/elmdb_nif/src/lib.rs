@@ -32,8 +32,10 @@ use std::sync::{Arc, Mutex};
 use std::path::Path;
 use lmdb::{Environment, EnvironmentFlags, Database, DatabaseFlags, Transaction, WriteFlags, Cursor};
 
-// LMDB constant for cursor positioning (instead of importing lmdb-sys only for a constant from lmdb_sys::ffi). 
+// LMDB cursor operation constants (instead of importing lmdb-sys only for constants from lmdb_sys::ffi).
 // To be improved in the future.
+const MDB_FIRST: u32 = 0;
+const MDB_NEXT: u32 = 8;
 const MDB_SET_RANGE: u32 = 17;
 
 mod atoms {
@@ -49,6 +51,9 @@ mod atoms {
         no_sync,
         write_map,
         create,
+        iterator,
+        start,
+        undefined,
         // Error atoms
         invalid_path,
         permission_denied,
@@ -80,6 +85,16 @@ mod atoms {
         bad_val_size,
         bad_dbi,
     }
+}
+
+/// Iterator cursor token passed between Erlang and Rust.
+///
+/// The token is intentionally stateless on the Rust side:
+/// - `{iterator, start}` means "start before the first key"
+/// - `{iterator, LastKey}` means "start after LastKey"
+enum IteratorCursor {
+    Start,
+    AfterKey(Vec<u8>),
 }
 
 /// Write operation to be batched
@@ -790,6 +805,116 @@ fn get<'a>(
 }
 
 ///===================================================================
+/// Iterator Operations
+///===================================================================
+
+#[rustler::nif]
+fn iterator<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>
+) -> NifResult<Term<'a>> {
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+
+    Ok(encode_iterator_start(env))
+}
+
+#[rustler::nif]
+fn iterator_next<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>,
+    cursor_term: Term<'a>
+) -> NifResult<Term<'a>> {
+    // Validate database and environment status
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+
+    // Decode the stateless cursor token.
+    let cursor_token = match decode_iterator_cursor(cursor_term) {
+        Ok(token) => token,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::invalid(), error_msg).encode(env));
+        }
+    };
+
+    // Only flush write buffer if there are pending writes.
+    // Iterator reads should observe all writes done before this call.
+    if db_handle.has_pending_writes() {
+        if let Err(error_msg) = db_handle.force_flush_buffer() {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    }
+
+    // Create a read-only transaction
+    let txn = match db_handle.env.env.begin_ro_txn() {
+        Ok(txn) => txn,
+        Err(_) => {
+            return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
+        }
+    };
+
+    // Open a cursor for the database
+    let cursor = match txn.open_ro_cursor(db_handle.db) {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
+        }
+    };
+
+    let next_entry = match cursor_token {
+        IteratorCursor::Start => {
+            match cursor.get(None, None, MDB_FIRST) {
+                Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
+                Ok((None, _)) => None,
+                Err(lmdb::Error::NotFound) => None,
+                Err(_) => {
+                    return Ok((atoms::error(), atoms::database_error(), "Failed to read first cursor entry".to_string()).encode(env));
+                }
+            }
+        }
+        IteratorCursor::AfterKey(last_key) => {
+            let positioned_entry = match cursor.get(Some(last_key.as_slice()), None, MDB_SET_RANGE) {
+                Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
+                Ok((None, _)) => None,
+                Err(lmdb::Error::NotFound) => None,
+                Err(_) => {
+                    return Ok((atoms::error(), atoms::database_error(), "Failed to position iterator cursor".to_string()).encode(env));
+                }
+            };
+
+            match positioned_entry {
+                // If LMDB positioned on the same key, advance once so semantics stay "after cursor".
+                Some((key, _value)) if key == last_key => {
+                    match cursor.get(None, None, MDB_NEXT) {
+                        Ok((Some(next_key), next_value)) => Some((next_key.to_vec(), next_value.to_vec())),
+                        Ok((None, _)) => None,
+                        Err(lmdb::Error::NotFound) => None,
+                        Err(_) => {
+                            return Ok((atoms::error(), atoms::database_error(), "Failed to advance iterator cursor".to_string()).encode(env));
+                        }
+                    }
+                }
+                // Key was deleted or moved; return the first lexicographically greater key if present.
+                Some((key, value)) => Some((key, value)),
+                None => None
+            }
+        }
+    };
+
+    match next_entry {
+        Some((key, value)) => {
+            let key_term = encode_binary(env, &key)?;
+            let value_term = encode_binary(env, &value)?;
+            let next_cursor = encode_iterator_after_key(env, &key)?;
+            Ok((atoms::ok(), key_term, value_term, next_cursor).encode(env))
+        }
+        None => Ok(atoms::undefined().encode(env))
+    }
+}
+
+///===================================================================
 /// List Operations
 ///===================================================================
 
@@ -1069,6 +1194,43 @@ fn flush<'a>(
 ///===================================================================
 /// Helper Functions
 ///===================================================================
+
+fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
+    let mut binary = OwnedBinary::new(bytes.len())
+        .ok_or(Error::BadArg)?;
+    binary.as_mut_slice().copy_from_slice(bytes);
+    Ok(binary.release(env).encode(env))
+}
+
+fn encode_iterator_start<'a>(env: Env<'a>) -> Term<'a> {
+    (atoms::iterator(), atoms::start()).encode(env)
+}
+
+fn encode_iterator_after_key<'a>(env: Env<'a>, key: &[u8]) -> NifResult<Term<'a>> {
+    Ok((atoms::iterator(), encode_binary(env, key)?).encode(env))
+}
+
+fn decode_iterator_cursor(cursor_term: Term) -> Result<IteratorCursor, String> {
+    let (tag, payload): (rustler::Atom, Term) = cursor_term
+        .decode()
+        .map_err(|_| "Invalid iterator cursor format".to_string())?;
+
+    if tag != atoms::iterator() {
+        return Err("Invalid iterator cursor tag".to_string());
+    }
+
+    if let Ok(atom_payload) = payload.decode::<rustler::Atom>() {
+        if atom_payload == atoms::start() {
+            return Ok(IteratorCursor::Start);
+        }
+    }
+
+    if let Ok(binary_payload) = payload.decode::<Binary>() {
+        return Ok(IteratorCursor::AfterKey(binary_payload.as_slice().to_vec()));
+    }
+
+    Err("Invalid iterator cursor payload".to_string())
+}
 
 fn lmdb_error_to_atom(error: lmdb::Error) -> rustler::Atom {
     match error {
