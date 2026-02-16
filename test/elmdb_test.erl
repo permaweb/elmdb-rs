@@ -183,6 +183,8 @@ fold_operations_test_() ->
                      ?assertEqual(ok, elmdb:foreach(DB, fun(_Key, _Value) -> ok end)),
                      ?assertEqual({ok, 0},
                                   elmdb:fold(DB, fun(_Key, _Value, Acc) -> Acc + 1 end, 0)),
+                     ?assertEqual({ok, #{}},
+                                  elmdb:map(DB, fun(_Key, _Value) -> unused end)),
 
                      % Populate and fold with arity-2 callback
                      ok = elmdb:put(DB, <<"fold/1">>, <<"1">>),
@@ -210,6 +212,17 @@ fold_operations_test_() ->
                         elmdb:fold(DB, fun(_Key, Value, Acc) ->
                                            Acc + binary_to_integer(Value)
                                    end, 0)
+                     ),
+
+                     ?assertEqual(
+                        {ok, #{
+                            <<"fold/1">> => 2,
+                            <<"fold/2">> => 4,
+                            <<"fold/3">> => 6
+                        }},
+                        elmdb:map(DB, fun(_Key, Value) ->
+                                          binary_to_integer(Value) * 2
+                                  end)
                      )
                  end)
          ]

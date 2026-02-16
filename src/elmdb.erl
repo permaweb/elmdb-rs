@@ -18,7 +18,7 @@
 -export([put/3, put_batch/2, get/2, flush/1]).
 
 %% Iterator operations
--export([iterator/1, iterator_next/2, foreach/2, fold/3]).
+-export([iterator/1, iterator_next/2, foreach/2, fold/3, map/2]).
 
 %% List operations
 -export([list/2]).
@@ -237,6 +237,14 @@ fold_loop_acc(DBInstance, Cursor, Fun, Acc) ->
         {error, _, _} = Error ->
             Error
     end.
+
+%% @doc Map over all key-value pairs and return an Erlang map of Key => Fun(Key, Value).
+-spec map(DBInstance :: term(), Fun :: fun((binary(), binary()) -> term())) ->
+    {ok, map()} | {error, term(), binary()}.
+map(DBInstance, Fun) when is_function(Fun, 2) ->
+    fold(DBInstance, fun(Key, Value, Acc) ->
+        Acc#{Key => Fun(Key, Value)}
+    end, #{}).
 
 %%%===================================================================
 %%% List Operations
