@@ -112,12 +112,131 @@ list_operations_test_() ->
                  end),
           
           % Skip empty database test due to lmdb-rs panic issue
-          {"Empty database list", 
+         {"Empty database list", 
            ?_test(begin
                       skip
                   end)}
          ]
      end}.
+
+%%%===================================================================
+%%% Iterator and Fold Tests
+%%%===================================================================
+
+iterator_lifecycle_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     % Empty iterator should terminate immediately.
+                     Start0 = elmdb:iterator(DB),
+                     ?assertMatch({iterator, start}, Start0),
+                     ?assertEqual(undefined, elmdb:iterator_next(DB, Start0)),
+
+                     % Populate sorted keys and iterate through all entries.
+                     ok = elmdb:put(DB, <<"iter/a">>, <<"A">>),
+                     ok = elmdb:put(DB, <<"iter/b">>, <<"B">>),
+                     ok = elmdb:put(DB, <<"iter/c">>, <<"C">>),
+
+                     Start = elmdb:iterator(DB),
+                     ?assertMatch({iterator, start}, Start),
+
+                     {ok, <<"iter/a">>, <<"A">>, CursorA} = elmdb:iterator_next(DB, Start),
+                     {ok, <<"iter/b">>, <<"B">>, CursorB} = elmdb:iterator_next(DB, CursorA),
+
+                     % Add an intermediate key between cursor steps; next call should observe it.
+                     ok = elmdb:put(DB, <<"iter/bb">>, <<"BB">>),
+                     {ok, <<"iter/bb">>, <<"BB">>, CursorBB} = elmdb:iterator_next(DB, CursorB),
+                     {ok, <<"iter/c">>, <<"C">>, CursorC} = elmdb:iterator_next(DB, CursorBB),
+
+                     % Last cursor and after-last cursor should both return undefined.
+                     ?assertEqual(undefined, elmdb:iterator_next(DB, CursorC)),
+                     ?assertEqual(undefined, elmdb:iterator_next(DB, CursorC))
+                 end)
+         ]
+     end}.
+
+iterator_invalid_cursor_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     ok = elmdb:put(DB, <<"iter/key">>, <<"value">>),
+                     ?assertMatch({error, invalid, _},
+                                  elmdb:iterator_next(DB, invalid_cursor))
+                 end)
+         ]
+     end}.
+
+fold_operations_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     % Empty database fold
+                     ?assertEqual(ok, elmdb:foreach(DB, fun(_Key, _Value) -> ok end)),
+                     ?assertEqual({ok, 0},
+                                  elmdb:fold(DB, fun(_Key, _Value, Acc) -> Acc + 1 end, 0)),
+                     ?assertEqual({ok, #{}},
+                                  elmdb:map(DB, fun(_Key, _Value) -> unused end)),
+
+                     % Populate and fold with arity-2 callback
+                     ok = elmdb:put(DB, <<"fold/1">>, <<"1">>),
+                     ok = elmdb:put(DB, <<"fold/2">>, <<"2">>),
+                     ok = elmdb:put(DB, <<"fold/3">>, <<"3">>),
+
+                     Self = self(),
+                     ok = elmdb:foreach(DB, fun(Key, Value) ->
+                                              Self ! {kv, Key, Value},
+                                              ok
+                                      end),
+                     Pairs = collect_messages(3, []),
+                     ?assertEqual(
+                        lists:sort([
+                            {<<"fold/1">>, <<"1">>},
+                            {<<"fold/2">>, <<"2">>},
+                            {<<"fold/3">>, <<"3">>}
+                        ]),
+                        lists:sort(Pairs)
+                     ),
+
+                     % Arity-3 fold should return the final accumulator.
+                     ?assertEqual(
+                        {ok, 6},
+                        elmdb:fold(DB, fun(_Key, Value, Acc) ->
+                                           Acc + binary_to_integer(Value)
+                                   end, 0)
+                     ),
+
+                     ?assertEqual(
+                        {ok, #{
+                            <<"fold/1">> => 2,
+                            <<"fold/2">> => 4,
+                            <<"fold/3">> => 6
+                        }},
+                        elmdb:map(DB, fun(_Key, Value) ->
+                                          binary_to_integer(Value) * 2
+                                  end)
+                     )
+                 end)
+         ]
+     end}.
+
+collect_messages(0, Acc) ->
+    Acc;
+collect_messages(Count, Acc) ->
+    receive
+        {kv, Key, Value} ->
+            collect_messages(Count - 1, [{Key, Value} | Acc])
+    after 1000 ->
+        ?assert(false)
+    end.
 
 %%%===================================================================
 %%% Error Handling Tests
@@ -229,6 +348,50 @@ performance_test_() ->
                 
                 cleanup({Dir, Env, DB})
             end)}.
+
+%%%===================================================================
+%%% Iterator/Fold Performance Test
+%%%===================================================================
+
+iterator_fold_performance_test_() ->
+    {timeout, 60,
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                RecordCount = 25000,
+
+                % Seed data for iteration/fold benchmarking.
+                lists:foreach(fun(I) ->
+                    Key = iolist_to_binary([<<"iter_perf/">>, integer_to_binary(I)]),
+                    Value = integer_to_binary(I),
+                    ok = elmdb:put(DB, Key, Value)
+                end, lists:seq(1, RecordCount)),
+                ok = elmdb:flush(DB),
+
+                IterStart = erlang:monotonic_time(millisecond),
+                Cursor = elmdb:iterator(DB),
+                IterCount = count_iterator_records(DB, Cursor, 0),
+                IterDuration = erlang:monotonic_time(millisecond) - IterStart,
+
+                ?debugFmt("Iterator over ~p keys: ~p ms", [RecordCount, IterDuration]),
+                ?assertEqual(RecordCount, IterCount),
+
+                FoldStart = erlang:monotonic_time(millisecond),
+                {ok, FoldCount} = elmdb:fold(DB, fun(_Key, _Value, Acc) -> Acc + 1 end, 0),
+                FoldDuration = erlang:monotonic_time(millisecond) - FoldStart,
+
+                ?debugFmt("Fold over ~p keys: ~p ms", [RecordCount, FoldDuration]),
+                ?assertEqual(RecordCount, FoldCount),
+
+                cleanup({Dir, Env, DB})
+            end)}.
+
+count_iterator_records(DB, Cursor, Count) ->
+    case elmdb:iterator_next(DB, Cursor) of
+        {ok, _Key, _Value, NextCursor} ->
+            count_iterator_records(DB, NextCursor, Count + 1);
+        undefined ->
+            Count
+    end.
 
 %%%===================================================================
 %%% Environment Copy Test

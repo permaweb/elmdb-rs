@@ -17,6 +17,9 @@
 %% Key-value operations
 -export([put/3, put_batch/2, get/2, flush/1]).
 
+%% Iterator operations
+-export([iterator/1, iterator_next/2, foreach/2, fold/3, map/2]).
+
 %% List operations
 -export([list/2]).
 
@@ -172,6 +175,76 @@ put_batch(_DBInstance, _KeyValuePairs) ->
 get(_DBInstance, _Key) ->
     erlang:nif_error(nif_not_loaded).
 
+%%%===================================================================
+%%% Iterator Operations
+%%%===================================================================
+
+%% @doc Create an iterator cursor token for a database scan.
+%% @param DBInstance Database handle
+%% @returns Cursor token that can be passed to iterator_next/2
+-spec iterator(DBInstance :: term()) -> term() | {error, term(), binary()}.
+iterator(_DBInstance) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Fetch the next {Key, Value} pair and continuation cursor.
+%% @param DBInstance Database handle
+%% @param Cursor Iterator token returned by iterator/1 or iterator_next/2
+%% @returns {ok, Key, Value, NextCursor} or undefined when exhausted
+-spec iterator_next(DBInstance :: term(), Cursor :: term()) ->
+    {ok, binary(), binary(), term()} | undefined | {error, term(), binary()}.
+iterator_next(_DBInstance, _Cursor) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Execute over the full keyspace with an arity-2 callback.
+%%      Callback is called as Fun(Key, Value). Stops when iterator_next returns
+%%      undefined.
+-spec foreach(DBInstance :: term(), Fun :: fun((binary(), binary()) -> term())) ->
+    ok | {error, term(), binary()}.
+foreach(DBInstance, Fun) when is_function(Fun, 2) ->
+    case iterator(DBInstance) of
+        {error, _, _} = Error -> Error;
+        Cursor -> fold_loop(DBInstance, Cursor, Fun)
+    end.
+
+%% @doc Fold over the full keyspace with an accumulator callback.
+%%      Callback is called as Fun(Key, Value, AccIn) and returns AccOut.
+-spec fold(DBInstance :: term(), Fun :: fun((binary(), binary(), term()) -> term()), Acc0 :: term()) ->
+    {ok, term()} | {error, term(), binary()}.
+fold(DBInstance, Fun, Acc0) when is_function(Fun, 3) ->
+    case iterator(DBInstance) of
+        {error, _, _} = Error -> Error;
+        Cursor -> fold_loop_acc(DBInstance, Cursor, Fun, Acc0)
+    end.
+
+fold_loop(DBInstance, Cursor, Fun) ->
+    case iterator_next(DBInstance, Cursor) of
+        {ok, Key, Value, NextCursor} ->
+            _ = Fun(Key, Value),
+            fold_loop(DBInstance, NextCursor, Fun);
+        undefined ->
+            ok;
+        {error, _, _} = Error ->
+            Error
+    end.
+
+fold_loop_acc(DBInstance, Cursor, Fun, Acc) ->
+    case iterator_next(DBInstance, Cursor) of
+        {ok, Key, Value, NextCursor} ->
+            NextAcc = Fun(Key, Value, Acc),
+            fold_loop_acc(DBInstance, NextCursor, Fun, NextAcc);
+        undefined ->
+            {ok, Acc};
+        {error, _, _} = Error ->
+            Error
+    end.
+
+%% @doc Map over all key-value pairs and return an Erlang map of Key => Fun(Key, Value).
+-spec map(DBInstance :: term(), Fun :: fun((binary(), binary()) -> term())) ->
+    {ok, map()} | {error, term(), binary()}.
+map(DBInstance, Fun) when is_function(Fun, 2) ->
+    fold(DBInstance, fun(Key, Value, Acc) ->
+        Acc#{Key => Fun(Key, Value)}
+    end, #{}).
 
 %%%===================================================================
 %%% List Operations
