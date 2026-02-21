@@ -19,8 +19,9 @@ setup() ->
     {ok, DB} = elmdb:db_open(Env, [create]),
     {Dir, Env, DB}.
 
-cleanup({Dir, Env, _DB}) ->
-    elmdb:env_close(Env),
+cleanup({Dir, Env, DB}) ->
+    _ = elmdb:db_close(DB),
+    _ = elmdb:env_close(Env),
     file:del_dir_r(Dir).
 
 test_dir() ->
@@ -78,9 +79,64 @@ batch_operations_test_() ->
                      ?assertEqual({ok, <<"value1">>}, elmdb:get(DB, <<"batch1">>)),
                      ?assertEqual({ok, <<"value2">>}, elmdb:get(DB, <<"batch2">>)),
                      ?assertEqual({ok, <<"value3">>}, elmdb:get(DB, <<"batch3">>))
+                 end),
+          ?_test(begin
+                     % Regression: mixed buffered put/3 + immediate put_batch/2
+                     % must preserve operation ordering.
+                     ok = elmdb:put(DB, <<"mixed/key">>, <<"from_put">>),
+                     ok = elmdb:put_batch(DB, [{<<"mixed/key">>, <<"from_batch">>}]),
+                     ?assertEqual({ok, <<"from_batch">>}, elmdb:get(DB, <<"mixed/key">>))
                  end)
          ]
      end}.
+
+%%%===================================================================
+%%% Singleton/Reopen Tests
+%%%===================================================================
+
+singleton_reopen_test_() ->
+    [
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}]),
+                {ok, EnvAgain} = elmdb:env_open(Dir, [{map_size, 20971520}]),
+                ?assertEqual(Env, EnvAgain),
+
+                {ok, DB1} = elmdb:db_open(Env, [create]),
+                {ok, DB2} = elmdb:db_open(Env, [create]),
+
+                % db_open should return the same singleton DB handle for the env.
+                ?assertEqual(DB1, DB2),
+
+                ok = elmdb:put(DB1, <<"singleton/key">>, <<"v1">>),
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(DB2, <<"singleton/key">>)),
+
+                % Soft-close then reopen through operation and db_open.
+                ok = elmdb:db_close(DB1),
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(DB2, <<"singleton/key">>)),
+
+                % Explicit env_close should not invalidate DB refs.
+                ok = elmdb:env_close(Env),
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(DB1, <<"singleton/key">>)),
+
+                % env_close_by_name should also be non-destructive.
+                ok = elmdb:env_close_by_name(Dir),
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(DB2, <<"singleton/key">>)),
+
+                {ok, DB3} = elmdb:db_open(Env, [create]),
+                ?assertEqual(DB1, DB3),
+
+                ok = elmdb:put(DB3, <<"singleton/key">>, <<"v2">>),
+                ?assertEqual({ok, <<"v2">>}, elmdb:get(DB1, <<"singleton/key">>)),
+
+                ok = elmdb:db_close(DB1),
+                ok = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)
+    ].
 
 %%%===================================================================
 %%% List Operation Tests  
@@ -251,24 +307,17 @@ error_handling_test_() ->
             end),
      
      ?_test(begin
-                % Test operations on closed database
+                % Test operations auto-reopen after soft-close
                 {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"k">>, <<"v0">>),
                 ok = elmdb:db_close(DB),
-                
-                % All operations should fail
-                CheckDbError = fun(R) ->
-                    case R of
-                        {error, database_error, _} -> ok;
-                        {error, database_error} -> ok;
-                        _ -> ?assertEqual({error, database_error}, R)
-                    end
-                end,
-                
-                CheckDbError(elmdb:put(DB, <<"k">>, <<"v">>)),
-                CheckDbError(elmdb:get(DB, <<"k">>)),
-                CheckDbError(elmdb:list(DB, <<>>)),
-                CheckDbError(elmdb:flush(DB)),
-                
+
+                % Operations should transparently reopen and succeed.
+                ok = elmdb:put(DB, <<"k">>, <<"v1">>),
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(DB, <<"k">>)),
+                ?assertEqual(ok, elmdb:flush(DB)),
+
+                ok = elmdb:db_close(DB),
                 ok = elmdb:env_close(Env),
                 file:del_dir_r(Dir)
             end),

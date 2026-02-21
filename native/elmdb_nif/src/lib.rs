@@ -150,12 +150,12 @@ impl WriteBuffer {
 /// Environments are reference-counted and shared across database instances.
 #[derive(Debug)]
 pub struct LmdbEnv {
-    /// The underlying LMDB environment
-    env: Environment,
     /// Path to the database directory
     path: String,
-    /// Flag indicating if environment has been closed
-    closed: Arc<Mutex<bool>>,
+    /// Environment options used when reopening
+    options: Arc<Mutex<EnvOptions>>,
+    /// Mutable runtime environment state
+    state: Arc<Mutex<EnvState>>,
     /// Reference count for active databases using this environment
     ref_count: Arc<Mutex<usize>>,
 }
@@ -165,14 +165,23 @@ pub struct LmdbEnv {
 /// Represents a database within an LMDB environment.
 /// Each database has its own write buffer for batching operations.
 pub struct LmdbDatabase {
-    /// The underlying LMDB database
-    db: Database,
     /// Reference to the parent environment
     env: ResourceArc<LmdbEnv>,
     /// Buffer for batching write operations
     write_buffer: Arc<Mutex<WriteBuffer>>,
+    /// Cached db handle for current env generation
+    cached_db: Arc<Mutex<Option<(Database, u64)>>>,
+    /// Whether db_open was requested with create
+    create_if_missing: Arc<Mutex<bool>>,
     /// Flag indicating if database has been closed
     closed: Arc<Mutex<bool>>,
+}
+
+#[derive(Debug)]
+struct EnvState {
+    env: Option<Arc<Environment>>,
+    close_requested: bool,
+    generation: u64,
 }
 
 // Global registry of open environments
@@ -182,6 +191,8 @@ pub struct LmdbDatabase {
 lazy_static::lazy_static! {
     static ref ENVIRONMENTS: Arc<Mutex<HashMap<String, ResourceArc<LmdbEnv>>>> = 
         Arc::new(Mutex::new(HashMap::new()));
+    static ref DATABASES: Arc<Mutex<HashMap<String, ResourceArc<LmdbDatabase>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 }
 
 /// Initialize the NIF module
@@ -190,6 +201,147 @@ lazy_static::lazy_static! {
 /// This function is called automatically when the NIF is loaded.
 fn init(env: Env, _info: Term) -> bool {
     rustler::resource!(LmdbEnv, env) && rustler::resource!(LmdbDatabase, env)
+}
+
+fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lmdb::Error> {
+    let mut env_builder = Environment::new();
+
+    if let Some(map_size) = options.map_size {
+        env_builder.set_map_size(map_size as usize);
+    } else {
+        env_builder.set_map_size(1024 * 1024 * 1024);
+    }
+
+    if let Some(max_readers) = options.max_readers {
+        env_builder.set_max_readers(max_readers);
+    }
+
+    let mut flags = EnvironmentFlags::empty();
+    if options.no_mem_init {
+        flags |= EnvironmentFlags::NO_MEM_INIT;
+    }
+    if options.no_sync {
+        flags |= EnvironmentFlags::NO_SYNC;
+    }
+    if options.no_lock {
+        flags |= EnvironmentFlags::NO_LOCK;
+    }
+    if options.write_map {
+        flags |= EnvironmentFlags::WRITE_MAP;
+    }
+    env_builder.set_flags(flags);
+
+    env_builder.open(Path::new(path))
+}
+
+impl LmdbEnv {
+    fn set_options(&self, options: EnvOptions) -> Result<(), String> {
+        let mut stored = self
+            .options
+            .lock()
+            .map_err(|_| "Failed to lock environment options".to_string())?;
+        *stored = options;
+        Ok(())
+    }
+
+    fn ensure_open(&self) -> Result<(Arc<Environment>, u64), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Failed to lock environment state".to_string())?;
+
+        if let Some(existing_env) = state.env.as_ref() {
+            if state.close_requested {
+                if Arc::strong_count(existing_env) == 1 {
+                    state.env = None;
+                    state.close_requested = false;
+                    state.generation += 1;
+                } else {
+                    return Ok((existing_env.clone(), state.generation));
+                }
+            } else {
+                return Ok((existing_env.clone(), state.generation));
+            }
+        }
+
+        let options = self
+            .options
+            .lock()
+            .map_err(|_| "Failed to lock environment options".to_string())?
+            .clone();
+
+        let reopened = build_environment(&self.path, &options)
+            .map_err(|e| format!("Failed to open environment: {:?}", e))?;
+        let reopened = Arc::new(reopened);
+        state.env = Some(reopened.clone());
+        state.close_requested = false;
+        state.generation += 1;
+        Ok((reopened, state.generation))
+    }
+
+    fn request_close(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Failed to lock environment state".to_string())?;
+
+        state.close_requested = true;
+        if let Some(existing_env) = state.env.as_ref() {
+            if Arc::strong_count(existing_env) == 1 {
+                state.env = None;
+                state.close_requested = false;
+                state.generation += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn is_closed(&self) -> Result<bool, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "Failed to lock environment state".to_string())?;
+        Ok(state.env.is_none() || state.close_requested)
+    }
+}
+
+fn soft_close_db(db_handle: &ResourceArc<LmdbDatabase>) -> Result<(), String> {
+    if let Err(error_msg) = db_handle.force_flush_buffer() {
+        // Close remains best-effort; keep old behavior of not failing close on flush errors.
+        eprintln!("Warning: Failed to flush buffer during db_close: {}", error_msg);
+    }
+
+    let was_open = {
+        let mut closed = db_handle
+            .closed
+            .lock()
+            .map_err(|_| "Failed to lock database state".to_string())?;
+        let was_open = !*closed;
+        *closed = true;
+        was_open
+    };
+
+    {
+        let mut cached = db_handle
+            .cached_db
+            .lock()
+            .map_err(|_| "Failed to lock cached db handle".to_string())?;
+        *cached = None;
+    }
+
+    if was_open {
+        let mut ref_count = db_handle
+            .env
+            .ref_count
+            .lock()
+            .map_err(|_| "Failed to update environment reference count".to_string())?;
+        if *ref_count > 0 {
+            *ref_count -= 1;
+        }
+    }
+
+    Ok(())
 }
 
 ///===================================================================
@@ -209,51 +361,31 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
         return Err(Error::BadArg);
     };
     let path_str = &path_string;
+    let has_options = !options.is_empty();
     let parsed_options = parse_env_options(options)?;
-    
-    // Check if environment is already open for this path
-    {
+
+    // Singleton behavior: always return the existing env resource for this path.
+    if let Some(existing_env) = {
         let environments = ENVIRONMENTS.lock().unwrap();
-        if environments.contains_key(path_str) {
-            return Ok((atoms::error(), atoms::already_open()).encode(env));
+        environments.get(path_str).cloned()
+    } {
+        if !Path::new(path_str).exists() {
+            if let Err(error_msg) = existing_env.request_close() {
+                return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
+            }
         }
+        if has_options {
+            if let Err(error_msg) = existing_env.set_options(parsed_options) {
+                return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
+            }
+        }
+        if let Err(error_msg) = existing_env.ensure_open() {
+            return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
+        }
+        return Ok((atoms::ok(), existing_env).encode(env));
     }
     
-    // Create LMDB environment builder
-    let mut env_builder = Environment::new();
-    
-    // Set map size if provided (default is 1MB, so we should set a reasonable size)
-    if let Some(map_size) = parsed_options.map_size {
-        env_builder.set_map_size(map_size as usize);
-    } else {
-        // Default to 1GB if no map size is specified
-        env_builder.set_map_size(1024 * 1024 * 1024);
-    }
-
-    // Set max readers if provided
-    if let Some(max_readers) = parsed_options.max_readers {
-        env_builder.set_max_readers(max_readers);
-    }
-
-    // Set flags based on options
-    let mut flags = EnvironmentFlags::empty();
-    if parsed_options.no_mem_init {
-        flags |= EnvironmentFlags::NO_MEM_INIT;
-    }
-    if parsed_options.no_sync {
-        flags |= EnvironmentFlags::NO_SYNC;
-    }
-    if parsed_options.no_lock {
-        flags |= EnvironmentFlags::NO_LOCK;
-    }
-    if parsed_options.write_map {
-        flags |= EnvironmentFlags::WRITE_MAP;
-    }
-    
-    env_builder.set_flags(flags);
-    
-    // Open the environment
-    let lmdb_env_result = env_builder.open(Path::new(path_str));
+    let lmdb_env_result = build_environment(path_str, &parsed_options);
     
     let lmdb_environment = match lmdb_env_result {
         Ok(env) => env,
@@ -290,9 +422,13 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
     
     // Create our wrapper struct
     let lmdb_env = LmdbEnv { 
-        env: lmdb_environment,
         path: path_str.to_string(),
-        closed: Arc::new(Mutex::new(false)),
+        options: Arc::new(Mutex::new(parsed_options.clone())),
+        state: Arc::new(Mutex::new(EnvState {
+            env: Some(Arc::new(lmdb_environment)),
+            close_requested: false,
+            generation: 1,
+        })),
         ref_count: Arc::new(Mutex::new(0)),
     };
     let resource = ResourceArc::new(lmdb_env);
@@ -308,8 +444,14 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
 
 #[rustler::nif]
 fn env_sync<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
-    // flush buffers to disk with force true
-    match env_handle.env.sync(true) {
+    let (live_env, _) = match env_handle.ensure_open() {
+        Ok(data) => data,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
+        }
+    };
+
+    match live_env.sync(true) {
         Ok(()) => Ok(atoms::ok().encode(env)),
         Err(err_msg) => Ok((atoms::error(), atoms::environment_error(), 
                       format!("Environment sync failed: {}", err_msg)).encode(env))
@@ -318,31 +460,17 @@ fn env_sync<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Ter
 
 #[rustler::nif]
 fn env_close<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
-    // Check if there are still active database references
+    if let Some(db_handle) = {
+        let databases = DATABASES.lock().unwrap();
+        databases.get(&env_handle.path).cloned()
+    } {
+        let _ = soft_close_db(&db_handle);
+    }
 
-    {
-        let ref_count = env_handle.ref_count.lock().unwrap();
-        if *ref_count > 0 {
-            return Ok((atoms::error(), atoms::environment_error(), 
-                      format!("Environment still has {} active database references", *ref_count)).encode(env));
-        }
+    if let Err(error_msg) = env_handle.request_close() {
+        return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
     }
-    
-    // Mark environment as closed
-    {
-        let mut closed = env_handle.closed.lock().unwrap();
-        *closed = true;
-    }
-    
-    // Remove from global environments map
-    {
-        let mut environments = ENVIRONMENTS.lock().unwrap();
-        environments.remove(&env_handle.path);
-    }
-    
-    // The Drop trait implementation will handle the actual closing
-    // when the ResourceArc is dropped
-    
+
     Ok(atoms::ok().encode(env))
 }
 
@@ -360,30 +488,25 @@ fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
     };
     let path_str = &path_string;
     
-    // Mark environment as closed and remove from global environments map
-    {
-        let mut environments = ENVIRONMENTS.lock().unwrap();
-        if let Some(env_handle) = environments.get(path_str) {
-            // Check if there are still active database references
-            {
-                let ref_count = env_handle.ref_count.lock().unwrap();
-                if *ref_count > 0 {
-                    return Ok((atoms::error(), atoms::environment_error(), 
-                              format!("Environment still has {} active database references", *ref_count)).encode(env));
-                }
-            }
-            
-            // Mark as closed
-            let mut closed = env_handle.closed.lock().unwrap();
-            *closed = true;
-            drop(closed);
-            
-            // Remove from map
-            environments.remove(path_str);
-            Ok(atoms::ok().encode(env))
-        } else {
-            Ok((atoms::error(), atoms::not_found()).encode(env))
+    let env_handle = {
+        let environments = ENVIRONMENTS.lock().unwrap();
+        environments.get(path_str).cloned()
+    };
+
+    if let Some(db_handle) = {
+        let databases = DATABASES.lock().unwrap();
+        databases.get(path_str).cloned()
+    } {
+        let _ = soft_close_db(&db_handle);
+    }
+
+    if let Some(env_handle) = env_handle {
+        if let Err(error_msg) = env_handle.request_close() {
+            return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
         }
+        Ok(atoms::ok().encode(env))
+    } else {
+        Ok((atoms::error(), atoms::not_found()).encode(env))
     }
 }
 
@@ -396,30 +519,10 @@ fn db_close<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>
 ) -> NifResult<Term<'a>> {
-    // Mark database as closed
-    {
-        let mut closed = db_handle.closed.lock().map_err(|_| Error::BadArg)?;
-        if *closed {
-            return Ok((atoms::error(), atoms::database_error(), "Database already closed".to_string()).encode(env));
-        }
-        *closed = true;
+    match soft_close_db(&db_handle) {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(error_msg) => Ok((atoms::error(), atoms::database_error(), error_msg).encode(env)),
     }
-    
-    // Force flush any pending writes
-    if let Err(error_msg) = db_handle.force_flush_buffer() {
-        // Log error but don't fail the close operation
-        eprintln!("Warning: Failed to flush buffer during db_close: {}", error_msg);
-    }
-    
-    // Decrement reference count for the environment
-    {
-        let mut ref_count = db_handle.env.ref_count.lock().map_err(|_| Error::BadArg)?;
-        if *ref_count > 0 {
-            *ref_count -= 1;
-        }
-    }
-    
-    Ok(atoms::ok().encode(env))
 }
 
 #[rustler::nif]
@@ -429,40 +532,28 @@ fn db_open<'a>(
     options: Vec<Term<'a>>
 ) -> NifResult<Term<'a>> {
     let parsed_options = parse_db_options(options)?;
-    
-    // Check if environment is closed before attempting to open database
-    {
-        let closed = env_handle.closed.lock().map_err(|_| Error::BadArg)?;
-        if *closed {
-            return Ok((atoms::error(), atoms::database_error(), "Environment is closed".to_string()).encode(env));
-        }
+    if let Err(error_msg) = env_handle.ensure_open() {
+        return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
     }
-    
-    // Set database flags based on options
-    let mut flags = DatabaseFlags::empty();
-    if parsed_options.create {
-        flags |= DatabaseFlags::empty(); // CREATE is default behavior
+
+    let db_key = env_handle.path.clone();
+    if let Some(existing_db) = {
+        let databases = DATABASES.lock().map_err(|_| Error::BadArg)?;
+        databases.get(&db_key).cloned()
+    } {
+        if parsed_options.create {
+            if let Err(error_msg) = existing_db.set_create_if_missing(true) {
+                return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+            }
+        }
+        if let Err(error_msg) = existing_db.reopen_if_closed() {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+        if let Err(error_msg) = existing_db.validate_database() {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+        return Ok((atoms::ok(), existing_db).encode(env));
     }
-    
-    // Open the database using the environment with flags
-    // Use None for the default (unnamed) database
-    let database_result = if parsed_options.create {
-        // Always use create_db for consistency - it will open existing or create new
-        env_handle.env.create_db(None, flags)
-    } else {
-        // Try create_db first, fall back to open_db if needed
-        match env_handle.env.create_db(None, flags) {
-            Ok(db) => Ok(db),
-            Err(_) => env_handle.env.open_db(None)
-        }
-    };
-    
-    let database = match database_result {
-        Ok(db) => db,
-        Err(lmdb_err) => {
-            return Ok((atoms::error(), lmdb_error_to_atom(lmdb_err)).encode(env));
-        }
-    };
     
     // Increment reference count for this environment
     {
@@ -472,12 +563,32 @@ fn db_open<'a>(
     
     // Create database resource with write buffer (default buffer size: 1000 operations)
     let lmdb_db = LmdbDatabase { 
-        db: database,
         env: env_handle.clone(),
         write_buffer: Arc::new(Mutex::new(WriteBuffer::new(1000))),
+        cached_db: Arc::new(Mutex::new(None)),
+        create_if_missing: Arc::new(Mutex::new(parsed_options.create)),
         closed: Arc::new(Mutex::new(false)),
     };
     let resource = ResourceArc::new(lmdb_db);
+
+    {
+        let mut databases = DATABASES.lock().map_err(|_| Error::BadArg)?;
+        databases.insert(db_key, resource.clone());
+    }
+
+    if let Err(error_msg) = resource.validate_database() {
+        {
+            let mut databases = DATABASES.lock().map_err(|_| Error::BadArg)?;
+            databases.remove(&env_handle.path);
+        }
+        {
+            let mut ref_count = env_handle.ref_count.lock().map_err(|_| Error::BadArg)?;
+            if *ref_count > 0 {
+                *ref_count -= 1;
+            }
+        }
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
     
     Ok((atoms::ok(), resource).encode(env))
 }
@@ -514,12 +625,87 @@ impl LmdbDatabase {
     // 4. Database is being closed
     // This dramatically improves write performance by reducing transaction overhead
     
-    fn is_closed(&self) -> bool {
-        if let Ok(closed) = self.closed.lock() {
-            *closed
-        } else {
-            true // If we can't check, assume closed for safety
+    fn set_create_if_missing(&self, create: bool) -> Result<(), String> {
+        if !create {
+            return Ok(());
         }
+
+        let mut create_if_missing = self
+            .create_if_missing
+            .lock()
+            .map_err(|_| "Failed to lock database options".to_string())?;
+        *create_if_missing = true;
+        Ok(())
+    }
+
+    fn reopen_if_closed(&self) -> Result<(), String> {
+        let reopened = {
+            let mut closed = self
+                .closed
+                .lock()
+                .map_err(|_| "Failed to lock database state")?;
+            if *closed {
+                *closed = false;
+                true
+            } else {
+                false
+            }
+        };
+
+        if reopened {
+            let mut ref_count = self
+                .env
+                .ref_count
+                .lock()
+                .map_err(|_| "Failed to update environment reference count")?;
+            *ref_count += 1;
+        }
+        Ok(())
+    }
+
+    fn ensure_open_handles(&self) -> Result<(Arc<Environment>, Database), String> {
+        let (live_env, env_generation) = self.env.ensure_open()?;
+        self.reopen_if_closed()?;
+
+        if let Some((cached_db, cached_generation)) = {
+            let cached = self
+                .cached_db
+                .lock()
+                .map_err(|_| "Failed to lock cached db handle".to_string())?;
+            *cached
+        } {
+            if cached_generation == env_generation {
+                return Ok((live_env, cached_db));
+            }
+        }
+
+        let create_if_missing = {
+            let create = self
+                .create_if_missing
+                .lock()
+                .map_err(|_| "Failed to lock database options".to_string())?;
+            *create
+        };
+
+        let db = if create_if_missing {
+            live_env.create_db(None, DatabaseFlags::empty())
+        } else {
+            match live_env.create_db(None, DatabaseFlags::empty()) {
+                Ok(db) => Ok(db),
+                Err(_) => live_env.open_db(None),
+            }
+        }
+        .map_err(|e| format!("Failed to open database: {:?}", e))?;
+
+        {
+            let mut cached = self
+                .cached_db
+                .lock()
+                .map_err(|_| "Failed to lock cached db handle".to_string())?;
+            *cached = Some((db, env_generation));
+        }
+
+        Ok((live_env, db))
     }
 
 
@@ -529,13 +715,15 @@ impl LmdbDatabase {
             return Ok(());
         }
 
+        let (live_env, live_db) = self.ensure_open_handles()?;
+
         // Create a write transaction for the batch
-        let mut txn = self.env.env.begin_rw_txn()
+        let mut txn = live_env.begin_rw_txn()
             .map_err(|_| "Failed to begin write transaction")?;
         
         // Execute all operations in the batch
         for op in operations {
-            txn.put(self.db, &op.key, &op.value, WriteFlags::empty())
+            txn.put(live_db, &op.key, &op.value, WriteFlags::empty())
                 .map_err(|e| format!("Failed to put value: key_len={}, value_len={}, error={:?}", 
                                      op.key.len(), op.value.len(), e))?;
         }
@@ -594,22 +782,8 @@ impl LmdbDatabase {
     }
 
     fn validate_database(&self) -> Result<(), String> {
-        // Check if database is marked as closed
-        if self.is_closed() {
-            return Err("Database is closed".to_string());
-        }
-        
-        // Check if environment is marked as closed
-        {
-            let closed = self.env.closed.lock().map_err(|_| "Failed to check environment status")?;
-            if *closed {
-                return Err("Database environment is closed".to_string());
-            }
-        }
-        
-        // Quick validation by attempting to begin a read transaction
-        let _txn = self.env.env.begin_ro_txn()
-            .map_err(|e| format!("Database environment is invalid or closed: {:?}", e))?;
+        self.reopen_if_closed()?;
+        let _ = self.env.ensure_open()?;
         Ok(())
     }
 }
@@ -663,14 +837,21 @@ fn put<'a>(
     
     // Handle empty keys directly (don't buffer them as they cause issues in LMDB batch operations)
     if key_vec.is_empty() {
-        let mut txn = match db_handle.env.env.begin_rw_txn() {
+        let (live_env, live_db) = match db_handle.ensure_open_handles() {
+            Ok(handles) => handles,
+            Err(error_msg) => {
+                return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+            }
+        };
+
+        let mut txn = match live_env.begin_rw_txn() {
             Ok(txn) => txn,
             Err(_) => {
                 return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin write transaction".to_string()).encode(env));
             }
         };
         
-        match txn.put(db_handle.db, &key_vec, &value_vec, WriteFlags::empty()) {
+        match txn.put(live_db, &key_vec, &value_vec, WriteFlags::empty()) {
             Ok(()) => {
                 match txn.commit() {
                     Ok(()) => return Ok(atoms::ok().encode(env)),
@@ -709,9 +890,23 @@ fn put_batch<'a>(
     if key_value_pairs.is_empty() {
         return Ok(atoms::ok().encode(env));
     }
+
+    // Preserve ordering when mixed with buffered put/3 calls.
+    if db_handle.has_pending_writes() {
+        if let Err(error_msg) = db_handle.force_flush_buffer() {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    }
     
+    let (live_env, live_db) = match db_handle.ensure_open_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
     // Create a write transaction for the entire batch
-    let mut txn = match (*db_handle).env.env.begin_rw_txn() {
+    let mut txn = match live_env.begin_rw_txn() {
         Ok(txn) => txn,
         Err(_) => {
             return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin write transaction".to_string()).encode(env));
@@ -726,7 +921,7 @@ fn put_batch<'a>(
         let key_bytes = key.as_slice();
         let value_bytes = value.as_slice();
         
-        match txn.put((*db_handle).db, &key_bytes, &value_bytes, WriteFlags::empty()) {
+        match txn.put(live_db, &key_bytes, &value_bytes, WriteFlags::empty()) {
             Ok(()) => {
                 success_count += 1;
             },
@@ -777,8 +972,15 @@ fn get<'a>(
         }
     }
     
+    let (live_env, live_db) = match db_handle.ensure_open_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
     // Create a read-only transaction
-    let txn = match (*db_handle).env.env.begin_ro_txn() {
+    let txn = match live_env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
             return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
@@ -786,7 +988,7 @@ fn get<'a>(
     };
     
     // Get the value for the key
-    let result = txn.get((*db_handle).db, &key_bytes);
+    let result = txn.get(live_db, &key_bytes);
     
     match result {
         Ok(value_bytes) => {
@@ -847,8 +1049,15 @@ fn iterator_next<'a>(
         }
     }
 
+    let (live_env, live_db) = match db_handle.ensure_open_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
     // Create a read-only transaction
-    let txn = match db_handle.env.env.begin_ro_txn() {
+    let txn = match live_env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
             return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
@@ -856,7 +1065,7 @@ fn iterator_next<'a>(
     };
 
     // Open a cursor for the database
-    let cursor = match txn.open_ro_cursor(db_handle.db) {
+    let cursor = match txn.open_ro_cursor(live_db) {
         Ok(cursor) => cursor,
         Err(_) => {
             return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
@@ -937,9 +1146,16 @@ fn list<'a>(
             return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
         }
     }
+
+    let (live_env, live_db) = match db_handle.ensure_open_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
     
     // Create a read-only transaction
-    let txn = match (*db_handle).env.env.begin_ro_txn() {
+    let txn = match live_env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
             return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
@@ -947,7 +1163,7 @@ fn list<'a>(
     };
 
     // Open a cursor for the database
-    let mut cursor = match txn.open_ro_cursor((*db_handle).db) {
+    let mut cursor = match txn.open_ro_cursor(live_db) {
         Ok(cursor) => cursor,
         Err(_) => {
             return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
@@ -1083,9 +1299,16 @@ fn match_pattern<'a>(
             return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
         }
     }
+
+    let (live_env, live_db) = match db_handle.ensure_open_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
     
     // Create a read-only transaction
-    let txn = match (*db_handle).env.env.begin_ro_txn() {
+    let txn = match live_env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
             return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
@@ -1093,7 +1316,7 @@ fn match_pattern<'a>(
     };
     
     // Open a cursor for the database
-    let mut cursor = match txn.open_ro_cursor((*db_handle).db) {
+    let mut cursor = match txn.open_ro_cursor(live_db) {
         Ok(cursor) => cursor,
         Err(_) => {
             return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
@@ -1315,7 +1538,7 @@ fn parse_db_options(options: Vec<Term>) -> NifResult<DbOptions> {
     Ok(db_opts)
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Clone)]
 struct EnvOptions {
     map_size: Option<u64>,
     max_readers: Option<u32>,
@@ -1336,10 +1559,7 @@ struct DbOptions {
 
 #[rustler::nif]
 fn env_status<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
-    let closed = {
-        let closed = env_handle.closed.lock().map_err(|_| Error::BadArg)?;
-        *closed
-    };
+    let closed = env_handle.is_closed().map_err(|_| Error::BadArg)?;
     
     let ref_count = {
         let ref_count = env_handle.ref_count.lock().map_err(|_| Error::BadArg)?;
