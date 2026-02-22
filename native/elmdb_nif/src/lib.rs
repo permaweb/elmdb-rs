@@ -244,6 +244,14 @@ impl LmdbEnv {
         Ok(())
     }
 
+    fn write_buffer_size(&self) -> Result<usize, String> {
+        let options = self
+            .options
+            .lock()
+            .map_err(|_| "Failed to lock environment options".to_string())?;
+        Ok(options.batch_size.unwrap_or(1000))
+    }
+
     fn ensure_open(&self) -> Result<(Arc<Environment>, u64), String> {
         let mut state = self
             .state
@@ -535,6 +543,12 @@ fn db_open<'a>(
     if let Err(error_msg) = env_handle.ensure_open() {
         return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
     }
+    let batch_size = match env_handle.write_buffer_size() {
+        Ok(size) => size,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
+        }
+    };
 
     let db_key = env_handle.path.clone();
     if let Some(existing_db) = {
@@ -545,6 +559,9 @@ fn db_open<'a>(
             if let Err(error_msg) = existing_db.set_create_if_missing(true) {
                 return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
             }
+        }
+        if let Err(error_msg) = existing_db.set_batch_size(batch_size) {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
         }
         if let Err(error_msg) = existing_db.reopen_if_closed() {
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
@@ -564,7 +581,7 @@ fn db_open<'a>(
     // Create database resource with write buffer (default buffer size: 1000 operations)
     let lmdb_db = LmdbDatabase { 
         env: env_handle.clone(),
-        write_buffer: Arc::new(Mutex::new(WriteBuffer::new(1000))),
+        write_buffer: Arc::new(Mutex::new(WriteBuffer::new(batch_size))),
         cached_db: Arc::new(Mutex::new(None)),
         create_if_missing: Arc::new(Mutex::new(parsed_options.create)),
         closed: Arc::new(Mutex::new(false)),
@@ -635,6 +652,19 @@ impl LmdbDatabase {
             .lock()
             .map_err(|_| "Failed to lock database options".to_string())?;
         *create_if_missing = true;
+        Ok(())
+    }
+
+    fn set_batch_size(&self, batch_size: usize) -> Result<(), String> {
+        if batch_size == 0 {
+            return Err("Batch size must be greater than 0".to_string());
+        }
+
+        let mut write_buffer = self
+            .write_buffer
+            .lock()
+            .map_err(|_| "Failed to lock write buffer".to_string())?;
+        write_buffer.max_size = batch_size;
         Ok(())
     }
 
@@ -1501,6 +1531,13 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
                         env_opts.max_readers = Some(readers);
                     }
                 }
+                "batch_size" => {
+                    if let Ok(size) = value.decode::<u64>() {
+                        if size > 0 && size <= usize::MAX as u64 {
+                            env_opts.batch_size = Some(size as usize);
+                        }
+                    }
+                }
                 _ => {} // Ignore unknown options for now
             }
         } else if let Ok(atom) = option.decode::<rustler::Atom>() {
@@ -1542,6 +1579,7 @@ fn parse_db_options(options: Vec<Term>) -> NifResult<DbOptions> {
 struct EnvOptions {
     map_size: Option<u64>,
     max_readers: Option<u32>,
+    batch_size: Option<usize>,
     no_mem_init: bool,
     no_sync: bool,
     no_lock: bool,
