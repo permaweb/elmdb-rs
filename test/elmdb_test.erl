@@ -15,7 +15,7 @@ setup() ->
     Dir = test_dir(),
     file:del_dir_r(Dir),
     filelib:ensure_dir(Dir ++ "/"),
-    {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}]),
+    {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 1000}]),
     {ok, DB} = elmdb:db_open(Env, [create]),
     {Dir, Env, DB}.
 
