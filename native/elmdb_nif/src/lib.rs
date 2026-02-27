@@ -84,6 +84,7 @@ mod atoms {
         bad_txn,
         bad_val_size,
         bad_dbi,
+        too_many_open_files,
     }
 }
 
@@ -1507,6 +1508,7 @@ fn lmdb_error_to_atom(error: lmdb::Error) -> rustler::Atom {
         lmdb::Error::BadTxn => atoms::bad_txn(),
         lmdb::Error::BadValSize => atoms::bad_val_size(),
         lmdb::Error::BadDbi => atoms::bad_dbi(),
+        lmdb::Error::Other(24) => atoms::too_many_open_files(),
         lmdb::Error::Other(28) => atoms::no_space(),
         lmdb::Error::Other(_) => atoms::io_error(),
     }
