@@ -1030,8 +1030,8 @@ fn get<'a>(
         Err(lmdb::Error::NotFound) => {
             Ok(atoms::not_found().encode(env))
         },
-        Err(_) => {
-            Ok((atoms::error(), atoms::database_error(), "Failed to get value".to_string()).encode(env))
+        Err(e) => {
+            Ok((atoms::error(), atoms::database_error(), e.to_string()).encode(env))
         }
     }
 }
