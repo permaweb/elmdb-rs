@@ -80,17 +80,20 @@ init_per_testcase(TestCase, Config) ->
     end.
 
 end_per_testcase(_TestCase, Config) ->
-    % Clean up
+    case ?config(db, Config) of
+        undefined -> ok;
+        DB ->
+            catch elmdb:flush(DB),
+            catch elmdb:db_close(DB)
+    end,
     case ?config(env, Config) of
         undefined -> ok;
-        Env -> 
+        Env ->
             catch elmdb:env_close(Env)
     end,
-    
-    % Remove test directory
     case ?config(test_dir, Config) of
         undefined -> ok;
-        TestDir -> 
+        TestDir ->
             file:del_dir_r(TestDir)
     end,
     ok.
@@ -346,22 +349,22 @@ bench_concurrent_access(Config) ->
     % Start concurrent writers
     StartTime = erlang:monotonic_time(microsecond),
     
-    WriterPids = lists:map(fun(ProcessId) ->
-        spawn_link(fun() ->
+    Writers = lists:map(fun(ProcessId) ->
+        {Pid, Ref} = spawn_monitor(fun() ->
             write_concurrent_records(DB, ProcessId, RecordsPerProcess)
-        end)
+        end),
+        {Pid, Ref, ProcessId}
     end, lists:seq(1, ProcessCount)),
-    
-    % Wait for all writers to complete
-    lists:foreach(fun(Pid) ->
+
+    lists:foreach(fun({Pid, Ref, ProcessId}) ->
         receive
-            {'EXIT', Pid, normal} -> ok;
-            {'EXIT', Pid, Reason} -> 
-                ct:print("Writer process ~p failed: ~p", [Pid, Reason])
+            {'DOWN', Ref, process, Pid, normal} -> ok;
+            {'DOWN', Ref, process, Pid, Reason} ->
+                ct:print("Writer ~p failed: ~p", [ProcessId, Reason])
         after 30000 ->
-            ct:print("Writer process ~p timed out", [Pid])
+            ct:print("Writer ~p timed out", [ProcessId])
         end
-    end, WriterPids),
+    end, Writers),
     
     EndTime = erlang:monotonic_time(microsecond),
     
