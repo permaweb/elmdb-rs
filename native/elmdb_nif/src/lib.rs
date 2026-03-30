@@ -30,6 +30,7 @@ use rustler::types::binary::OwnedBinary;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use arc_swap::ArcSwap;
 use std::path::Path;
 use lmdb::{Environment, EnvironmentFlags, Database, DatabaseFlags, Transaction, WriteFlags, Cursor};
 
@@ -182,13 +183,12 @@ pub struct LmdbDatabase {
     has_pending: AtomicBool,
     /// Atomic: true when db is closed
     is_closed: AtomicBool,
-    /// Fast-path: raw pointer to Environment (kept alive by env ResourceArc)
-    fast_env: std::sync::atomic::AtomicPtr<Environment>,
-    /// Fast-path: cached Database handle (stored as usize for atomic access)
-    fast_db: AtomicU64,
-    /// Fast-path: generation when fast_env/fast_db were set
-    fast_gen: AtomicU64,
+    /// Fast-path: cached (Arc<Environment>, Database, env_generation) triple.
+    /// Written only on open/close/reopen. Read on every get via ArcSwap::load()
+    /// which returns a Guard — no refcount increment, no lock, no cache-line bounce.
+    hot_handles: ArcSwap<Option<(Arc<Environment>, Database, u64)>>,
 }
+
 
 #[derive(Debug)]
 struct EnvState {
@@ -322,12 +322,12 @@ impl LmdbEnv {
             .map_err(|_| "Failed to write environment state".to_string())?;
 
         state.close_requested = true;
+        state.generation += 1;
+        self.generation.fetch_add(1, Ordering::Release);
         if let Some(existing_env) = state.env.as_ref() {
             if Arc::strong_count(existing_env) == 1 {
                 state.env = None;
                 state.close_requested = false;
-                state.generation += 1;
-            self.generation.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -368,8 +368,9 @@ fn soft_close_db(db_handle: &ResourceArc<LmdbDatabase>) -> Result<(), String> {
         *cached = None;
     }
 
-    db_handle.fast_env.store(std::ptr::null_mut(), Ordering::Release);
-    db_handle.fast_gen.store(u64::MAX, Ordering::Release);
+    db_handle.hot_handles.store(Arc::new(None));
+
+
 
     if was_open {
         let mut ref_count = db_handle
@@ -621,9 +622,7 @@ fn db_open<'a>(
         closed: Arc::new(RwLock::new(false)),
         has_pending: AtomicBool::new(false),
         is_closed: AtomicBool::new(false),
-        fast_env: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
-        fast_db: AtomicU64::new(0),
-        fast_gen: AtomicU64::new(u64::MAX),
+        hot_handles: ArcSwap::from_pointee(None),
     };
     let resource = ResourceArc::new(lmdb_db);
 
@@ -809,19 +808,18 @@ impl LmdbDatabase {
                                      op.key.len(), op.value.len(), e))?;
         }
         
-        // Commit the transaction
         txn.commit()
             .map_err(|_| "Failed to commit batch transaction")?;
-        
+
         Ok(())
     }
 
     // Optimized method that tries to batch multiple puts in a single transaction
     fn put_with_batching(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
+        self.has_pending.store(true, Ordering::Release);
         let (should_batch_immediately, current_ops) = {
             let mut buffer = self.write_buffer.write().map_err(|_| "Failed to write lock buffer")?;
             buffer.add_without_check(key, value);
-            self.has_pending.store(true, Ordering::Release);
 
             if buffer.should_flush() {
                 let ops = buffer.drain();
@@ -869,27 +867,33 @@ impl LmdbDatabase {
         Ok(())
     }
 
-    fn get_open_handles_fast(&self) -> Result<(*const Environment, Database), String> {
+    fn fast_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         if !self.is_closed.load(Ordering::Relaxed) {
-            let gen = self.env.generation.load(Ordering::Acquire);
-            if self.fast_gen.load(Ordering::Acquire) == gen {
-                let ptr = self.fast_env.load(Ordering::Acquire);
-                if !ptr.is_null() {
-                    let db_bits = self.fast_db.load(Ordering::Acquire);
-                    let db = unsafe { std::mem::transmute::<u64, [u32; 2]>(db_bits)[0] };
-                    let db: Database = unsafe { std::mem::transmute(db) };
-                    return Ok((ptr, db));
+            let current_gen = self.env.generation.load(Ordering::Acquire);
+            let guard = self.hot_handles.load();
+            if let Some((ref env, db, cached_gen)) = **guard {
+                if cached_gen == current_gen {
+                    let txn = env.begin_ro_txn()
+                        .map_err(|e| format!("begin_ro_txn failed: {:?}", e))?;
+                    return match txn.get(db, &key) {
+                        Ok(val) => Ok(Some(val.to_vec())),
+                        Err(lmdb::Error::NotFound) => Ok(None),
+                        Err(e) => Err(format!("get failed: {:?}", e)),
+                    };
                 }
             }
         }
 
         let (env, db) = self.ensure_open_handles()?;
         let gen = self.env.generation.load(Ordering::Acquire);
-        self.fast_env.store(Arc::as_ptr(&env) as *mut Environment, Ordering::Release);
-        let db_bits: u32 = unsafe { std::mem::transmute(db) };
-        self.fast_db.store(db_bits as u64, Ordering::Release);
-        self.fast_gen.store(gen, Ordering::Release);
-        Ok((Arc::as_ptr(&env), db))
+        self.hot_handles.store(Arc::new(Some((env.clone(), db, gen))));
+        let txn = env.begin_ro_txn()
+            .map_err(|e| format!("begin_ro_txn failed: {:?}", e))?;
+        match txn.get(db, &key) {
+            Ok(val) => Ok(Some(val.to_vec())),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(format!("get failed: {:?}", e)),
+        }
     }
 }
 
@@ -1045,6 +1049,7 @@ fn put_batch<'a>(
     // Commit the transaction
     match txn.commit() {
         Ok(()) => {
+        
             if errors.is_empty() {
                 Ok(atoms::ok().encode(env))
             } else {
@@ -1069,38 +1074,15 @@ fn get<'a>(
         }
     }
 
-    let (env_ptr, live_db) = match db_handle.get_open_handles_fast() {
-        Ok(handles) => handles,
-        Err(error_msg) => {
-            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
-        }
-    };
-
-    let key_bytes = key.as_slice();
-    let live_env = unsafe { &*env_ptr };
-
-    let txn = match live_env.begin_ro_txn() {
-        Ok(txn) => txn,
-        Err(_) => {
-            return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
-        }
-    };
-    
-    // Get the value for the key
-    let result = txn.get(live_db, &key_bytes);
-    
-    match result {
-        Ok(value_bytes) => {
-            // Convert the value to a binary that Erlang can use
+    match db_handle.fast_get(key.as_slice()) {
+        Ok(Some(value_bytes)) => {
             let mut binary = rustler::types::binary::OwnedBinary::new(value_bytes.len()).unwrap();
-            binary.as_mut_slice().copy_from_slice(value_bytes);
+            binary.as_mut_slice().copy_from_slice(&value_bytes);
             Ok((atoms::ok(), binary.release(env)).encode(env))
         },
-        Err(lmdb::Error::NotFound) => {
-            Ok(atoms::not_found().encode(env))
-        },
-        Err(_) => {
-            Ok((atoms::error(), atoms::database_error(), "Failed to get value".to_string()).encode(env))
+        Ok(None) => Ok(atoms::not_found().encode(env)),
+        Err(error_msg) => {
+            Ok((atoms::error(), atoms::database_error(), error_msg).encode(env))
         }
     }
 }

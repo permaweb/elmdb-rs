@@ -862,3 +862,100 @@ match_concurrent_test_() ->
                  end)
          ]
      end}.
+
+%%%===================================================================
+%%% Read Cache Safety Tests
+%%%===================================================================
+
+put_batch_cache_invalidation_test_() ->
+    [
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"k1">>, <<"old">>),
+                elmdb:flush(DB),
+                ?assertEqual({ok, <<"old">>}, elmdb:get(DB, <<"k1">>)),
+                ok = elmdb:put_batch(DB, [{<<"k1">>, <<"new">>}, {<<"k2">>, <<"v2">>}]),
+                ?assertEqual({ok, <<"new">>}, elmdb:get(DB, <<"k1">>)),
+                ?assertEqual({ok, <<"v2">>}, elmdb:get(DB, <<"k2">>)),
+                cleanup({Dir, Env, DB})
+            end),
+
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"x1">>, <<"before">>),
+                elmdb:flush(DB),
+                ?assertEqual({ok, <<"before">>}, elmdb:get(DB, <<"x1">>)),
+                Self = self(),
+                spawn(fun() ->
+                    ok = elmdb:put_batch(DB, [{<<"x1">>, <<"after">>}]),
+                    Self ! written
+                end),
+                receive written -> ok end,
+                timer:sleep(1),
+                ?assertEqual({ok, <<"after">>}, elmdb:get(DB, <<"x1">>)),
+                cleanup({Dir, Env, DB})
+            end)
+    ].
+
+env_close_cached_txn_test_() ->
+    [
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"alive">>, <<"yes">>),
+                elmdb:flush(DB),
+                ?assertEqual({ok, <<"yes">>}, elmdb:get(DB, <<"alive">>)),
+                elmdb:db_close(DB),
+                elmdb:env_close(Env),
+                {ok, Env2} = elmdb:env_open(Dir, [{map_size, 10485760}]),
+                {ok, DB2} = elmdb:db_open(Env2, [create]),
+                ?assertEqual({ok, <<"yes">>}, elmdb:get(DB2, <<"alive">>)),
+                cleanup({Dir, Env2, DB2})
+            end),
+
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"cycle">>, <<"v1">>),
+                elmdb:flush(DB),
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(DB, <<"cycle">>)),
+                elmdb:db_close(DB),
+                elmdb:env_close(Env),
+                {ok, Env2} = elmdb:env_open(Dir, [{map_size, 10485760}]),
+                {ok, DB2} = elmdb:db_open(Env2, [create]),
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(DB2, <<"cycle">>)),
+                ok = elmdb:put(DB2, <<"cycle">>, <<"v2">>),
+                elmdb:flush(DB2),
+                ?assertEqual({ok, <<"v2">>}, elmdb:get(DB2, <<"cycle">>)),
+                cleanup({Dir, Env2, DB2})
+            end)
+    ].
+
+concurrent_write_read_test_() ->
+    [
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"counter">>, <<"0">>),
+                elmdb:flush(DB),
+                Self = self(),
+                Writers = [spawn_monitor(fun() ->
+                    lists:foreach(fun(N) ->
+                        elmdb:put(DB, <<"counter">>, integer_to_binary(N)),
+                        elmdb:flush(DB)
+                    end, lists:seq(I*100, I*100+99)),
+                    Self ! {writer_done, self()}
+                end) || I <- lists:seq(1, 5)],
+                Readers = [spawn_monitor(fun() ->
+                    lists:foreach(fun(_) ->
+                        case elmdb:get(DB, <<"counter">>) of
+                            {ok, _} -> ok;
+                            not_found -> exit(stale_not_found)
+                        end
+                    end, lists:seq(1, 500)),
+                    Self ! {reader_done, self()}
+                end) || _ <- lists:seq(1, 5)],
+                [receive {writer_done, P} -> ok end || {P, _} <- Writers],
+                [receive {reader_done, P} -> ok end || {P, _} <- Readers],
+                [receive {'DOWN', R, process, P, normal} -> ok end
+                 || {P, R} <- Writers ++ Readers],
+                cleanup({Dir, Env, DB})
+            end)
+    ].
