@@ -50,6 +50,7 @@ mod atoms {
         no_mem_init,
         no_sync,
         write_map,
+        read_only,
         create,
         iterator,
         start,
@@ -228,6 +229,9 @@ fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lm
     }
     if options.write_map {
         flags |= EnvironmentFlags::WRITE_MAP;
+    }
+    if options.read_only {
+        flags |= EnvironmentFlags::READ_ONLY;
     }
     env_builder.set_flags(flags);
 
@@ -1549,6 +1553,7 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
                 "no_sync" => env_opts.no_sync = true,
                 "no_lock" => env_opts.no_lock = true,
                 "write_map" => env_opts.write_map = true,
+                "read_only" => env_opts.read_only = true,
                 _ => {} // Ignore unknown options
             }
         }
@@ -1584,6 +1589,7 @@ struct EnvOptions {
     no_sync: bool,
     no_lock: bool,
     write_map: bool,
+    read_only: bool,
 }
 
 #[derive(Default)]

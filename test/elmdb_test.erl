@@ -862,3 +862,57 @@ match_concurrent_test_() ->
                  end)
          ]
      end}.
+
+%%%===================================================================
+%%% Read-Only Environment Tests
+%%%===================================================================
+
+read_only_test_() ->
+    [
+     ?_test(begin
+                WriteDir = test_dir(),
+                ReadDir = test_dir(),
+                filelib:ensure_dir(WriteDir ++ "/"),
+                {ok, Env} = elmdb:env_open(WriteDir, [{map_size, 10485760}]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                ok = elmdb:put(DB, <<"ro_key">>, <<"ro_val">>),
+                ok = elmdb:flush(DB),
+                ok = elmdb:db_close(DB),
+                ok = elmdb:env_close(Env),
+                filelib:ensure_dir(ReadDir ++ "/"),
+                {ok, _} = file:copy(WriteDir ++ "/data.mdb", ReadDir ++ "/data.mdb"),
+                {ok, _} = file:copy(WriteDir ++ "/lock.mdb", ReadDir ++ "/lock.mdb"),
+                {ok, RoEnv} = elmdb:env_open(ReadDir, [{map_size, 10485760}, read_only]),
+                {ok, RoDB} = elmdb:db_open(RoEnv, []),
+                ?assertEqual({ok, <<"ro_val">>}, elmdb:get(RoDB, <<"ro_key">>)),
+                ok = elmdb:db_close(RoDB),
+                ok = elmdb:env_close(RoEnv),
+                file:del_dir_r(WriteDir),
+                file:del_dir_r(ReadDir)
+            end),
+
+     ?_test(begin
+                WriteDir = test_dir(),
+                ReadDir = test_dir(),
+                filelib:ensure_dir(WriteDir ++ "/"),
+                {ok, Env} = elmdb:env_open(WriteDir, [{map_size, 10485760}]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                ok = elmdb:put(DB, <<"k1">>, <<"v1">>),
+                ok = elmdb:put(DB, <<"k2">>, <<"v2">>),
+                ok = elmdb:flush(DB),
+                ok = elmdb:db_close(DB),
+                ok = elmdb:env_close(Env),
+                filelib:ensure_dir(ReadDir ++ "/"),
+                {ok, _} = file:copy(WriteDir ++ "/data.mdb", ReadDir ++ "/data.mdb"),
+                {ok, _} = file:copy(WriteDir ++ "/lock.mdb", ReadDir ++ "/lock.mdb"),
+                {ok, RoEnv} = elmdb:env_open(ReadDir, [{map_size, 10485760}, read_only]),
+                {ok, RoDB} = elmdb:db_open(RoEnv, []),
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(RoDB, <<"k1">>)),
+                ?assertEqual({ok, <<"v2">>}, elmdb:get(RoDB, <<"k2">>)),
+                ?assertEqual(not_found, elmdb:get(RoDB, <<"missing">>)),
+                ok = elmdb:db_close(RoDB),
+                ok = elmdb:env_close(RoEnv),
+                file:del_dir_r(WriteDir),
+                file:del_dir_r(ReadDir)
+            end)
+    ].
