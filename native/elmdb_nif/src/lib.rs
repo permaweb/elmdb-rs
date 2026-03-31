@@ -320,15 +320,9 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
     let new_map = Arc::new(SccHashMap::new());
     let old_map = db.active.swap(new_map);
     db.draining.store(Arc::new(Some(old_map.clone())));
-    db.op_count.store(0, Ordering::Release);
+    let _ = db.op_count.swap(0, Ordering::AcqRel);
 
-    let mut snapshot = Vec::new();
-    old_map.iter_sync(|k, v| {
-        snapshot.push((k.clone(), v.clone()));
-        true
-    });
-
-    if snapshot.is_empty() {
+    if old_map.is_empty() {
         db.draining.store(Arc::new(None));
         return Ok(());
     }
@@ -336,17 +330,32 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
     let (live_env, live_db) = match db.fast_get_handles() {
         Ok(handles) => handles,
         Err(e) => {
+            restore_failed_flush(db, old_map);
             return Err(e);
         }
     };
 
-    let mut txn = live_env
-        .begin_rw_txn()
-        .map_err(|_| "Failed to begin write transaction".to_string())?;
+    let mut txn = match live_env.begin_rw_txn() {
+        Ok(txn) => txn,
+        Err(_) => {
+            restore_failed_flush(db, old_map);
+            return Err("Failed to begin write transaction".to_string());
+        }
+    };
 
-    for (k, v) in &snapshot {
-        txn.put(live_db, k, v, WriteFlags::empty())
-            .map_err(|e| format!("Failed to put value: {:?}", e))?;
+    let mut write_err = None;
+    (*old_map).iter_sync(|k, v| {
+        if let Err(e) = txn.put(live_db, k, v, WriteFlags::empty()) {
+            write_err = Some(format!("Failed to put value: {:?}", e));
+            return false;
+        }
+        true
+    });
+
+    if let Some(e) = write_err {
+        drop(txn);
+        restore_failed_flush(db, old_map);
+        return Err(e);
     }
 
     match txn.commit() {
@@ -354,8 +363,20 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
             db.draining.store(Arc::new(None));
             Ok(())
         }
-        Err(_) => Err("Failed to commit batch transaction".to_string()),
+        Err(_) => {
+            restore_failed_flush(db, old_map);
+            Err("Failed to commit batch transaction".to_string())
+        }
     }
+}
+
+fn restore_failed_flush(db: &LmdbDatabase, failed_map: Arc<SccHashMap<Vec<u8>, Vec<u8>>>) {
+    let current = db.active.load();
+    (*failed_map).iter_sync(|k, v| {
+        let _ = current.upsert_sync(k.clone(), v.clone());
+        true
+    });
+    db.draining.store(Arc::new(None));
 }
 
 fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
