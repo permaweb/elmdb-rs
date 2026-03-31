@@ -1043,8 +1043,7 @@ fn get<'a>(
     // Fast path: skip overlay checks if both maps are empty
     let active_guard = db_handle.active.load();
     if !active_guard.is_empty() {
-        let key_vec = key_bytes.to_vec();
-        if let Some(value) = active_guard.read_sync(&key_vec, |_, v| v.clone()) {
+        if let Some(value) = active_guard.read_sync(key_bytes, |_, v| v.clone()) {
             let mut binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
             binary.as_mut_slice().copy_from_slice(&value);
             return Ok((atoms::ok(), binary.release(env)).encode(env));
@@ -1054,8 +1053,7 @@ fn get<'a>(
     {
         let draining_guard = db_handle.draining.load();
         if let Some(ref old_map) = **draining_guard {
-            let key_vec = key_bytes.to_vec();
-            if let Some(value) = old_map.read_sync(&key_vec, |_, v| v.clone()) {
+            if let Some(value) = old_map.read_sync(key_bytes, |_, v| v.clone()) {
                 let mut binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
                 binary.as_mut_slice().copy_from_slice(&value);
                 return Ok((atoms::ok(), binary.release(env)).encode(env));
