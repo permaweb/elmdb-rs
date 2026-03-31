@@ -153,8 +153,18 @@ db_close(_DBInstance) ->
 %% @throws {error, Type, Description} on failure
 -spec put(DBInstance :: term(), Key :: binary(), Value :: binary()) -> 
     ok | {error, term(), binary()}.
-put(_DBInstance, _Key, _Value) ->
-    erlang:nif_error(nif_not_loaded).
+put(DBInstance, Key, Value) ->
+    case nif_put(DBInstance, Key, Value) of
+        ok -> ok;
+        {ok, flush} -> try_flush(DBInstance);
+        ewouldlock ->
+            case dirty_put(DBInstance, Key, Value) of
+                ok -> ok;
+                {ok, flush} -> try_flush(DBInstance);
+                Error -> Error
+            end;
+        Error -> Error
+    end.
 
 %% @doc Write multiple key-value pairs to the database in a single transaction
 %% @param DBInstance Database handle
@@ -170,7 +180,7 @@ put_batch(_DBInstance, _KeyValuePairs) ->
 %% @param DBInstance Database handle
 %% @param Key The key to read (binary)
 %% @returns {ok, Value} where Value is a binary, or not_found if key doesn't exist
--spec get(DBInstance :: term(), Key :: binary()) -> 
+-spec get(DBInstance :: term(), Key :: binary()) ->
     {ok, binary()} | not_found.
 get(_DBInstance, _Key) ->
     erlang:nif_error(nif_not_loaded).
@@ -254,7 +264,7 @@ map(DBInstance, Fun) when is_function(Fun, 2) ->
 %% @param DBInstance Database handle
 %% @param Key The key prefix to search for (binary)
 %% @returns {ok, Children} where Children is a list of binaries, or not_found
--spec list(DBInstance :: term(), Key :: binary()) -> 
+-spec list(DBInstance :: term(), Key :: binary()) ->
     {ok, [binary()]} | not_found.
 list(_DBInstance, _Key) ->
     erlang:nif_error(nif_not_loaded).
@@ -280,7 +290,6 @@ list(_DBInstance, _Key) ->
 match(DBInstance, Patterns) ->
     match_pattern(DBInstance, Patterns).
 
-%% Internal NIF stub for match_pattern
 match_pattern(_DBInstance, _Patterns) ->
     erlang:nif_error(nif_not_loaded).
 
@@ -288,5 +297,21 @@ match_pattern(_DBInstance, _Patterns) ->
 %% @param DBInstance Database handle
 %% @returns ok on success
 -spec flush(DBInstance :: term()) -> ok | {error, term(), binary()}.
-flush(_DBInstance) ->
+flush(DBInstance) ->
+    try_flush(DBInstance).
+
+%%%===================================================================
+%%% Internal NIF stubs
+%%%===================================================================
+
+nif_put(_DBInstance, _Key, _Value) ->
+    erlang:nif_error(nif_not_loaded).
+
+dirty_put(_DBInstance, _Key, _Value) ->
+    erlang:nif_error(nif_not_loaded).
+
+try_flush(_DBInstance) ->
+    erlang:nif_error(nif_not_loaded).
+
+nif_has_pending(_DBInstance) ->
     erlang:nif_error(nif_not_loaded).
