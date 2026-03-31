@@ -153,18 +153,8 @@ db_close(_DBInstance) ->
 %% @throws {error, Type, Description} on failure
 -spec put(DBInstance :: term(), Key :: binary(), Value :: binary()) -> 
     ok | {error, term(), binary()}.
-put(DBInstance, Key, Value) ->
-    case nif_put(DBInstance, Key, Value) of
-        ok -> ok;
-        {ok, flush} -> try_flush(DBInstance);
-        ewouldlock ->
-            case dirty_put(DBInstance, Key, Value) of
-                ok -> ok;
-                {ok, flush} -> try_flush(DBInstance);
-                Error -> Error
-            end;
-        Error -> Error
-    end.
+put(_DBInstance, _Key, _Value) ->
+    erlang:nif_error(nif_not_loaded).
 
 %% @doc Write multiple key-value pairs to the database in a single transaction
 %% @param DBInstance Database handle
@@ -297,21 +287,5 @@ match_pattern(_DBInstance, _Patterns) ->
 %% @param DBInstance Database handle
 %% @returns ok on success
 -spec flush(DBInstance :: term()) -> ok | {error, term(), binary()}.
-flush(DBInstance) ->
-    try_flush(DBInstance).
-
-%%%===================================================================
-%%% Internal NIF stubs
-%%%===================================================================
-
-nif_put(_DBInstance, _Key, _Value) ->
-    erlang:nif_error(nif_not_loaded).
-
-dirty_put(_DBInstance, _Key, _Value) ->
-    erlang:nif_error(nif_not_loaded).
-
-try_flush(_DBInstance) ->
-    erlang:nif_error(nif_not_loaded).
-
-nif_has_pending(_DBInstance) ->
+flush(_DBInstance) ->
     erlang:nif_error(nif_not_loaded).
