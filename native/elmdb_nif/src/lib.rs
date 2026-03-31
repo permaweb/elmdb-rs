@@ -376,10 +376,13 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
 
 fn restore_failed_flush(db: &LmdbDatabase, failed_map: Arc<SccHashMap<Vec<u8>, Vec<u8>>>) {
     let current = db.active.load();
+    let mut count = 0usize;
     (*failed_map).iter_sync(|k, v| {
         let _ = current.upsert_sync(k.clone(), v.clone());
+        count += 1;
         true
     });
+    db.op_count.fetch_add(count, Ordering::Relaxed);
     db.draining.store(Arc::new(None));
 }
 
@@ -1039,6 +1042,12 @@ fn get<'a>(
     if db_handle.is_closed.load(Ordering::Acquire) {
         if let Err(error_msg) = db_handle.validate_database() {
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    }
+
+    if let Ok(guard) = db_handle.fatal_error.lock() {
+        if let Some(ref err) = *guard {
+            return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
         }
     }
 
