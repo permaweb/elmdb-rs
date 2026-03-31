@@ -151,9 +151,19 @@ db_close(_DBInstance) ->
 %% @param Value The value to store (binary)
 %% @returns ok on success
 %% @throws {error, Type, Description} on failure
--spec put(DBInstance :: term(), Key :: binary(), Value :: binary()) -> 
+-spec put(DBInstance :: term(), Key :: binary(), Value :: binary()) ->
     ok | {error, term(), binary()}.
-put(_DBInstance, _Key, _Value) ->
+put(DBInstance, Key, Value) ->
+    case nif_put(DBInstance, Key, Value) of
+        {ok, flush} -> try_flush(DBInstance);
+        ok -> ok;
+        Error -> Error
+    end.
+
+nif_put(_DBInstance, _Key, _Value) ->
+    erlang:nif_error(nif_not_loaded).
+
+try_flush(_DBInstance) ->
     erlang:nif_error(nif_not_loaded).
 
 %% @doc Write multiple key-value pairs to the database in a single transaction

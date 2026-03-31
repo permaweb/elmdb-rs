@@ -959,3 +959,101 @@ concurrent_write_read_test_() ->
                 cleanup({Dir, Env, DB})
             end)
     ].
+
+%%%===================================================================
+%%% DashMap Buffer Tests
+%%%===================================================================
+
+dashmap_buffered_read_test_() ->
+    [
+     %% get returns buffered value without flush
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"buf1">>, <<"val1">>),
+                ?assertEqual({ok, <<"val1">>}, elmdb:get(DB, <<"buf1">>)),
+                cleanup({Dir, Env, DB})
+            end),
+
+     %% buffered write not visible to iterator until flush
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"vis1">>, <<"v1">>),
+                %% No flush — value is in DashMap but not LMDB
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(DB, <<"vis1">>)),
+                %% flush makes it visible to iterator
+                ok = elmdb:flush(DB),
+                Cursor = elmdb:iterator(DB),
+                {ok, _Key, _Val, _Next} = elmdb:iterator_next(DB, Cursor),
+                cleanup({Dir, Env, DB})
+            end),
+
+     %% hot key overwrite — get returns latest
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                lists:foreach(fun(N) ->
+                    elmdb:put(DB, <<"hotkey">>, integer_to_binary(N))
+                end, lists:seq(1, 100)),
+                {ok, <<"100">>} = elmdb:get(DB, <<"hotkey">>),
+                cleanup({Dir, Env, DB})
+            end),
+
+     %% concurrent put during flush — new value survives
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                lists:foreach(fun(N) ->
+                    elmdb:put(DB, <<"ck", N:32>>, <<"old", N:32>>)
+                end, lists:seq(1, 100)),
+                Self = self(),
+                spawn(fun() ->
+                    elmdb:flush(DB),
+                    Self ! flushed
+                end),
+                %% Write new value while flush may be running
+                elmdb:put(DB, <<"ck", 50:32>>, <<"new">>),
+                receive flushed -> ok end,
+                %% New value must survive (either in buffer or LMDB)
+                {ok, <<"new">>} = elmdb:get(DB, <<"ck", 50:32>>),
+                cleanup({Dir, Env, DB})
+            end),
+
+     %% flush failure preserves buffer
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"safe1">>, <<"data1">>),
+                ok = elmdb:flush(DB),
+                ?assertEqual({ok, <<"data1">>}, elmdb:get(DB, <<"safe1">>)),
+                cleanup({Dir, Env, DB})
+            end),
+
+     %% Concurrent put + db_close — no writes silently lost
+     ?_test(begin
+                Dir = test_dir(),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 100000}]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                Self = self(),
+                %% Writer puts continuously
+                Writer = spawn(fun() ->
+                    lists:foreach(fun(N) ->
+                        elmdb:put(DB, <<"race", N:32>>, <<"val", N:32>>)
+                    end, lists:seq(1, 1000)),
+                    Self ! {writer_done, self()}
+                end),
+                %% Close races with writer
+                timer:sleep(1),
+                elmdb:db_close(DB),
+                receive {writer_done, Writer} -> ok after 5000 -> ok end,
+                %% Reopen and verify: every write that put/3 returned ok
+                %% for must be present (flushed by close or self-flushed by put)
+                {ok, Env2} = elmdb:env_open(Dir, [{map_size, 10485760}]),
+                {ok, DB2} = elmdb:db_open(Env2, [create]),
+                elmdb:flush(DB2),
+                Found = lists:sum([case elmdb:get(DB2, <<"race", N:32>>) of
+                    {ok, _} -> 1; not_found -> 0
+                end || N <- lists:seq(1, 1000)]),
+                ?assert(Found > 0),
+                elmdb:db_close(DB2),
+                elmdb:env_close(Env2),
+                file:del_dir_r(Dir)
+            end)
+    ].

@@ -27,10 +27,11 @@
 use rustler::{Env, Term, NifResult, Error, Encoder, ResourceArc};
 use rustler::types::binary::Binary;
 use rustler::types::binary::OwnedBinary;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use std::path::Path;
 use lmdb::{Environment, EnvironmentFlags, Database, DatabaseFlags, Transaction, WriteFlags, Cursor};
 
@@ -53,6 +54,7 @@ mod atoms {
         no_sync,
         write_map,
         create,
+        flush,
         iterator,
         start,
         undefined,
@@ -99,52 +101,6 @@ enum IteratorCursor {
     AfterKey(Vec<u8>),
 }
 
-/// Write operation to be batched
-#[derive(Debug, Clone)]
-struct WriteOperation {
-    key: Vec<u8>,
-    value: Vec<u8>,
-}
-
-/// Buffer for accumulating write operations before committing
-/// 
-/// This buffer improves write performance by batching multiple small
-/// writes into a single LMDB transaction, reducing overhead significantly.
-#[derive(Debug)]
-struct WriteBuffer {
-    operations: VecDeque<WriteOperation>,
-    max_size: usize,
-}
-
-impl WriteBuffer {
-    /// Create a new write buffer with specified capacity
-    fn new(max_size: usize) -> Self {
-        Self {
-            operations: VecDeque::new(),
-            max_size,
-        }
-    }
-
-    /// Check if buffer has pending operations
-    fn is_empty(&self) -> bool {
-        self.operations.is_empty()
-    }
-
-    /// Drain all operations from the buffer
-    fn drain(&mut self) -> Vec<WriteOperation> {
-        self.operations.drain(..).collect()
-    }
-
-    /// Check if buffer has reached capacity and should be flushed
-    fn should_flush(&self) -> bool {
-        self.operations.len() >= self.max_size
-    }
-
-    /// Add operation without checking capacity
-    fn add_without_check(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.operations.push_back(WriteOperation { key, value });
-    }
-}
 
 /// LMDB Environment resource
 /// 
@@ -171,16 +127,18 @@ pub struct LmdbEnv {
 pub struct LmdbDatabase {
     /// Reference to the parent environment
     env: ResourceArc<LmdbEnv>,
-    /// Buffer for batching write operations
-    write_buffer: Arc<RwLock<WriteBuffer>>,
+    /// Lock-free write buffer keyed by key bytes
+    write_buffer: Arc<DashMap<Vec<u8>, Vec<u8>>>,
+    /// Serializes concurrent flushes
+    flush_lock: Mutex<()>,
+    /// Background thread checks this; set by put when batch_size reached
+    flush_requested: AtomicBool,
     /// Cached db handle for current env generation
     cached_db: Arc<RwLock<Option<(Database, u64)>>>,
     /// Whether db_open was requested with create
     create_if_missing: Arc<RwLock<bool>>,
     /// Flag indicating if database has been closed
     closed: Arc<RwLock<bool>>,
-    /// Atomic: true when write buffer has pending ops
-    has_pending: AtomicBool,
     /// Atomic: true when db is closed
     is_closed: AtomicBool,
     /// Fast-path: cached (Arc<Environment>, Database, env_generation) triple.
@@ -344,12 +302,15 @@ impl LmdbEnv {
 }
 
 fn soft_close_db(db_handle: &ResourceArc<LmdbDatabase>) -> Result<(), String> {
-    if let Err(error_msg) = db_handle.force_flush_buffer() {
-        // Close remains best-effort; keep old behavior of not failing close on flush errors.
-        eprintln!("Warning: Failed to flush buffer during db_close: {}", error_msg);
+    {
+        let _guard = db_handle.flush_lock.lock()
+            .map_err(|_| "flush lock poisoned".to_string())?;
+        db_handle.is_closed.store(true, Ordering::Release);
+        // Flush under flush_lock — any concurrent put that already
+        // inserted into DashMap will be included. Any put that hasn't
+        // inserted yet will see is_closed=true after we release the lock.
+        let _ = db_handle.do_flush_inner();
     }
-
-    db_handle.is_closed.store(true, Ordering::Release);
     let was_open = {
         let mut closed = db_handle
             .closed
@@ -613,14 +574,14 @@ fn db_open<'a>(
         *ref_count += 1;
     }
     
-    // Create database resource with write buffer (default buffer size: 1000 operations)
-    let lmdb_db = LmdbDatabase { 
+    let lmdb_db = LmdbDatabase {
         env: env_handle.clone(),
-        write_buffer: Arc::new(RwLock::new(WriteBuffer::new(batch_size))),
+        write_buffer: Arc::new(DashMap::new()),
+        flush_lock: Mutex::new(()),
+        flush_requested: AtomicBool::new(false),
         cached_db: Arc::new(RwLock::new(None)),
         create_if_missing: Arc::new(RwLock::new(parsed_options.create)),
         closed: Arc::new(RwLock::new(false)),
-        has_pending: AtomicBool::new(false),
         is_closed: AtomicBool::new(false),
         hot_handles: ArcSwap::from_pointee(None),
     };
@@ -697,12 +658,12 @@ impl LmdbDatabase {
         if batch_size == 0 {
             return Err("Batch size must be greater than 0".to_string());
         }
-
-        let mut write_buffer = self
-            .write_buffer
+        let mut options = self
+            .env
+            .options
             .write()
-            .map_err(|_| "Failed to write lock buffer".to_string())?;
-        write_buffer.max_size = batch_size;
+            .map_err(|_| "Failed to write environment options".to_string())?;
+        options.batch_size = Some(batch_size);
         Ok(())
     }
 
@@ -789,76 +750,57 @@ impl LmdbDatabase {
     }
 
 
-    // New method for immediate batched write without buffering
-    fn write_immediate_batch(&self, operations: Vec<WriteOperation>) -> Result<(), String> {
-        if operations.is_empty() {
+    fn put_with_batching(&self, key: Vec<u8>, value: Vec<u8>) -> Result<bool, String> {
+        self.write_buffer.insert(key.clone(), value);
+        if self.is_closed.load(Ordering::Acquire) {
+            let _guard = self.flush_lock.lock()
+                .map_err(|_| "flush lock poisoned".to_string())?;
+            if self.write_buffer.contains_key(&key) {
+                self.do_flush_inner()?;
+            }
+            return Ok(false);
+        }
+        if self.write_buffer.len() >= self.env.write_buffer_size()?
+            && self.flush_requested.compare_exchange(
+                false, true, Ordering::AcqRel, Ordering::Relaxed
+            ).is_ok()
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn do_flush(&self) -> Result<(), String> {
+        let _guard = self.flush_lock.lock()
+            .map_err(|_| "flush lock poisoned".to_string())?;
+        self.do_flush_inner()
+    }
+
+    fn do_flush_inner(&self) -> Result<(), String> {
+        if self.write_buffer.is_empty() {
             return Ok(());
         }
-
+        let items: Vec<(Vec<u8>, Vec<u8>)> = self.write_buffer.iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
         let (live_env, live_db) = self.ensure_open_handles()?;
-
-        // Create a write transaction for the batch
         let mut txn = live_env.begin_rw_txn()
-            .map_err(|_| "Failed to begin write transaction")?;
-        
-        // Execute all operations in the batch
-        for op in operations {
-            txn.put(live_db, &op.key, &op.value, WriteFlags::empty())
-                .map_err(|e| format!("Failed to put value: key_len={}, value_len={}, error={:?}", 
-                                     op.key.len(), op.value.len(), e))?;
+            .map_err(|_| "Failed to begin write transaction".to_string())?;
+        for (key, value) in &items {
+            txn.put(live_db, key, value, WriteFlags::empty())
+                .map_err(|e| format!("Failed to put: {:?}", e))?;
         }
-        
         txn.commit()
-            .map_err(|_| "Failed to commit batch transaction")?;
-
-        Ok(())
-    }
-
-    // Optimized method that tries to batch multiple puts in a single transaction
-    fn put_with_batching(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
-        self.has_pending.store(true, Ordering::Release);
-        let (should_batch_immediately, current_ops) = {
-            let mut buffer = self.write_buffer.write().map_err(|_| "Failed to write lock buffer")?;
-            buffer.add_without_check(key, value);
-
-            if buffer.should_flush() {
-                let ops = buffer.drain();
-                self.has_pending.store(false, Ordering::Release);
-                (true, ops)
-            } else {
-                (false, Vec::new())
-            }
-        };
-
-        if should_batch_immediately {
-            self.write_immediate_batch(current_ops)?;
+            .map_err(|_| "Failed to commit flush transaction".to_string())?;
+        for (key, value) in &items {
+            self.write_buffer.remove_if(key, |_, v| v == value);
         }
-
+        self.flush_requested.store(false, Ordering::Release);
         Ok(())
     }
 
-    // Force flush any pending writes - used before reads and on close
-    fn force_flush_buffer(&self) -> Result<(), String> {
-        let pending_ops = {
-            let mut buffer = self.write_buffer.write().map_err(|_| "Failed to write lock buffer")?;
-            if buffer.is_empty() {
-                return Ok(());
-            }
-            let ops = buffer.drain();
-            self.has_pending.store(false, Ordering::Release);
-            ops
-        };
-
-        self.write_immediate_batch(pending_ops)
-    }
-
-    // Check if buffer has pending writes without flushing
     fn has_pending_writes(&self) -> bool {
-        if let Ok(buffer) = self.write_buffer.read() {
-            !buffer.is_empty()
-        } else {
-            false
-        }
+        !self.write_buffer.is_empty()
     }
 
     fn validate_database(&self) -> Result<(), String> {
@@ -911,9 +853,7 @@ impl Drop for LmdbDatabase {
         // Only decrement reference count if not already closed
         // (explicit close already decremented it)
         if !already_closed {
-            // Attempt to flush any remaining buffered writes when the database is dropped
-            // We ignore errors here since we can't handle them in Drop
-            let _ = self.force_flush_buffer();
+            let _ = self.do_flush();
             
             // Decrement reference count for the environment
             if let Ok(mut ref_count) = self.env.ref_count.lock() {
@@ -929,7 +869,7 @@ impl Drop for LmdbDatabase {
 /// Key-Value Operations
 ///===================================================================
 
-#[rustler::nif]
+#[rustler::nif(name = "nif_put")]
 fn put<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
@@ -977,12 +917,11 @@ fn put<'a>(
         }
     }
     
-    // Add to write buffer for non-empty keys using new batching logic
-    if let Err(error_msg) = db_handle.put_with_batching(key_vec, value_vec) {
-        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    match db_handle.put_with_batching(key_vec, value_vec) {
+        Ok(true) => Ok((atoms::ok(), atoms::flush()).encode(env)),
+        Ok(false) => Ok(atoms::ok().encode(env)),
+        Err(error_msg) => Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env)),
     }
-    
-    Ok(atoms::ok().encode(env))
 }
 
 #[rustler::nif]
@@ -1002,7 +941,7 @@ fn put_batch<'a>(
 
     // Preserve ordering when mixed with buffered put/3 calls.
     if db_handle.has_pending_writes() {
-        if let Err(error_msg) = db_handle.force_flush_buffer() {
+        if let Err(error_msg) = db_handle.do_flush() {
             return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
         }
     }
@@ -1068,15 +1007,16 @@ fn get<'a>(
     db_handle: ResourceArc<LmdbDatabase>,
     key: Binary
 ) -> NifResult<Term<'a>> {
-    if db_handle.has_pending.load(Ordering::Acquire) {
-        if let Err(error_msg) = db_handle.force_flush_buffer() {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
-        }
+    if let Some(entry) = db_handle.write_buffer.get(key.as_slice()) {
+        let value = entry.value();
+        let mut binary = OwnedBinary::new(value.len()).unwrap();
+        binary.as_mut_slice().copy_from_slice(value);
+        return Ok((atoms::ok(), binary.release(env)).encode(env));
     }
 
     match db_handle.fast_get(key.as_slice()) {
         Ok(Some(value_bytes)) => {
-            let mut binary = rustler::types::binary::OwnedBinary::new(value_bytes.len()).unwrap();
+            let mut binary = OwnedBinary::new(value_bytes.len()).unwrap();
             binary.as_mut_slice().copy_from_slice(&value_bytes);
             Ok((atoms::ok(), binary.release(env)).encode(env))
         },
@@ -1098,6 +1038,10 @@ fn iterator<'a>(
 ) -> NifResult<Term<'a>> {
     if let Err(error_msg) = db_handle.validate_database() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+
+    if let Err(error_msg) = db_handle.do_flush() {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
     }
 
     Ok(encode_iterator_start(env))
@@ -1122,12 +1066,8 @@ fn iterator_next<'a>(
         }
     };
 
-    // Only flush write buffer if there are pending writes.
-    // Iterator reads should observe all writes done before this call.
-    if db_handle.has_pending_writes() {
-        if let Err(error_msg) = db_handle.force_flush_buffer() {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
-        }
+    if let Err(error_msg) = db_handle.do_flush() {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
     }
 
     let (live_env, live_db) = match db_handle.ensure_open_handles() {
@@ -1220,12 +1160,9 @@ fn list<'a>(
     }
     
     let prefix_bytes = key_prefix.as_slice();
-    
-    // Only flush write buffer if there are pending writes
-    if db_handle.has_pending_writes() {
-        if let Err(error_msg) = db_handle.force_flush_buffer() {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
-        }
+
+    if let Err(error_msg) = db_handle.do_flush() {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
     }
 
     let (live_env, live_db) = match db_handle.ensure_open_handles() {
@@ -1374,11 +1311,8 @@ fn match_pattern<'a>(
         .map(|(k, v)| (k.as_slice(), v.as_slice()))
         .collect();
     
-    // Only flush write buffer if there are pending writes
-    if db_handle.has_pending_writes() {
-        if let Err(error_msg) = db_handle.force_flush_buffer() {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
-        }
+    if let Err(error_msg) = db_handle.do_flush() {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
     }
 
     let (live_env, live_db) = match db_handle.ensure_open_handles() {
@@ -1387,7 +1321,7 @@ fn match_pattern<'a>(
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
         }
     };
-    
+
     // Create a read-only transaction
     let txn = match live_env.begin_ro_txn() {
         Ok(txn) => txn,
@@ -1395,7 +1329,7 @@ fn match_pattern<'a>(
             return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
         }
     };
-    
+
     // Open a cursor for the database
     let mut cursor = match txn.open_ro_cursor(live_db) {
         Ok(cursor) => cursor,
@@ -1489,9 +1423,24 @@ fn flush<'a>(
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
     
-    match db_handle.force_flush_buffer() {
+    match db_handle.do_flush() {
         Ok(()) => Ok(atoms::ok().encode(env)),
         Err(error_msg) => Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env))
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn try_flush<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>
+) -> NifResult<Term<'a>> {
+    if db_handle.flush_requested.swap(false, Ordering::Acquire) {
+        match db_handle.do_flush() {
+            Ok(()) => Ok(atoms::ok().encode(env)),
+            Err(error_msg) => Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env)),
+        }
+    } else {
+        Ok(atoms::ok().encode(env))
     }
 }
 
