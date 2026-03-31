@@ -378,7 +378,7 @@ performance_test_() ->
     {timeout, 60,
      ?_test(begin
                 {Dir, Env, DB} = setup(),
-                
+
                 % Write 1000 key-value pairs
                 Start = erlang:monotonic_time(millisecond),
                 lists:foreach(fun(I) ->
@@ -386,17 +386,90 @@ performance_test_() ->
                     Value = iolist_to_binary([<<"value">>, integer_to_binary(I)]),
                     ok = elmdb:put(DB, Key, Value)
                 end, lists:seq(1, 1000)),
-                
+
                 WriteTime = erlang:monotonic_time(millisecond) - Start,
                 ?debugFmt("Write 1000 keys: ~p ms", [WriteTime]),
-                
+
                 % Verify a few reads
                 ?assertEqual({ok, <<"value1">>}, elmdb:get(DB, <<"key1">>)),
                 ?assertEqual({ok, <<"value500">>}, elmdb:get(DB, <<"key500">>)),
                 ?assertEqual({ok, <<"value1000">>}, elmdb:get(DB, <<"key1000">>)),
-                
+
                 cleanup({Dir, Env, DB})
             end)}.
+
+%%%===================================================================
+%%% Chain Validity Stress Test
+%%%===================================================================
+
+chain_validity_test_() ->
+    {timeout, 30,
+     ?_test(begin
+                Dir = "/tmp/elmdb_chain_" ++ integer_to_list(erlang:unique_integer([positive])),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 3}]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+
+                Parent = self(),
+                StopFlag = atomics:new(1, []),
+                atomics:put(StopFlag, 1, 0),
+
+                Writers = [spawn_monitor(fun() ->
+                    chain_writer(DB, W, 500),
+                    Parent ! {writer_done, self()}
+                end) || W <- lists:seq(1, 5)],
+
+                Readers = [spawn_monitor(fun() ->
+                    Broken = chain_reader(DB, StopFlag, 0),
+                    Parent ! {reader_result, self(), Broken}
+                end) || _ <- lists:seq(1, 5)],
+
+                [receive {writer_done, P} -> ok end || {P, _} <- Writers],
+                atomics:put(StopFlag, 1, 1),
+
+                BrokenTotal = lists:sum([receive {reader_result, P, N} -> N end || {P, _} <- Readers]),
+
+                [receive {'DOWN', R, process, P, _} -> ok end || {P, R} <- Writers ++ Readers],
+
+                elmdb:flush(DB),
+                elmdb:db_close(DB),
+                elmdb:env_close(Env),
+                file:del_dir_r(Dir),
+
+                ?assertEqual(0, BrokenTotal)
+            end)}.
+
+chain_writer(DB, W, Iters) ->
+    WB = integer_to_binary(W),
+    lists:foreach(fun(I) ->
+        IB = integer_to_binary(I),
+        ok = elmdb:put(DB, <<"w", WB/binary, ":", IB/binary, "/leaf">>, <<"val", WB/binary, ":", IB/binary>>),
+        ok = elmdb:put(DB, <<"w", WB/binary, ":", IB/binary, "/c">>, <<"w", WB/binary, ":", IB/binary, "/leaf">>),
+        ok = elmdb:put(DB, <<"w", WB/binary, ":", IB/binary, "/b">>, <<"w", WB/binary, ":", IB/binary, "/c">>),
+        ok = elmdb:put(DB, <<"w", WB/binary, ":", IB/binary, "/a">>, <<"w", WB/binary, ":", IB/binary, "/b">>)
+    end, lists:seq(1, Iters)).
+
+chain_reader(DB, StopFlag, Broken) ->
+    case atomics:get(StopFlag, 1) of
+        1 -> Broken;
+        0 ->
+            WB = integer_to_binary(rand:uniform(5)),
+            IB = integer_to_binary(rand:uniform(500)),
+            Root = <<"w", WB/binary, ":", IB/binary, "/a">>,
+            NewBroken = case elmdb:get(DB, Root) of
+                not_found -> Broken;
+                {ok, Next1} -> follow_chain(DB, Next1, 3, Broken)
+            end,
+            chain_reader(DB, StopFlag, NewBroken)
+    end.
+
+follow_chain(_DB, _Key, 0, Broken) -> Broken;
+follow_chain(DB, Key, Hops, Broken) ->
+    case elmdb:get(DB, Key) of
+        not_found -> Broken + 1;
+        {ok, Next} -> follow_chain(DB, Next, Hops - 1, Broken)
+    end.
 
 %%%===================================================================
 %%% Iterator/Fold Performance Test
@@ -859,6 +932,121 @@ match_concurrent_test_() ->
                      lists:foreach(fun(Result) ->
                          ?assertEqual({ok, [<<"concurrent/test">>]}, Result)
                      end, Results)
+                 end)
+         ]
+     end}.
+
+%%%===================================================================
+%%% Ported Tests from expr/erlbuf
+%%%===================================================================
+
+put_batch_cache_invalidation_test_() ->
+    [
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"k1">>, <<"old">>),
+                elmdb:flush(DB),
+                ?assertEqual({ok, <<"old">>}, elmdb:get(DB, <<"k1">>)),
+                ok = elmdb:put(DB, <<"k1">>, <<"new">>),
+                ok = elmdb:put(DB, <<"k2">>, <<"v2">>),
+                ?assertEqual({ok, <<"new">>}, elmdb:get(DB, <<"k1">>)),
+                ?assertEqual({ok, <<"v2">>}, elmdb:get(DB, <<"k2">>)),
+                cleanup({Dir, Env, DB})
+            end)
+    ].
+
+env_close_cached_txn_test_() ->
+    [
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"alive">>, <<"yes">>),
+                elmdb:flush(DB),
+                ?assertEqual({ok, <<"yes">>}, elmdb:get(DB, <<"alive">>)),
+                elmdb:db_close(DB),
+                elmdb:env_close(Env),
+                {ok, Env2} = elmdb:env_open(Dir, [{map_size, 10485760}]),
+                {ok, DB2} = elmdb:db_open(Env2, [create]),
+                ?assertEqual({ok, <<"yes">>}, elmdb:get(DB2, <<"alive">>)),
+                cleanup({Dir, Env2, DB2})
+            end)
+    ].
+
+concurrent_write_read_test_() ->
+    [
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"counter">>, <<"0">>),
+                elmdb:flush(DB),
+                Self = self(),
+                Writers = [spawn_monitor(fun() ->
+                    lists:foreach(fun(N) ->
+                        elmdb:put(DB, <<"counter">>, integer_to_binary(N)),
+                        elmdb:flush(DB)
+                    end, lists:seq(I*100, I*100+99)),
+                    Self ! {writer_done, self()}
+                end) || I <- lists:seq(1, 5)],
+                Readers = [spawn_monitor(fun() ->
+                    lists:foreach(fun(_) ->
+                        case elmdb:get(DB, <<"counter">>) of
+                            {ok, _} -> ok;
+                            not_found -> exit(stale_not_found)
+                        end
+                    end, lists:seq(1, 500)),
+                    Self ! {reader_done, self()}
+                end) || _ <- lists:seq(1, 5)],
+                [receive {writer_done, P} -> ok end || {P, _} <- Writers],
+                [receive {reader_done, P} -> ok end || {P, _} <- Readers],
+                [receive {'DOWN', R, process, P, normal} -> ok end
+                 || {P, R} <- Writers ++ Readers],
+                cleanup({Dir, Env, DB})
+            end)
+    ].
+
+overlay_buffered_read_test_() ->
+    [
+     ?_test(begin
+                {Dir, Env, DB} = setup(),
+                ok = elmdb:put(DB, <<"buf1">>, <<"val1">>),
+                ?assertEqual({ok, <<"val1">>}, elmdb:get(DB, <<"buf1">>)),
+                cleanup({Dir, Env, DB})
+            end)
+    ].
+
+%%%===================================================================
+%%% Regression Tests
+%%%===================================================================
+
+flush_visibility_regression_test_() ->
+    {setup,
+     fun() ->
+         Dir = test_dir(),
+         file:del_dir_r(Dir),
+         filelib:ensure_dir(Dir ++ "/"),
+         {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 1000}]),
+         {ok, DB} = elmdb:db_open(Env, [create]),
+         {Dir, Env, DB}
+     end,
+     fun({Dir, Env, DB}) ->
+         _ = elmdb:db_close(DB),
+         _ = elmdb:env_close(Env),
+         file:del_dir_r(Dir)
+     end,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     % Write exactly 1000 keys to trigger background flush
+                     lists:foreach(fun(I) ->
+                         Key = <<"key_", (integer_to_binary(I))/binary>>,
+                         Value = <<"value_", (integer_to_binary(I))/binary>>,
+                         ok = elmdb:put(DB, Key, Value)
+                     end, lists:seq(1, 1000)),
+
+                     % Immediately read all keys - none should return not_found
+                     lists:foreach(fun(I) ->
+                         Key = <<"key_", (integer_to_binary(I))/binary>>,
+                         Result = elmdb:get(DB, Key),
+                         ?assertNotEqual(not_found, Result)
+                     end, lists:seq(1, 1000))
                  end)
          ]
      end}.

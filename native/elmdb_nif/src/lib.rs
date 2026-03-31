@@ -322,8 +322,9 @@ impl LmdbEnv {
 
 fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
     let new_map = Arc::new(SccHashMap::new());
-    let old_map = db.active.swap(new_map);
+    let old_map = db.active.load_full();
     db.draining.store(Arc::new(Some(old_map.clone())));
+    db.active.store(new_map);
     let _ = db.op_count.swap(0, Ordering::AcqRel);
 
     if old_map.is_empty() {
@@ -378,7 +379,7 @@ fn restore_failed_flush(db: &LmdbDatabase, failed_map: Arc<SccHashMap<Vec<u8>, V
     let current = db.active.load();
     let mut count = 0usize;
     (*failed_map).iter_sync(|k, v| {
-        let _ = current.upsert_sync(k.clone(), v.clone());
+        let _ = current.insert_sync(k.clone(), v.clone());
         count += 1;
         true
     });
