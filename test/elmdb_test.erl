@@ -1050,3 +1050,348 @@ flush_visibility_regression_test_() ->
                  end)
          ]
      end}.
+
+%%%===================================================================
+%%% Fatal-state and Recovery Regression Tests
+%%%===================================================================
+
+flush_sync_waiter_on_worker_death_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 1048576}, {batch_size, 3},
+                                                  no_sync, no_mem_init, write_map]),
+                {ok, _DB0} = elmdb:db_open(Env, [create]),
+                LargeVal = binary:copy(<<"x">>, 10000),
+                trigger_map_full(_DB0, LargeVal, 0),
+
+                {ok, DB} = elmdb:db_open(Env, [create]),
+
+                Self = self(),
+                Flushers = [spawn_monitor(fun() ->
+                    R = elmdb:flush(DB),
+                    Self ! {flush_result, self(), R}
+                end) || _ <- lists:seq(1, 3)],
+
+                lists:foreach(fun(I) ->
+                    K = <<"trigger_", (integer_to_binary(I))/binary>>,
+                    elmdb:put(DB, K, <<"v">>)
+                end, lists:seq(1, 6)),
+
+                lists:foreach(fun({Pid, Ref}) ->
+                    receive
+                        {flush_result, Pid, {error, _, _}} -> ok
+                    after 5000 ->
+                        ?assert(false)
+                    end,
+                    receive {'DOWN', Ref, process, _, _} -> ok after 1000 -> ok end
+                end, Flushers),
+
+                ?assertMatch({error, _, _}, elmdb:get(DB, <<"trigger_1">>)),
+
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+trigger_map_full(DB, LargeVal, N) ->
+    Key = <<"fill_", (integer_to_binary(N))/binary>>,
+    case elmdb:put(DB, Key, LargeVal) of
+        ok ->
+            case elmdb:flush(DB) of
+                ok -> trigger_map_full(DB, LargeVal, N + 1);
+                {error, _, _} -> ok
+            end;
+        {error, _, _} -> ok
+    end.
+
+reopen_after_fatal_restores_worker_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 1048576}, {batch_size, 3},
+                                                  no_sync, no_mem_init, write_map]),
+                {ok, _DB1} = elmdb:db_open(Env, [create]),
+
+                LargeVal = binary:copy(<<"x">>, 10000),
+                trigger_map_full(_DB1, LargeVal, 0),
+
+                {ok, DB2} = elmdb:db_open(Env, [create]),
+
+                ok = elmdb:put(DB2, <<"recovered_key">>, <<"recovered_val">>),
+                ?assertEqual({ok, <<"recovered_val">>}, elmdb:get(DB2, <<"recovered_key">>)),
+                ?assertMatch({error, _, _}, elmdb:flush(DB2)),
+
+                _ = elmdb:db_close(DB2),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+put_batch_rejects_invalid_keys_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     Result = elmdb:put_batch(DB, [{<<>>, <<"val">>}, {<<"good_key">>, <<"good_val">>}]),
+                     ?assertMatch({error, validation_error, _}, Result),
+                     ?assertEqual(not_found, elmdb:get(DB, <<"good_key">>)),
+
+                     ok = elmdb:put_batch(DB, [{<<"healthy_key">>, <<"healthy_val">>}]),
+                     ok = elmdb:flush(DB),
+                     ?assertEqual({ok, <<"healthy_val">>}, elmdb:get(DB, <<"healthy_key">>))
+                 end)
+         ]
+     end}.
+
+put_batch_oversized_key_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     OversizedKey = binary:copy(<<"x">>, 512),
+                     ?assertMatch({error, validation_error, _},
+                                  elmdb:put_batch(DB, [{OversizedKey, <<"val">>}])),
+
+                     ok = elmdb:put_batch(DB, [{<<"durable_key">>, <<"durable_val">>}]),
+                     ok = elmdb:flush(DB),
+                     ?assertEqual({ok, <<"durable_val">>}, elmdb:get(DB, <<"durable_key">>))
+                 end)
+         ]
+     end}.
+
+concurrent_ops_no_hang_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 104857600}, {batch_size, 5}]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+
+                Self = self(),
+                Workers = [spawn_monitor(fun() ->
+                    Prefix = <<"w", (integer_to_binary(W))/binary, "_">>,
+                    worker_script(DB, Prefix, 10),
+                    Self ! {worker_done, self()}
+                end) || W <- lists:seq(1, 5)],
+
+                Closer = spawn_monitor(fun() ->
+                    timer:sleep(50),
+                    elmdb:db_close(DB),
+                    elmdb:db_open(Env, [create]),
+                    Self ! {closer_done, self()}
+                end),
+
+                AllProcs = Workers ++ [Closer],
+                lists:foreach(fun({P, Ref}) ->
+                    receive
+                        {worker_done, P} -> ok;
+                        {closer_done, P} -> ok;
+                        {'DOWN', Ref, process, P, _} -> ok
+                    after 10000 ->
+                        ?assert(false)
+                    end
+                end, AllProcs),
+                [receive {'DOWN', R, process, P, _} -> ok after 1000 -> ok end
+                 || {P, R} <- AllProcs],
+
+                {ok, DB2} = elmdb:db_open(Env, [create]),
+                ok = elmdb:put(DB2, <<"liveness_check">>, <<"ok">>),
+                ok = elmdb:flush(DB2),
+                ?assertEqual({ok, <<"ok">>}, elmdb:get(DB2, <<"liveness_check">>)),
+
+                _ = elmdb:db_close(DB2),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+worker_script(DB, Prefix, Rounds) ->
+    lists:foreach(fun(R) ->
+        RB = integer_to_binary(R),
+        elmdb:put(DB, <<Prefix/binary, RB/binary, "_a">>, <<"v1">>),
+        elmdb:put(DB, <<Prefix/binary, RB/binary, "_b">>, <<"v2">>),
+        elmdb:put(DB, <<Prefix/binary, RB/binary, "_c">>, <<"v3">>),
+        elmdb:put_batch(DB, [
+            {<<Prefix/binary, RB/binary, "_d">>, <<"v4">>},
+            {<<Prefix/binary, RB/binary, "_e">>, <<"v5">>}
+        ]),
+        elmdb:flush(DB),
+        elmdb:get(DB, <<Prefix/binary, RB/binary, "_a">>),
+        elmdb:get(DB, <<Prefix/binary, RB/binary, "_b">>),
+        elmdb:list(DB, <<Prefix/binary, RB/binary, "_">>)
+    end, lists:seq(1, Rounds)).
+
+repeated_fatal_recover_cycle_test_() ->
+    {timeout, 30,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 1048576}, {batch_size, 3},
+                                                  no_sync, no_mem_init, write_map]),
+                {ok, DB0} = elmdb:db_open(Env, [create]),
+
+                LargeVal = binary:copy(<<"x">>, 10000),
+                recover_cycle(Env, DB0, LargeVal, 1, 3),
+
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+recover_cycle(_Env, _DB, _LargeVal, Iter, Max) when Iter > Max -> ok;
+recover_cycle(Env, DB, LargeVal, Iter, Max) ->
+    trigger_map_full(DB, LargeVal, Iter * 1000),
+    {ok, DB2} = elmdb:db_open(Env, [create]),
+    SmallKey = <<"small_", (integer_to_binary(Iter))/binary>>,
+    ok = elmdb:put(DB2, SmallKey, <<"survived">>),
+    ?assertEqual({ok, <<"survived">>}, elmdb:get(DB2, SmallKey)),
+    ?assertMatch({error, _, _}, elmdb:flush(DB2)),
+    recover_cycle(Env, DB2, LargeVal, Iter + 1, Max).
+
+multi_db_parallel_no_crosstalk_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dirs = [test_dir() || _ <- lists:seq(1, 3)],
+                lists:foreach(fun(D) ->
+                    file:del_dir_r(D),
+                    filelib:ensure_dir(D ++ "/")
+                end, Dirs),
+
+                Envs = [begin {ok, E} = elmdb:env_open(D, [{map_size, 10485760}]), E end
+                        || D <- Dirs],
+                DBs = [begin {ok, Db} = elmdb:db_open(E, [create]), Db end
+                       || E <- Envs],
+
+                Self = self(),
+                Workers = lists:zipwith(fun(Idx, DB) ->
+                    spawn_monitor(fun() ->
+                        Prefix = <<"db", (integer_to_binary(Idx))/binary, "_key_">>,
+                        lists:foreach(fun(I) ->
+                            K = <<Prefix/binary, (integer_to_binary(I))/binary>>,
+                            elmdb:put(DB, K, <<"val">>)
+                        end, lists:seq(1, 50)),
+                        elmdb:flush(DB),
+                        lists:foreach(fun(I) ->
+                            K = <<Prefix/binary, (integer_to_binary(I))/binary>>,
+                            ?assertEqual({ok, <<"val">>}, elmdb:get(DB, K))
+                        end, lists:seq(1, 50)),
+                        Self ! {db_done, self()}
+                    end)
+                end, lists:seq(1, 3), DBs),
+
+                lists:foreach(fun({P, Ref}) ->
+                    receive
+                        {db_done, P} -> ok;
+                        {'DOWN', Ref, process, P, _} -> ok
+                    after 10000 ->
+                        ?assert(false)
+                    end
+                end, Workers),
+                [receive {'DOWN', R, process, P, _} -> ok after 1000 -> ok end
+                 || {P, R} <- Workers],
+
+                [DB1, DB2, DB3] = DBs,
+                ?assertEqual(not_found, elmdb:get(DB1, <<"db2_key_1">>)),
+                ?assertEqual(not_found, elmdb:get(DB2, <<"db3_key_1">>)),
+                ?assertEqual(not_found, elmdb:get(DB3, <<"db1_key_1">>)),
+
+                lists:foreach(fun({Db, E, D}) ->
+                    _ = elmdb:db_close(Db),
+                    _ = elmdb:env_close(E),
+                    file:del_dir_r(D)
+                end, lists:zip3(DBs, Envs, Dirs))
+            end)}.
+
+auto_flush_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 3},
+                                                  no_sync, no_mem_init, write_map]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+
+                lists:foreach(fun(I) ->
+                    K = <<"auto_", (integer_to_binary(I))/binary>>,
+                    ok = elmdb:put(DB, K, <<"v">>)
+                end, lists:seq(1, 10)),
+                timer:sleep(500),
+                ?assertEqual(0, elmdb:overlay_count(DB)),
+
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+concurrent_open_writers_auto_flush_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 3},
+                                                  no_sync, no_mem_init, write_map]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+
+                Self = self(),
+                Writer = spawn_monitor(fun() ->
+                    lists:foreach(fun(I) ->
+                        K = <<"race_", (integer_to_binary(I))/binary>>,
+                        elmdb:put(DB, K, <<"v">>)
+                    end, lists:seq(1, 20)),
+                    Self ! {writer_done, self()}
+                end),
+                Opener = spawn_monitor(fun() ->
+                    timer:sleep(1),
+                    {ok, _} = elmdb:db_open(Env, [create])
+                end),
+
+                {WriterPid, WriterRef} = Writer,
+                receive {writer_done, WriterPid} -> ok
+                after 5000 -> ?assert(false) end,
+                receive {'DOWN', WriterRef, process, _, _} -> ok after 1000 -> ok end,
+
+                {OpenerPid, OpenerRef} = Opener,
+                receive {'DOWN', OpenerRef, process, OpenerPid, normal} -> ok
+                after 5000 -> ?assert(false) end,
+
+                timer:sleep(500),
+                ?assertEqual(0, elmdb:overlay_count(DB)),
+
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+flush_pending_resets_after_recovery_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 1048576}, {batch_size, 3},
+                                                   no_sync, no_mem_init, write_map]),
+                {ok, _DB1} = elmdb:db_open(Env, [create]),
+                trigger_map_full(_DB1, binary:copy(<<"x">>, 10000), 0),
+
+                {ok, DB2} = elmdb:db_open(Env, [create]),
+                lists:foreach(fun(I) ->
+                    K = <<"fp_", (integer_to_binary(I))/binary>>,
+                    ok = elmdb:put(DB2, K, <<"v">>)
+                end, lists:seq(1, 6)),
+                timer:sleep(500),
+                ?assertMatch({error, _, _}, elmdb:get(DB2, <<"fp_1">>)),
+
+                _ = elmdb:db_close(DB2),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.

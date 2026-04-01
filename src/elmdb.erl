@@ -17,6 +17,9 @@
 %% Key-value operations
 -export([put/3, put_batch/2, get/2, flush/1]).
 
+%% Diagnostics
+-export([overlay_count/1]).
+
 %% Iterator operations
 -export([iterator/1, iterator_next/2, foreach/2, fold/3, map/2]).
 
@@ -288,4 +291,9 @@ match_pattern(_DBInstance, _Patterns) ->
 %% @returns ok on success
 -spec flush(DBInstance :: term()) -> ok | {error, term(), binary()}.
 flush(_DBInstance) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Return the number of entries in the write overlay (diagnostic)
+-spec overlay_count(DBInstance :: term()) -> non_neg_integer().
+overlay_count(_DBInstance) ->
     erlang:nif_error(nif_not_loaded).
