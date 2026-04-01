@@ -572,6 +572,12 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
         environments.get(path_str).cloned()
     } {
         if !Path::new(path_str).exists() {
+            if let Some(db_handle) = {
+                let databases = DATABASES.lock().unwrap();
+                databases.get(path_str).cloned()
+            } {
+                db_handle.hot_handles.store(Arc::new(None));
+            }
             if let Err(error_msg) = existing_env.request_close() {
                 return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
             }
@@ -745,9 +751,15 @@ fn db_open<'a>(
             }
         }
         existing_db.batch_size.store(batch_size, Ordering::Release);
+        if let Ok(mut fe) = existing_db.fatal_error.lock() {
+            if fe.is_some() {
+                *fe = None;
+            }
+        }
         if let Err(error_msg) = existing_db.reopen_if_closed() {
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
         }
+        ensure_worker(&existing_db);
         if let Err(error_msg) = existing_db.validate_database() {
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
         }
