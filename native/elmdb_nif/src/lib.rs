@@ -150,14 +150,14 @@ pub struct LmdbDatabase {
     batch_size: AtomicUsize,
     /// Coalesces redundant flush signals to worker
     flush_pending: AtomicBool,
+    /// Cache: true when db is closed (atomic fast-path, no lock needed)
+    is_closed: AtomicBool,
+    /// Atomic fast-path: true when fatal_error is set
+    has_fatal_error: AtomicBool,
     /// Metadata state (cached_db, closed, create_if_missing)
     state: Mutex<DbState>,
     /// Fatal flush error set by worker thread
     fatal_error: Mutex<Option<String>>,
-    /// Atomic fast-path: true when fatal_error is set
-    has_fatal_error: AtomicBool,
-    /// Cache: true when db is closed (atomic fast-path, no lock needed)
-    is_closed: AtomicBool,
     /// Lock-free read fast path: cached (Arc<Environment>, Database, generation)
     hot_handles: ArcSwap<Option<(Arc<Environment>, Database, u64)>>,
     /// Channel to send commands to the worker thread
@@ -1061,14 +1061,13 @@ fn get<'a>(
     db_handle: ResourceArc<LmdbDatabase>,
     key: Binary,
 ) -> NifResult<Term<'a>> {
-    // Fast path: skip validate_database if not closed (avoids Mutex)
-    if db_handle.is_closed.load(Ordering::Acquire) {
+    if db_handle.is_closed.load(Ordering::Relaxed) {
         if let Err(error_msg) = db_handle.validate_database() {
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
         }
     }
 
-    if db_handle.has_fatal_error.load(Ordering::Acquire) {
+    if db_handle.has_fatal_error.load(Ordering::Relaxed) {
         if let Ok(guard) = db_handle.fatal_error.lock() {
             if let Some(ref err) = *guard {
                 return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
