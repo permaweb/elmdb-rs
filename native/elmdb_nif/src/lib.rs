@@ -1134,7 +1134,7 @@ fn flush<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Te
     }
 }
 
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif]
 fn put_batch<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
@@ -1149,71 +1149,36 @@ fn put_batch<'a>(
         return Ok(atoms::ok().encode(env));
     }
 
-    let active_empty = db_handle.active.load().is_empty();
-    let draining_empty = db_handle.draining.load().is_none();
-    if !active_empty || !draining_empty {
-        if let Err(error_msg) = flush_sync(&db_handle) {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    if let Ok(guard) = db_handle.fatal_error.lock() {
+        if let Some(ref err) = *guard {
+            return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
         }
     }
 
-    let (live_env, live_db) = match db_handle.fast_get_handles() {
-        Ok(handles) => handles,
-        Err(error_msg) => {
-            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
-        }
-    };
-
-    let mut txn = match live_env.begin_rw_txn() {
-        Ok(txn) => txn,
-        Err(_) => {
-            return Ok((
-                atoms::error(),
-                atoms::transaction_error(),
-                "Failed to begin write transaction".to_string(),
-            )
-                .encode(env));
-        }
-    };
-
-    let mut success_count = 0;
-    let mut errors = Vec::new();
-
-    for (i, (key, value)) in key_value_pairs.iter().enumerate() {
-        let key_bytes = key.as_slice();
-        let value_bytes = value.as_slice();
-
-        match txn.put(live_db, &key_bytes, &value_bytes, WriteFlags::empty()) {
-            Ok(()) => {
-                success_count += 1;
-            }
-            Err(lmdb_err) => {
-                let error_detail = match lmdb_err {
-                    lmdb::Error::KeyExist => "Key already exists".to_string(),
-                    lmdb::Error::MapFull => "Database is full".to_string(),
-                    lmdb::Error::TxnFull => "Transaction is full".to_string(),
-                    _ => "Failed to put value".to_string(),
-                };
-                errors.push((i, error_detail));
+    let map = db_handle.active.load();
+    for (key, value) in key_value_pairs.iter() {
+        loop {
+            let m = db_handle.active.load();
+            let _ = m.upsert_sync(key.as_slice().to_vec(), value.as_slice().to_vec());
+            if Arc::ptr_eq(&m, &db_handle.active.load()) {
+                break;
             }
         }
     }
-
-    match txn.commit() {
-        Ok(()) => {
-            if errors.is_empty() {
-                Ok(atoms::ok().encode(env))
-            } else {
-                Ok((atoms::ok(), success_count, errors).encode(env))
+    let count = db_handle.op_count.fetch_add(key_value_pairs.len(), Ordering::Relaxed) + key_value_pairs.len();
+    let threshold = db_handle.batch_size.load(Ordering::Relaxed);
+    if count >= threshold {
+        if db_handle.flush_pending.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if let Ok(tx) = db_handle.worker_tx.lock() {
+                if let Some(ref sender) = *tx {
+                    let _ = sender.send(WorkerCommand::Flush);
+                }
             }
         }
-        Err(_) => Ok((
-            atoms::error(),
-            atoms::transaction_error(),
-            "Failed to commit batch transaction".to_string(),
-        )
-            .encode(env)),
     }
+    drop(map);
+
+    Ok(atoms::ok().encode(env))
 }
 
 ///===================================================================
