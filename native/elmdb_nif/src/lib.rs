@@ -154,6 +154,8 @@ pub struct LmdbDatabase {
     state: Mutex<DbState>,
     /// Fatal flush error set by worker thread
     fatal_error: Mutex<Option<String>>,
+    /// Atomic fast-path: true when fatal_error is set
+    has_fatal_error: AtomicBool,
     /// Cache: true when db is closed (atomic fast-path, no lock needed)
     is_closed: AtomicBool,
     /// Lock-free read fast path: cached (Arc<Environment>, Database, generation)
@@ -397,6 +399,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
                     if let Ok(mut guard) = db.fatal_error.lock() {
                         *guard = Some(e);
                     }
+                    db.has_fatal_error.store(true, Ordering::Release);
                     break;
                 }
             }
@@ -408,6 +411,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
                     if let Ok(mut guard) = db.fatal_error.lock() {
                         *guard = Some(result.as_ref().unwrap_err().clone());
                     }
+                    db.has_fatal_error.store(true, Ordering::Release);
                 }
                 {
                     let (lock, cvar) = &*signal;
@@ -426,6 +430,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
                     if let Ok(mut guard) = db.fatal_error.lock() {
                         *guard = Some(e);
                     }
+                    db.has_fatal_error.store(true, Ordering::Release);
                 }
                 break;
             }
@@ -756,6 +761,7 @@ fn db_open<'a>(
                 *fe = None;
             }
         }
+        existing_db.has_fatal_error.store(false, Ordering::Release);
         if let Err(error_msg) = existing_db.reopen_if_closed() {
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
         }
@@ -785,6 +791,7 @@ fn db_open<'a>(
             closed: false,
         }),
         fatal_error: Mutex::new(None),
+        has_fatal_error: AtomicBool::new(false),
         is_closed: AtomicBool::new(false),
         hot_handles: ArcSwap::from_pointee(None),
         worker_tx: Mutex::new(None),
@@ -861,6 +868,7 @@ impl LmdbDatabase {
             if let Ok(mut fe) = self.fatal_error.lock() {
                 *fe = None;
             }
+            self.has_fatal_error.store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -963,11 +971,13 @@ fn put<'a>(
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
     ensure_worker(&db_handle);
-    if let Ok(guard) = db_handle.fatal_error.lock() {
-        if let Some(ref err) = *guard {
-            return Ok(
-                (atoms::error(), atoms::transaction_error(), err.clone()).encode(env),
-            );
+    if db_handle.has_fatal_error.load(Ordering::Acquire) {
+        if let Ok(guard) = db_handle.fatal_error.lock() {
+            if let Some(ref err) = *guard {
+                return Ok(
+                    (atoms::error(), atoms::transaction_error(), err.clone()).encode(env),
+                );
+            }
         }
     }
 
@@ -1058,9 +1068,11 @@ fn get<'a>(
         }
     }
 
-    if let Ok(guard) = db_handle.fatal_error.lock() {
-        if let Some(ref err) = *guard {
-            return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
+    if db_handle.has_fatal_error.load(Ordering::Acquire) {
+        if let Ok(guard) = db_handle.fatal_error.lock() {
+            if let Some(ref err) = *guard {
+                return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
+            }
         }
     }
 
@@ -1149,9 +1161,11 @@ fn put_batch<'a>(
         return Ok(atoms::ok().encode(env));
     }
 
-    if let Ok(guard) = db_handle.fatal_error.lock() {
-        if let Some(ref err) = *guard {
-            return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
+    if db_handle.has_fatal_error.load(Ordering::Acquire) {
+        if let Ok(guard) = db_handle.fatal_error.lock() {
+            if let Some(ref err) = *guard {
+                return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
+            }
         }
     }
 
