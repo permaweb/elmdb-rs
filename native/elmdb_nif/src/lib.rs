@@ -28,14 +28,16 @@
 use rustler::{Env, Term, NifResult, Error, Encoder, ResourceArc};
 use rustler::types::binary::Binary;
 use rustler::types::binary::OwnedBinary;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::mpsc::{self, Sender, Receiver};
 use std::thread::{self, JoinHandle};
-use arc_swap::ArcSwap;
+use std::time::{Duration, Instant};
+use arc_swap::{ArcSwap, ArcSwapOption};
 use std::path::Path;
-use scc::HashMap as SccHashMap;
+use scc::{HashCache as SccHashCache, HashMap as SccHashMap};
 use lmdb::{Environment, EnvironmentFlags, Database, DatabaseFlags, Transaction, WriteFlags, Cursor};
 
 // LMDB cursor operation constants (instead of importing lmdb-sys only for constants from lmdb_sys::ffi).
@@ -46,6 +48,9 @@ const MDB_SET_RANGE: u32 = 17;
 // Default LMDB max key size. This is controlled by LMDB's compile-time MDB_MAXKEYSIZE.
 // If the Rust lmdb crate exposes mdb_env_get_maxkeysize safely in the future, prefer that.
 const LMDB_DEFAULT_MAX_KEY_SIZE: usize = 511;
+const METRICS_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+const METRICS_CHECK_MASK: u64 = 1023;
+const GET_LATENCY_BUCKETS: usize = 16;
 
 mod atoms {
     rustler::atoms! {
@@ -115,6 +120,7 @@ struct DbState {
 }
 
 type OverlayMap = SccHashMap<Vec<u8>, Vec<u8>, ahash::RandomState>;
+type ReadCache = SccHashCache<Vec<u8>, Vec<u8>, ahash::RandomState>;
 type FlushSyncState = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
 
 enum WorkerCommand {
@@ -151,6 +157,8 @@ pub struct LmdbDatabase {
     active: ArcSwap<OverlayMap>,
     /// Draining map: set during flush, readable for get consistency
     draining: ArcSwap<Option<Arc<OverlayMap>>>,
+    /// Optional read cache for point-lookups only.
+    lru: ArcSwapOption<ReadCache>,
     /// Write operation counter for flush threshold
     op_count: AtomicUsize,
     /// Flush threshold (number of ops before triggering background flush)
@@ -189,6 +197,43 @@ lazy_static::lazy_static! {
         Arc::new(Mutex::new(HashMap::new()));
     static ref DATABASES: Arc<Mutex<HashMap<String, ResourceArc<LmdbDatabase>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    static ref GET_CACHE_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static ref GET_LMDB_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
+    static ref GET_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
+    static ref GET_LATENCY_HISTOGRAM: [AtomicU64; GET_LATENCY_BUCKETS] =
+        std::array::from_fn(|_| AtomicU64::new(0));
+}
+
+enum GetMetricKind {
+    CacheHit,
+    LmdbHit,
+    Miss,
+}
+
+struct LocalGetMetrics {
+    cache_hits: u64,
+    lmdb_hits: u64,
+    misses: u64,
+    latency_histogram: [u64; GET_LATENCY_BUCKETS],
+    ops_since_check: u64,
+    last_flush: Instant,
+}
+
+impl LocalGetMetrics {
+    fn new() -> Self {
+        Self {
+            cache_hits: 0,
+            lmdb_hits: 0,
+            misses: 0,
+            latency_histogram: [0; GET_LATENCY_BUCKETS],
+            ops_since_check: 0,
+            last_flush: Instant::now(),
+        }
+    }
+}
+
+thread_local! {
+    static LOCAL_GET_METRICS: RefCell<LocalGetMetrics> = RefCell::new(LocalGetMetrics::new());
 }
 
 /// Initialize the NIF module
@@ -201,6 +246,14 @@ fn init(env: Env, _info: Term) -> bool {
 
 fn new_overlay_map() -> OverlayMap {
     SccHashMap::with_hasher(ahash::RandomState::default())
+}
+
+fn new_read_cache(capacity: usize) -> Arc<ReadCache> {
+    Arc::new(SccHashCache::with_capacity_and_hasher(
+        capacity,
+        capacity,
+        ahash::RandomState::default(),
+    ))
 }
 
 fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lmdb::Error> {
@@ -253,6 +306,14 @@ impl LmdbEnv {
             .read()
             .map_err(|_| "Failed to read environment options".to_string())?;
         Ok(options.batch_size.unwrap_or(1000))
+    }
+
+    fn lru_size(&self) -> Result<Option<usize>, String> {
+        let options = self
+            .options
+            .read()
+            .map_err(|_| "Failed to read environment options".to_string())?;
+        Ok(options.lru_size)
     }
 
     fn ensure_open(&self) -> Result<(Arc<Environment>, u64), String> {
@@ -775,6 +836,12 @@ fn db_open<'a>(
             return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
         }
     };
+    let lru_size = match env_handle.lru_size() {
+        Ok(size) => size,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
+        }
+    };
 
     let db_key = env_handle.path.clone();
     if let Some(existing_db) = {
@@ -787,6 +854,9 @@ fn db_open<'a>(
             }
         }
         existing_db.batch_size.store(batch_size, Ordering::Release);
+        existing_db
+            .lru
+            .store(lru_size.map(new_read_cache));
         if existing_db.has_fatal_error.load(Ordering::Acquire) {
             if let Ok(mut wh) = existing_db.worker_handle.lock() {
                 if let Some(handle) = wh.take() {
@@ -826,6 +896,7 @@ fn db_open<'a>(
         env: env_handle.clone(),
         active: ArcSwap::from_pointee(new_overlay_map()),
         draining: ArcSwap::from_pointee(None),
+        lru: ArcSwapOption::from(lru_size.map(new_read_cache)),
         op_count: AtomicUsize::new(0),
         batch_size: AtomicUsize::new(batch_size),
         flush_pending: AtomicBool::new(false),
@@ -1050,7 +1121,10 @@ fn put<'a>(
         };
         match txn.put(live_db, &key_vec, &value_vec, WriteFlags::empty()) {
             Ok(()) => match txn.commit() {
-                Ok(()) => return Ok(atoms::ok().encode(env)),
+                Ok(()) => {
+                    lru_store(&db_handle, &key_vec, &value_vec);
+                    return Ok(atoms::ok().encode(env));
+                }
                 Err(_) => {
                     return Ok((
                         atoms::error(),
@@ -1079,6 +1153,7 @@ fn put<'a>(
             break;
         }
     }
+    lru_store(&db_handle, &key_vec, &value_vec);
 
     let count = db_handle.op_count.fetch_add(1, Ordering::Relaxed) + 1;
     let threshold = db_handle.batch_size.load(Ordering::Relaxed);
@@ -1100,6 +1175,7 @@ fn get<'a>(
     db_handle: &'a LmdbDatabase,
     key: Binary,
 ) -> NifResult<Term<'a>> {
+    let metric_start = begin_get_metric();
     if db_handle.is_closed.load(Ordering::Relaxed) {
         if let Err(error_msg) = db_handle.validate_database() {
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
@@ -1116,10 +1192,20 @@ fn get<'a>(
 
     let key_bytes = key.as_slice();
 
+    // If an LRU is configured, trust it first for the hot path and fall back to
+    // overlay checks only on miss.
+    if let Some(value) = lru_lookup(db_handle, key_bytes) {
+        record_get_metric(GetMetricKind::CacheHit, metric_start);
+        let mut binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
+        binary.as_mut_slice().copy_from_slice(&value);
+        return Ok((atoms::ok(), binary.release(env)).encode(env));
+    }
+
     // Fast path: skip overlay checks if both maps are empty
     let active_guard = db_handle.active.load();
     if !active_guard.is_empty() {
         if let Some(value) = active_guard.read_sync(key_bytes, |_, v| v.clone()) {
+            record_get_metric(GetMetricKind::CacheHit, metric_start);
             let mut binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
             binary.as_mut_slice().copy_from_slice(&value);
             return Ok((atoms::ok(), binary.release(env)).encode(env));
@@ -1130,6 +1216,7 @@ fn get<'a>(
         let draining_guard = db_handle.draining.load();
         if let Some(ref old_map) = **draining_guard {
             if let Some(value) = old_map.read_sync(key_bytes, |_, v| v.clone()) {
+                record_get_metric(GetMetricKind::CacheHit, metric_start);
                 let mut binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
                 binary.as_mut_slice().copy_from_slice(&value);
                 return Ok((atoms::ok(), binary.release(env)).encode(env));
@@ -1158,11 +1245,16 @@ fn get<'a>(
 
     match txn.get(live_db, &key_bytes) {
         Ok(value_bytes) => {
+            record_get_metric(GetMetricKind::LmdbHit, metric_start);
+            lru_store(db_handle, key_bytes, value_bytes);
             let mut binary = OwnedBinary::new(value_bytes.len()).unwrap();
             binary.as_mut_slice().copy_from_slice(value_bytes);
             Ok((atoms::ok(), binary.release(env)).encode(env))
         }
-        Err(lmdb::Error::NotFound) => Ok(atoms::not_found().encode(env)),
+        Err(lmdb::Error::NotFound) => {
+            record_get_metric(GetMetricKind::Miss, metric_start);
+            Ok(atoms::not_found().encode(env))
+        }
         Err(_) => Ok(
             (atoms::error(), atoms::database_error(), "Failed to get value".to_string())
                 .encode(env),
@@ -1189,6 +1281,18 @@ fn overlay_count<'a>(env: Env<'a>, db_handle: &'a LmdbDatabase) -> NifResult<Ter
     let active = db_handle.active.load();
     let count = active.len();
     Ok(count.encode(env))
+}
+
+#[rustler::nif]
+fn get_metrics<'a>(env: Env<'a>) -> NifResult<Term<'a>> {
+    let cache_hits = GET_CACHE_HIT_COUNT.load(Ordering::Relaxed);
+    let lmdb_hits = GET_LMDB_HIT_COUNT.load(Ordering::Relaxed);
+    let misses = GET_MISS_COUNT.load(Ordering::Relaxed);
+    let histogram: Vec<u64> = GET_LATENCY_HISTOGRAM
+        .iter()
+        .map(|bucket| bucket.load(Ordering::Relaxed))
+        .collect();
+    Ok((atoms::ok(), cache_hits, lmdb_hits, misses, histogram).encode(env))
 }
 
 #[rustler::nif]
@@ -1233,6 +1337,9 @@ fn put_batch<'a>(
         if Arc::ptr_eq(&m, &db_handle.active.load()) {
             break;
         }
+    }
+    for (key, value) in key_value_pairs.iter() {
+        lru_store(&db_handle, key.as_slice(), value.as_slice());
     }
     let count = db_handle.op_count.fetch_add(key_value_pairs.len(), Ordering::Relaxed) + key_value_pairs.len();
     let threshold = db_handle.batch_size.load(Ordering::Relaxed);
@@ -1632,11 +1739,109 @@ fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
     Ok(binary.release(env).encode(env))
 }
 
+fn begin_get_metric() -> Option<u64> {
+    LOCAL_GET_METRICS.with(|metrics| {
+        let mut metrics = metrics.borrow_mut();
+        metrics.ops_since_check += 1;
+        if metrics.ops_since_check & METRICS_CHECK_MASK == 0 {
+            read_cycle_counter()
+        } else {
+            None
+        }
+    })
+}
+
+fn record_get_metric(kind: GetMetricKind, started_at: Option<u64>) {
+    LOCAL_GET_METRICS.with(|metrics| {
+        let mut metrics = metrics.borrow_mut();
+        match kind {
+            GetMetricKind::CacheHit => metrics.cache_hits += 1,
+            GetMetricKind::LmdbHit => metrics.lmdb_hits += 1,
+            GetMetricKind::Miss => metrics.misses += 1,
+        }
+
+        if let Some(start_cycles) = started_at {
+            if let Some(end_cycles) = read_cycle_counter() {
+                let elapsed = end_cycles.saturating_sub(start_cycles);
+                let bucket = latency_bucket(elapsed);
+                metrics.latency_histogram[bucket] += 1;
+            }
+        }
+
+        if metrics.ops_since_check & METRICS_CHECK_MASK != 0
+            || metrics.last_flush.elapsed() < METRICS_FLUSH_INTERVAL
+        {
+            return;
+        }
+
+        let cache_hits = std::mem::take(&mut metrics.cache_hits);
+        let lmdb_hits = std::mem::take(&mut metrics.lmdb_hits);
+        let misses = std::mem::take(&mut metrics.misses);
+        let latency_histogram = std::mem::take(&mut metrics.latency_histogram);
+        metrics.last_flush = Instant::now();
+
+        if cache_hits != 0 {
+            GET_CACHE_HIT_COUNT.fetch_add(cache_hits, Ordering::Relaxed);
+        }
+        if lmdb_hits != 0 {
+            GET_LMDB_HIT_COUNT.fetch_add(lmdb_hits, Ordering::Relaxed);
+        }
+        if misses != 0 {
+            GET_MISS_COUNT.fetch_add(misses, Ordering::Relaxed);
+        }
+        for (idx, count) in latency_histogram.into_iter().enumerate() {
+            if count != 0 {
+                GET_LATENCY_HISTOGRAM[idx].fetch_add(count, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+fn latency_bucket(cycles: u64) -> usize {
+    if cycles == 0 {
+        0
+    } else {
+        let bucket = (u64::BITS - 1 - cycles.leading_zeros()) as usize;
+        bucket.min(GET_LATENCY_BUCKETS - 1)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_cycle_counter() -> Option<u64> {
+    unsafe {
+        core::arch::x86_64::_mm_lfence();
+        Some(core::arch::x86_64::_rdtsc())
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn read_cycle_counter() -> Option<u64> {
+    None
+}
+
 fn send_background_flush_if_worker_present(db_handle: &LmdbDatabase) {
     if let Ok(tx) = db_handle.worker_tx.lock() {
         if let Some(ref sender) = *tx {
             let _ = sender.send(WorkerCommand::Flush);
         }
+    }
+}
+
+fn lru_lookup(db_handle: &LmdbDatabase, key: &[u8]) -> Option<Vec<u8>> {
+    db_handle
+        .lru
+        .load_full()
+        .and_then(|cache| cache.read_sync(key, |_, v| v.clone()))
+}
+
+fn lru_store(db_handle: &LmdbDatabase, key: &[u8], value: &[u8]) {
+    if let Some(cache) = db_handle.lru.load_full() {
+        let key_vec = key.to_vec();
+        let value_vec = value.to_vec();
+        let _ = cache
+            .entry_sync(key_vec)
+            .and_modify(|v| *v = value_vec.clone())
+            .or_put(value_vec);
     }
 }
 
@@ -1722,6 +1927,13 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
                         }
                     }
                 }
+                "lru_size" => {
+                    if let Ok(size) = value.decode::<u64>() {
+                        if size > 0 && size <= usize::MAX as u64 {
+                            env_opts.lru_size = Some(size as usize);
+                        }
+                    }
+                }
                 _ => {}
             }
         } else if let Ok(atom) = option.decode::<rustler::Atom>() {
@@ -1762,6 +1974,7 @@ struct EnvOptions {
     map_size: Option<u64>,
     max_readers: Option<u32>,
     batch_size: Option<usize>,
+    lru_size: Option<usize>,
     no_mem_init: bool,
     no_sync: bool,
     no_lock: bool,

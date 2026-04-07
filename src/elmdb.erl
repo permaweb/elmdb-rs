@@ -18,7 +18,7 @@
 -export([put/3, put_batch/2, get/2, flush/1]).
 
 %% Diagnostics
--export([overlay_count/1]).
+-export([overlay_count/1, get_metrics/0]).
 
 %% Iterator operations
 -export([iterator/1, iterator_next/2, foreach/2, fold/3, map/2]).
@@ -79,6 +79,7 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %% @param Options Configuration options:
 %%   - {map_size, integer()}: Maximum database size in bytes
 %%   - {max_readers, integer()}: Maximum number of reader slots (default: 126)
+%%   - {lru_size, integer()}: Optional point-read cache size for get/2
 %%   - no_mem_init: Don't initialize malloc'd memory before writing to disk
 %%   - no_sync: Don't flush system buffers to disk when committing
 %%   - write_map: Use a writeable memory map for better performance
@@ -120,6 +121,13 @@ env_close_by_name(_Path) ->
 %% @returns {ok, Closed, RefCount, Path} where Closed is boolean, RefCount is integer
 -spec env_status(Env :: term()) -> {ok, boolean(), integer(), string()}.
 env_status(_Env) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Get debug metrics snapshot from flushed global counters.
+%% @returns {ok, CacheHits, LmdbHits, Misses, Histogram}
+-spec get_metrics() ->
+    {ok, non_neg_integer(), non_neg_integer(), non_neg_integer(), [non_neg_integer()]}.
+get_metrics() ->
     erlang:nif_error(nif_not_loaded).
 
 
