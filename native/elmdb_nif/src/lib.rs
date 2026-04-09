@@ -121,12 +121,12 @@ struct DbState {
 
 type CacheOverlay = CacheLogMap<Vec<u8>, Vec<u8>, ahash::RandomState>;
 type FlushSyncState = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
+type PersistFn<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), String> + 'a;
+type PutFn = fn(&LmdbDatabase, Vec<u8>, Vec<u8>) -> Result<(), String>;
+type PutBatchFn = fn(&LmdbDatabase, Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), String>;
 
 trait FlushBatchHandle: Send {
-    fn persist(
-        &self,
-        persist: &mut dyn FnMut(&[u8], &[u8]) -> Result<(), String>,
-    ) -> Result<(), String>;
+    fn persist(&self, persist: &mut PersistFn<'_>) -> Result<(), String>;
     fn mark_committed(self: Box<Self>) -> usize;
 }
 
@@ -136,10 +136,7 @@ struct CacheLogFlushBatch {
 }
 
 impl FlushBatchHandle for CacheLogFlushBatch {
-    fn persist(
-        &self,
-        persist: &mut dyn FnMut(&[u8], &[u8]) -> Result<(), String>,
-    ) -> Result<(), String> {
+    fn persist(&self, persist: &mut PersistFn<'_>) -> Result<(), String> {
         for entry in self.batch.iter() {
             persist(&entry.key, &entry.value)?;
         }
@@ -167,8 +164,8 @@ enum StrategyKind {
 struct StrategyOps {
     lookup: fn(&LmdbDatabase, &[u8]) -> Option<Vec<u8>>,
     note_lmdb_hit: fn(&LmdbDatabase, &[u8], &[u8]),
-    put: fn(&LmdbDatabase, Vec<u8>, Vec<u8>) -> Result<(), String>,
-    put_batch: fn(&LmdbDatabase, Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), String>,
+    put: PutFn,
+    put_batch: PutBatchFn,
     visible_len: fn(&LmdbDatabase) -> usize,
     dirty_len: fn(&LmdbDatabase) -> usize,
     prepare_flush_batch: fn(&LmdbDatabase, usize) -> Option<Box<dyn FlushBatchHandle>>,
@@ -390,6 +387,7 @@ thread_local! {
 ///
 /// Registers resource types with the Erlang runtime.
 /// This function is called automatically when the NIF is loaded.
+#[allow(non_local_definitions)]
 fn init(env: Env, _info: Term) -> bool {
     rustler::resource!(LmdbEnv, env) && rustler::resource!(LmdbDatabase, env)
 }
@@ -600,10 +598,7 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
             return Ok(());
         };
 
-        let (live_env, live_db) = match db.fast_get_handles() {
-            Ok(handles) => handles,
-            Err(e) => return Err(e),
-        };
+        let (live_env, live_db) = db.fast_get_handles()?;
 
         let mut txn = match live_env.begin_rw_txn() {
             Ok(txn) => txn,
