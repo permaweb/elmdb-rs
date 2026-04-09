@@ -138,6 +138,34 @@ singleton_reopen_test_() ->
             end)
     ].
 
+retired_handle_on_strategy_reopen_test_() ->
+    [
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+
+                {ok, EnvRw} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 1000}]),
+                {ok, DBRw} = elmdb:db_open(EnvRw, [create]),
+                ok = elmdb:put(DBRw, <<"retire/key">>, <<"v1">>),
+                ok = elmdb:flush(DBRw),
+                ok = elmdb:db_close(DBRw),
+                ok = elmdb:env_close(EnvRw),
+
+                {ok, EnvRo} = elmdb:env_open(Dir, [{map_size, 10485760}, read_only]),
+                {ok, DBRo} = elmdb:db_open(EnvRo, []),
+                ?assertEqual({ok, <<"v1">>}, elmdb:get(DBRo, <<"retire/key">>)),
+                ?assertMatch(
+                    {error, database_error, <<"Database handle has been retired; reopen with db_open/2">>},
+                    elmdb:get(DBRw, <<"retire/key">>)
+                ),
+
+                ok = elmdb:db_close(DBRo),
+                ok = elmdb:env_close(EnvRo),
+                file:del_dir_r(Dir)
+            end)
+    ].
+
 %%%===================================================================
 %%% List Operation Tests  
 %%%===================================================================
@@ -955,6 +983,52 @@ put_batch_cache_invalidation_test_() ->
             end)
     ].
 
+read_cache_dirty_override_test_() ->
+    [
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 1000}, {lru_size, 32}]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+
+                ok = elmdb:put(DB, <<"k1">>, <<"old">>),
+                ok = elmdb:flush(DB),
+
+                % Populate clean cache from LMDB, then overwrite through the dirty path.
+                ?assertEqual({ok, <<"old">>}, elmdb:get(DB, <<"k1">>)),
+                ok = elmdb:put(DB, <<"k1">>, <<"new">>),
+                ?assertEqual({ok, <<"new">>}, elmdb:get(DB, <<"k1">>)),
+
+                ok = elmdb:flush(DB),
+                ?assertEqual({ok, <<"new">>}, elmdb:get(DB, <<"k1">>)),
+
+                cleanup({Dir, Env, DB})
+            end)
+    ].
+
+flush_read_only_noop_test_() ->
+    [
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+
+                {ok, SeedEnv} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 1000}]),
+                {ok, SeedDB} = elmdb:db_open(SeedEnv, [create]),
+                ok = elmdb:put(SeedDB, <<"k1">>, <<"v1">>),
+                ok = elmdb:flush(SeedDB),
+                ok = elmdb:db_close(SeedDB),
+                ok = elmdb:env_close(SeedEnv),
+
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, read_only]),
+                {ok, DB} = elmdb:db_open(Env, []),
+                ?assertEqual(ok, elmdb:flush(DB)),
+
+                cleanup({Dir, Env, DB})
+            end)
+    ].
+
 env_close_cached_txn_test_() ->
     [
      ?_test(begin
@@ -1070,15 +1144,15 @@ flush_sync_waiter_on_worker_death_test_() ->
                 {ok, DB} = elmdb:db_open(Env, [create]),
 
                 Self = self(),
-                Flushers = [spawn_monitor(fun() ->
-                    R = elmdb:flush(DB),
-                    Self ! {flush_result, self(), R}
-                end) || _ <- lists:seq(1, 3)],
-
                 lists:foreach(fun(I) ->
                     K = <<"trigger_", (integer_to_binary(I))/binary>>,
                     elmdb:put(DB, K, <<"v">>)
                 end, lists:seq(1, 6)),
+
+                Flushers = [spawn_monitor(fun() ->
+                    R = elmdb:flush(DB),
+                    Self ! {flush_result, self(), R}
+                end) || _ <- lists:seq(1, 3)],
 
                 lists:foreach(fun({Pid, Ref}) ->
                     receive
@@ -1384,10 +1458,11 @@ flush_pending_resets_after_recovery_test_() ->
                 trigger_map_full(_DB1, binary:copy(<<"x">>, 10000), 0),
 
                 {ok, DB2} = elmdb:db_open(Env, [create]),
-                lists:foreach(fun(I) ->
+                PutResults = [begin
                     K = <<"fp_", (integer_to_binary(I))/binary>>,
-                    ok = elmdb:put(DB2, K, <<"v">>)
-                end, lists:seq(1, 6)),
+                    elmdb:put(DB2, K, <<"v">>)
+                end || I <- lists:seq(1, 6)],
+                ?assert(lists:any(fun(Result) -> Result =:= ok end, PutResults)),
                 timer:sleep(500),
                 ?assertMatch({error, _, _}, elmdb:get(DB2, <<"fp_1">>)),
 

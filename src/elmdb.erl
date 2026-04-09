@@ -79,10 +79,21 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %% @param Options Configuration options:
 %%   - {map_size, integer()}: Maximum database size in bytes
 %%   - {max_readers, integer()}: Maximum number of reader slots (default: 126)
-%%   - {lru_size, integer()}: Optional point-read cache size for get/2
+%%   - {lru_size, integer()}: Optional clean-cache capacity for point reads
+%%   - read_only: Open the environment in LMDB read-only mode
 %%   - no_mem_init: Don't initialize malloc'd memory before writing to disk
 %%   - no_sync: Don't flush system buffers to disk when committing
 %%   - write_map: Use a writeable memory map for better performance
+%%
+%% Strategy selection is fixed when db_open/2 creates the database handle:
+%%   - RW: dirty overlay + LMDB fallback
+%%   - RW + {lru_size, N}: dirty overlay + clean read cache + LMDB fallback
+%%   - read_only: direct LMDB reads
+%%   - read_only + {lru_size, N}: clean read cache in front of LMDB
+%%
+%% Warning: the clean cache is local to this DB handle. Reads through a cached
+%% handle do not observe writes made by external LMDB users or other BEAM
+%% processes unless those writes also go through this handle's dirty path.
 %% @returns {ok, Env} where Env is an opaque environment handle
 %%          {error, directory_not_found} if the directory doesn't exist
 %%          {error, permission_denied} if lacking permissions
@@ -139,6 +150,8 @@ get_metrics() ->
 %% @param Env Environment handle
 %% @param Options Configuration options:
 %%   - create: Create the database if it doesn't exist
+%% The read strategy is derived from the environment options and remains fixed
+%% for the lifetime of the returned DB handle.
 %% @returns {ok, DBInstance} where DBInstance is an opaque database handle
 -spec db_open(Env :: term(), Options :: list()) -> 
     {ok, term()} | {error, term()}.
@@ -301,7 +314,7 @@ match_pattern(_DBInstance, _Patterns) ->
 flush(_DBInstance) ->
     erlang:nif_error(nif_not_loaded).
 
-%% @doc Return the number of entries in the write overlay (diagnostic)
+%% @doc Return the number of visible in-memory entries for the current strategy (diagnostic)
 -spec overlay_count(DBInstance :: term()) -> non_neg_integer().
 overlay_count(_DBInstance) ->
     erlang:nif_error(nif_not_loaded).
