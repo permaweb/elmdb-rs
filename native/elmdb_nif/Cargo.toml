@@ -14,4 +14,5 @@ lazy_static = "1.4"
 arc-swap = "1"
 scc = "3"
 ahash = "0.8.12"
-cachelog-rs = { package = "cachelog", version = "0.1.0" }
+cachelog-rs = { package = "cachelog", version = "0.2.1"}
+quanta = "0.12.6"

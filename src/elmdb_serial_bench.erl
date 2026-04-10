@@ -139,5 +139,5 @@ hot8_loop(DB, K1, K2, K3, K4, K5, K6, K7, K8, N) ->
     hot8_loop(DB, K1, K2, K3, K4, K5, K6, K7, K8, N - 1).
 
 reset_dir(Dir) ->
-    _ = os:cmd("rm -rf " ++ Dir),
+    _ = file:del_dir_r(Dir),
     ok.

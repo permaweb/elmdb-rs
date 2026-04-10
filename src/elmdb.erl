@@ -79,7 +79,7 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %% @param Options Configuration options:
 %%   - {map_size, integer()}: Maximum database size in bytes
 %%   - {max_readers, integer()}: Maximum number of reader slots (default: 126)
-%%   - {lru_size, integer()}: Optional clean-cache capacity for point reads
+%%   - {lru_size, integer()}: Accepted for backward compatibility (currently ignored)
 %%   - read_only: Open the environment in LMDB read-only mode
 %%   - no_mem_init: Don't initialize malloc'd memory before writing to disk
 %%   - no_sync: Don't flush system buffers to disk when committing
@@ -87,13 +87,9 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %%
 %% Strategy selection is fixed when db_open/2 creates the database handle:
 %%   - RW: dirty overlay + LMDB fallback
-%%   - RW + {lru_size, N}: dirty overlay + clean read cache + LMDB fallback
+%%   - RW + {lru_size, N}: same as RW (clean-cache path disabled)
 %%   - read_only: direct LMDB reads
-%%   - read_only + {lru_size, N}: clean read cache in front of LMDB
-%%
-%% Warning: the clean cache is local to this DB handle. Reads through a cached
-%% handle do not observe writes made by external LMDB users or other BEAM
-%% processes unless those writes also go through this handle's dirty path.
+%%   - read_only + {lru_size, N}: same as read_only
 %% @returns {ok, Env} where Env is an opaque environment handle
 %%          {error, directory_not_found} if the directory doesn't exist
 %%          {error, permission_denied} if lacking permissions

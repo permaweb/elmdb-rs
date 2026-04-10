@@ -196,10 +196,29 @@ list_operations_test_() ->
                  end),
           
           % Skip empty database test due to lmdb-rs panic issue
-         {"Empty database list", 
-           ?_test(begin
-                      skip
-                  end)}
+          {"Empty database list (placeholder)",
+           ?_test(ok)}
+         ]
+     end}.
+
+list_overlay_duplicate_children_regression_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     lists:foreach(
+                       fun(I) ->
+                           Child = integer_to_binary(I),
+                           ok = elmdb:put(DB, <<"dup/", Child/binary, "/a">>, <<"v">>),
+                           ok = elmdb:put(DB, <<"dup/", Child/binary, "/b">>, <<"v">>)
+                       end,
+                       lists:seq(1, 40)
+                      ),
+                     {ok, Children} = elmdb:list(DB, <<"dup/">>),
+                     ?assertEqual(length(Children), length(lists:usort(Children)))
+                 end)
          ]
      end}.
 
@@ -433,7 +452,7 @@ performance_test_() ->
 chain_validity_test_() ->
     {timeout, 30,
      ?_test(begin
-                Dir = "/tmp/elmdb_chain_" ++ integer_to_list(erlang:unique_integer([positive])),
+                Dir = test_dir(),
                 file:del_dir_r(Dir),
                 filelib:ensure_dir(Dir ++ "/"),
                 {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 3}]),
@@ -553,8 +572,8 @@ environment_copy_test_() ->
       ?_test(begin
                  % Test 1: Basic environment copy with 100k keys
                  % Create source environment and database
-                 SourceDir = "/tmp/foo-db",
-                 TargetDir = "/tmp/bar-db",
+                 SourceDir = test_dir(),
+                 TargetDir = test_dir(),
                  
                  % Clean up directories if they exist
                  file:del_dir_r(SourceDir),
@@ -636,8 +655,8 @@ environment_copy_test_() ->
      {timeout, 30,
       ?_test(begin
                  % Test 2: Copy empty database
-                 SourceDir = "/tmp/empty-source-db",
-                 TargetDir = "/tmp/empty-target-db",
+                 SourceDir = test_dir(),
+                 TargetDir = test_dir(),
                  
                  % Clean up and create source
                  file:del_dir_r(SourceDir),
@@ -681,9 +700,9 @@ environment_copy_test_() ->
      {timeout, 30,
       ?_test(begin
                  % Test 3: Multiple copies to different locations
-                 SourceDir = "/tmp/multi-source-db",
-                 TargetDir1 = "/tmp/multi-target-db-1",
-                 TargetDir2 = "/tmp/multi-target-db-2",
+                 SourceDir = test_dir(),
+                 TargetDir1 = test_dir(),
+                 TargetDir2 = test_dir(),
                  
                  % Clean up
                  file:del_dir_r(SourceDir),
@@ -1467,6 +1486,45 @@ flush_pending_resets_after_recovery_test_() ->
                 ?assertMatch({error, _, _}, elmdb:get(DB2, <<"fp_1">>)),
 
                 _ = elmdb:db_close(DB2),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+get_metrics_reports_reads_test_() ->
+    {timeout, 10,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 256}]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+
+                ok = elmdb:put(DB, <<"metrics/key">>, <<"value">>),
+                ok = elmdb:flush(DB),
+
+                {ok, Cache0, Lmdb0, Miss0, _Hist0} = elmdb:get_metrics(),
+
+                lists:foreach(
+                  fun(_) ->
+                      {ok, <<"value">>} = elmdb:get(DB, <<"metrics/key">>)
+                  end,
+                  lists:seq(1, 1200)
+                 ),
+                timer:sleep(550),
+                lists:foreach(
+                  fun(_) ->
+                      {ok, <<"value">>} = elmdb:get(DB, <<"metrics/key">>)
+                  end,
+                  lists:seq(1, 1200)
+                 ),
+
+                {ok, Cache1, Lmdb1, Miss1, Hist1} = elmdb:get_metrics(),
+                Before = Cache0 + Lmdb0 + Miss0,
+                After = Cache1 + Lmdb1 + Miss1,
+                ?assert(After > Before),
+                ?assert(is_list(Hist1)),
+
+                _ = elmdb:db_close(DB),
                 _ = elmdb:env_close(Env),
                 file:del_dir_r(Dir)
             end)}.

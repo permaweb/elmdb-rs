@@ -346,22 +346,22 @@ bench_concurrent_access(Config) ->
     % Start concurrent writers
     StartTime = erlang:monotonic_time(microsecond),
     
-    WriterPids = lists:map(fun(ProcessId) ->
-        spawn_link(fun() ->
+    WriterMonitors = lists:map(fun(ProcessId) ->
+        spawn_monitor(fun() ->
             write_concurrent_records(DB, ProcessId, RecordsPerProcess)
         end)
     end, lists:seq(1, ProcessCount)),
     
     % Wait for all writers to complete
-    lists:foreach(fun(Pid) ->
+    lists:foreach(fun({Pid, Ref}) ->
         receive
-            {'EXIT', Pid, normal} -> ok;
-            {'EXIT', Pid, Reason} -> 
+            {'DOWN', Ref, process, Pid, normal} -> ok;
+            {'DOWN', Ref, process, Pid, Reason} -> 
                 ct:print("Writer process ~p failed: ~p", [Pid, Reason])
         after 30000 ->
             ct:print("Writer process ~p timed out", [Pid])
         end
-    end, WriterPids),
+    end, WriterMonitors),
     
     EndTime = erlang:monotonic_time(microsecond),
     

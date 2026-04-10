@@ -25,20 +25,23 @@
 //! - Efficient cursor iteration for list operations
 //! - Early termination for prefix searches
 
-use rustler::{Env, Term, NifResult, Error, Encoder, ResourceArc};
+use arc_swap::{ArcSwap, ArcSwapOption};
+use cachelog_rs::{CacheLogConfig, CacheLogMap, FlushBatch};
+use lmdb::{
+    Cursor, Database, DatabaseFlags, Environment, EnvironmentFlags, Transaction, WriteFlags,
+};
+use quanta::Clock;
 use rustler::types::binary::Binary;
 use rustler::types::binary::OwnedBinary;
+use rustler::{Encoder, Env, Error, NifResult, ResourceArc, Term};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
-use arc_swap::{ArcSwap, ArcSwapOption};
+use std::collections::HashMap;
 use std::path::Path;
-use cachelog_rs::{CacheLogConfig, CacheLogMap, FlushBatch};
-use lmdb::{Environment, EnvironmentFlags, Database, DatabaseFlags, Transaction, WriteFlags, Cursor};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant as StdInstant};
 
 // LMDB cursor operation constants (instead of importing lmdb-sys only for constants from lmdb_sys::ffi).
 // To be improved in the future.
@@ -64,8 +67,12 @@ mod atoms {
         max_readers,
         no_mem_init,
         no_sync,
+        no_lock,
+        read_only,
         write_map,
         no_readahead,
+        batch_size,
+        lru_size,
         create,
         iterator,
         start,
@@ -150,20 +157,18 @@ impl FlushBatchHandle for CacheLogFlushBatch {
 
 enum WorkerCommand {
     FlushSync(FlushSyncState),
+    FlushHint,
     Shutdown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StrategyKind {
     DirectReadOnly,
-    CacheReadOnly,
     DirtyReadWrite,
-    DirtyCacheReadWrite,
 }
 
 struct StrategyOps {
     lookup: fn(&LmdbDatabase, &[u8]) -> Option<Vec<u8>>,
-    note_lmdb_hit: fn(&LmdbDatabase, &[u8], &[u8]),
     put: PutFn,
     put_batch: PutBatchFn,
     visible_len: fn(&LmdbDatabase) -> usize,
@@ -171,7 +176,9 @@ struct StrategyOps {
     prepare_flush_batch: fn(&LmdbDatabase, usize) -> Option<Box<dyn FlushBatchHandle>>,
 }
 
-fn no_lookup(_db: &LmdbDatabase, _key: &[u8]) -> Option<Vec<u8>> { None }
+fn no_lookup(_db: &LmdbDatabase, _key: &[u8]) -> Option<Vec<u8>> {
+    None
+}
 
 fn overlay_lookup(db: &LmdbDatabase, key: &[u8]) -> Option<Vec<u8>> {
     db.overlay
@@ -179,22 +186,16 @@ fn overlay_lookup(db: &LmdbDatabase, key: &[u8]) -> Option<Vec<u8>> {
         .and_then(|overlay| overlay.read(key, |_, value, _, _| value.clone()))
 }
 
-fn no_note_lmdb_hit(_db: &LmdbDatabase, _key: &[u8], _value: &[u8]) {}
-
-fn cache_note_lmdb_hit(db: &LmdbDatabase, key: &[u8], value: &[u8]) {
-    if let Some(overlay) = db.overlay.load_full() {
-        let _ = overlay.insert_clean_if_absent(key.to_vec(), value.to_vec());
-    }
-}
-
 fn read_only_put(_db: &LmdbDatabase, _key: Vec<u8>, _value: Vec<u8>) -> Result<(), String> {
     Err("Database opened read_only".to_string())
 }
 
 fn dirty_put(db: &LmdbDatabase, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
-    if let Some(overlay) = db.overlay.load_full() {
-        let _ = overlay.insert_dirty(key, value);
-    }
+    let overlay = db
+        .overlay
+        .load_full()
+        .ok_or_else(|| "Dirty strategy overlay is not initialized".to_string())?;
+    let _ = overlay.insert_dirty(key, value);
     Ok(())
 }
 
@@ -203,27 +204,39 @@ fn read_only_put_batch(_db: &LmdbDatabase, _pairs: Vec<(Vec<u8>, Vec<u8>)>) -> R
 }
 
 fn dirty_put_batch(db: &LmdbDatabase, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), String> {
-    if let Some(overlay) = db.overlay.load_full() {
-        for (key, value) in pairs {
-            let _ = overlay.insert_dirty(key, value);
-        }
+    let overlay = db
+        .overlay
+        .load_full()
+        .ok_or_else(|| "Dirty strategy overlay is not initialized".to_string())?;
+    for (key, value) in pairs {
+        let _ = overlay.insert_dirty(key, value);
     }
     Ok(())
 }
 
-fn no_visible_len(_db: &LmdbDatabase) -> usize { 0 }
+fn no_visible_len(_db: &LmdbDatabase) -> usize {
+    0
+}
 
 fn overlay_visible_len(db: &LmdbDatabase) -> usize {
-    db.overlay.load_full().map_or(0, |overlay| overlay.visible_len())
+    db.overlay
+        .load_full()
+        .map_or(0, |overlay| overlay.visible_len())
 }
 
-fn no_dirty_len(_db: &LmdbDatabase) -> usize { 0 }
+fn no_dirty_len(_db: &LmdbDatabase) -> usize {
+    0
+}
 
 fn overlay_dirty_len(db: &LmdbDatabase) -> usize {
-    db.overlay.load_full().map_or(0, |overlay| overlay.dirty_log_len())
+    db.overlay
+        .load_full()
+        .map_or(0, |overlay| overlay.dirty_log_len())
 }
 
-fn no_flush_batch(_db: &LmdbDatabase, _limit: usize) -> Option<Box<dyn FlushBatchHandle>> { None }
+fn no_flush_batch(_db: &LmdbDatabase, _limit: usize) -> Option<Box<dyn FlushBatchHandle>> {
+    None
+}
 
 fn overlay_flush_batch(db: &LmdbDatabase, limit: usize) -> Option<Box<dyn FlushBatchHandle>> {
     let overlay = db.overlay.load_full()?;
@@ -237,7 +250,6 @@ fn overlay_flush_batch(db: &LmdbDatabase, limit: usize) -> Option<Box<dyn FlushB
 
 static DIRECT_RO_OPS: StrategyOps = StrategyOps {
     lookup: no_lookup,
-    note_lmdb_hit: no_note_lmdb_hit,
     put: read_only_put,
     put_batch: read_only_put_batch,
     visible_len: no_visible_len,
@@ -245,29 +257,8 @@ static DIRECT_RO_OPS: StrategyOps = StrategyOps {
     prepare_flush_batch: no_flush_batch,
 };
 
-static CACHE_RO_OPS: StrategyOps = StrategyOps {
-    lookup: overlay_lookup,
-    note_lmdb_hit: cache_note_lmdb_hit,
-    put: read_only_put,
-    put_batch: read_only_put_batch,
-    visible_len: overlay_visible_len,
-    dirty_len: no_dirty_len,
-    prepare_flush_batch: no_flush_batch,
-};
-
 static DIRTY_RW_OPS: StrategyOps = StrategyOps {
     lookup: overlay_lookup,
-    note_lmdb_hit: no_note_lmdb_hit,
-    put: dirty_put,
-    put_batch: dirty_put_batch,
-    visible_len: overlay_visible_len,
-    dirty_len: overlay_dirty_len,
-    prepare_flush_batch: overlay_flush_batch,
-};
-
-static DIRTY_CACHE_RW_OPS: StrategyOps = StrategyOps {
-    lookup: overlay_lookup,
-    note_lmdb_hit: cache_note_lmdb_hit,
     put: dirty_put,
     put_batch: dirty_put_batch,
     visible_len: overlay_visible_len,
@@ -310,6 +301,8 @@ pub struct LmdbDatabase {
     flush_trigger_dirty: AtomicUsize,
     /// Maximum number of dirty items drained per automatic flush transaction.
     flush_batch_limit: AtomicUsize,
+    /// Coalescing gate for FlushHint command (true means one hint is already queued/in-flight).
+    flush_hint: AtomicBool,
     /// Cache: true when db is closed (atomic fast-path, no lock needed)
     is_closed: AtomicBool,
     /// Permanently disables a stale handle after the registry replaces it.
@@ -349,6 +342,7 @@ lazy_static::lazy_static! {
     static ref GET_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
     static ref GET_LATENCY_HISTOGRAM: [AtomicU64; GET_LATENCY_BUCKETS] =
         std::array::from_fn(|_| AtomicU64::new(0));
+    static ref GET_METRIC_CLOCK: Clock = Clock::new();
 }
 
 enum GetMetricKind {
@@ -363,7 +357,7 @@ struct LocalGetMetrics {
     misses: u64,
     latency_histogram: [u64; GET_LATENCY_BUCKETS],
     ops_since_check: u64,
-    last_flush: Instant,
+    last_flush: StdInstant,
 }
 
 impl LocalGetMetrics {
@@ -374,7 +368,7 @@ impl LocalGetMetrics {
             misses: 0,
             latency_histogram: [0; GET_LATENCY_BUCKETS],
             ops_since_check: 0,
-            last_flush: Instant::now(),
+            last_flush: StdInstant::now(),
         }
     }
 }
@@ -389,36 +383,26 @@ thread_local! {
 /// This function is called automatically when the NIF is loaded.
 #[allow(non_local_definitions)]
 fn init(env: Env, _info: Term) -> bool {
+    lazy_static::initialize(&GET_METRIC_CLOCK);
     rustler::resource!(LmdbEnv, env) && rustler::resource!(LmdbDatabase, env)
 }
 
-fn cachelog_config(batch_size: usize, clean_capacity: usize) -> CacheLogConfig {
+fn cachelog_config(batch_size: usize) -> CacheLogConfig {
     let dirty_log_capacity = batch_size.max(1).saturating_mul(2);
-    let clean_capacity = clean_capacity.max(1);
-    let visible_capacity = dirty_log_capacity
-        .saturating_add(clean_capacity)
-        .max(1024);
+    let clean_capacity = 1;
+    let visible_capacity = dirty_log_capacity.saturating_add(clean_capacity).max(1024);
     CacheLogConfig::new(visible_capacity, dirty_log_capacity, clean_capacity)
 }
 
-fn flush_batch_limit(trigger: usize) -> usize {
-    let _ = trigger;
+fn flush_batch_limit() -> usize {
     512
 }
 
-fn build_overlay(kind: StrategyKind, batch_size: usize, lru_size: Option<usize>) -> Option<Arc<CacheOverlay>> {
+fn build_overlay(kind: StrategyKind, batch_size: usize) -> Option<Arc<CacheOverlay>> {
     match kind {
         StrategyKind::DirectReadOnly => None,
-        StrategyKind::CacheReadOnly => Some(Arc::new(CacheOverlay::with_hasher(
-            cachelog_config(batch_size, lru_size.unwrap_or(1024)),
-            ahash::RandomState::default(),
-        ))),
         StrategyKind::DirtyReadWrite => Some(Arc::new(CacheOverlay::with_hasher(
-            cachelog_config(batch_size, 1),
-            ahash::RandomState::default(),
-        ))),
-        StrategyKind::DirtyCacheReadWrite => Some(Arc::new(CacheOverlay::with_hasher(
-            cachelog_config(batch_size, lru_size.unwrap_or(1024)),
+            cachelog_config(batch_size),
             ahash::RandomState::default(),
         ))),
     }
@@ -427,18 +411,14 @@ fn build_overlay(kind: StrategyKind, batch_size: usize, lru_size: Option<usize>)
 fn strategy_ops(kind: StrategyKind) -> &'static StrategyOps {
     match kind {
         StrategyKind::DirectReadOnly => &DIRECT_RO_OPS,
-        StrategyKind::CacheReadOnly => &CACHE_RO_OPS,
         StrategyKind::DirtyReadWrite => &DIRTY_RW_OPS,
-        StrategyKind::DirtyCacheReadWrite => &DIRTY_CACHE_RW_OPS,
     }
 }
 
 fn select_strategy_kind(options: &EnvOptions) -> StrategyKind {
-    match (options.read_only, options.lru_size) {
-        (true, Some(_)) => StrategyKind::CacheReadOnly,
-        (true, None) => StrategyKind::DirectReadOnly,
-        (false, Some(_)) => StrategyKind::DirtyCacheReadWrite,
-        (false, None) => StrategyKind::DirtyReadWrite,
+    match options.read_only {
+        true => StrategyKind::DirectReadOnly,
+        false => StrategyKind::DirtyReadWrite,
     }
 }
 
@@ -495,14 +475,6 @@ impl LmdbEnv {
             .read()
             .map_err(|_| "Failed to read environment options".to_string())?;
         Ok(options.batch_size.unwrap_or(1000))
-    }
-
-    fn lru_size(&self) -> Result<Option<usize>, String> {
-        let options = self
-            .options
-            .read()
-            .map_err(|_| "Failed to read environment options".to_string())?;
-        Ok(options.lru_size)
     }
 
     fn strategy_kind(&self) -> Result<StrategyKind, String> {
@@ -622,7 +594,9 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
 fn drain_remaining_sync_waiters(rx: &Receiver<WorkerCommand>, fatal_error: Option<String>) {
     while let Ok(cmd) = rx.try_recv() {
         if let WorkerCommand::FlushSync(signal) = cmd {
-            let err_msg = fatal_error.clone().unwrap_or_else(|| "Worker shut down".to_string());
+            let err_msg = fatal_error
+                .clone()
+                .unwrap_or_else(|| "Worker shut down".to_string());
             let (lock, cvar) = &*signal;
             if let Ok(mut guard) = lock.lock() {
                 *guard = Some(Err(err_msg));
@@ -658,6 +632,20 @@ fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
                     break;
                 }
             }
+            Ok(WorkerCommand::FlushHint) => {
+                db.flush_hint.store(false, Ordering::Release);
+                if (db.ops.dirty_len)(&db) != 0 {
+                    let result = do_flush(&db);
+                    if let Err(e) = result {
+                        if let Ok(mut guard) = db.fatal_error.lock() {
+                            *guard = Some(e.clone());
+                        }
+                        db.has_fatal_error.store(true, Ordering::Release);
+                        exit_error = Some(e);
+                        break;
+                    }
+                }
+            }
             Ok(WorkerCommand::Shutdown) => {
                 let result = do_flush(&db);
                 if let Err(e) = result {
@@ -688,6 +676,29 @@ fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
     }
     db.worker_running.store(false, Ordering::Relaxed);
     drain_remaining_sync_waiters(&rx, exit_error);
+}
+
+fn send_flush_hint(db_handle: &LmdbDatabase) {
+    if !db_handle.needs_worker {
+        return;
+    }
+    if db_handle.flush_hint.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let tx_guard = match db_handle.worker_tx.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            db_handle.flush_hint.store(false, Ordering::Release);
+            return;
+        }
+    };
+    if let Some(sender) = tx_guard.as_ref() {
+        if sender.send(WorkerCommand::FlushHint).is_err() {
+            db_handle.flush_hint.store(false, Ordering::Release);
+        }
+    } else {
+        db_handle.flush_hint.store(false, Ordering::Release);
+    }
 }
 
 fn flush_sync(db_handle: &LmdbDatabase) -> Result<(), String> {
@@ -733,23 +744,41 @@ fn ensure_worker(db_handle: &ResourceArc<LmdbDatabase>) {
     if db_handle.worker_running.load(Ordering::Relaxed) {
         return;
     }
-    let needs_worker = db_handle
-        .worker_tx
-        .lock()
-        .map(|g| g.is_none())
-        .unwrap_or(false);
-    if needs_worker {
-        let (tx, handle) = spawn_worker(db_handle);
-        if let Ok(mut wtx) = db_handle.worker_tx.lock() {
-            if wtx.is_none() {
-                *wtx = Some(tx);
-                db_handle.worker_running.store(true, Ordering::Relaxed);
-                if let Ok(mut wh) = db_handle.worker_handle.lock() {
-                    *wh = Some(handle);
-                }
-            }
+    let mut wtx = match db_handle.worker_tx.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if wtx.is_some() {
+        db_handle.worker_running.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    let (tx, handle) = spawn_worker(db_handle);
+    *wtx = Some(tx);
+    db_handle.worker_running.store(true, Ordering::Relaxed);
+    drop(wtx);
+
+    if let Ok(mut wh) = db_handle.worker_handle.lock() {
+        *wh = Some(handle);
+    } else {
+        db_handle.worker_running.store(false, Ordering::Relaxed);
+        if let Ok(mut tx_guard) = db_handle.worker_tx.lock() {
+            let _ = tx_guard.take();
+        }
+        let _ = handle.join();
+    }
+}
+
+fn current_fatal_error(db_handle: &LmdbDatabase) -> Option<String> {
+    if !db_handle.has_fatal_error.load(Ordering::Acquire) {
+        return None;
+    }
+    if let Ok(guard) = db_handle.fatal_error.lock() {
+        if let Some(err) = guard.as_ref() {
+            return Some(err.clone());
         }
     }
+    Some("Database is in fatal error state".to_string())
 }
 
 fn soft_close_db(db_handle: &ResourceArc<LmdbDatabase>) -> Result<(), String> {
@@ -775,11 +804,7 @@ fn soft_close_db(db_handle: &ResourceArc<LmdbDatabase>) -> Result<(), String> {
         }
     }
 
-    let fatal_err = db_handle
-        .fatal_error
-        .lock()
-        .ok()
-        .and_then(|g| g.clone());
+    let fatal_err = db_handle.fatal_error.lock().ok().and_then(|g| g.clone());
 
     {
         let mut state = db_handle
@@ -816,11 +841,15 @@ fn soft_close_db(db_handle: &ResourceArc<LmdbDatabase>) -> Result<(), String> {
 #[rustler::nif]
 fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResult<Term<'a>> {
     let path_string = if let Ok(binary) = path.decode::<Binary>() {
-        std::str::from_utf8(&binary).map_err(|_| Error::BadArg)?.to_string()
+        std::str::from_utf8(&binary)
+            .map_err(|_| Error::BadArg)?
+            .to_string()
     } else if let Ok(string) = path.decode::<String>() {
         string
     } else if let Ok(chars) = path.decode::<Vec<u8>>() {
-        std::str::from_utf8(&chars).map_err(|_| Error::BadArg)?.to_string()
+        std::str::from_utf8(&chars)
+            .map_err(|_| Error::BadArg)?
+            .to_string()
     } else {
         return Err(Error::BadArg);
     };
@@ -829,12 +858,12 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
     let parsed_options = parse_env_options(options)?;
 
     if let Some(existing_env) = {
-        let environments = ENVIRONMENTS.lock().unwrap();
+        let environments = ENVIRONMENTS.lock().map_err(|_| Error::BadArg)?;
         environments.get(path_str).cloned()
     } {
         if !Path::new(path_str).exists() {
             if let Some(db_handle) = {
-                let databases = DATABASES.lock().unwrap();
+                let databases = DATABASES.lock().map_err(|_| Error::BadArg)?;
                 databases.get(path_str).cloned()
             } {
                 db_handle.hot_handles.store(Arc::new(None));
@@ -896,7 +925,7 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
     let resource = ResourceArc::new(lmdb_env);
 
     {
-        let mut environments = ENVIRONMENTS.lock().unwrap();
+        let mut environments = ENVIRONMENTS.lock().map_err(|_| Error::BadArg)?;
         environments.insert(path_str.to_string(), resource.clone());
     }
 
@@ -914,17 +943,19 @@ fn env_sync<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Ter
 
     match live_env.sync(true) {
         Ok(()) => Ok(atoms::ok().encode(env)),
-        Err(err_msg) => Ok(
-            (atoms::error(), atoms::environment_error(), format!("Environment sync failed: {}", err_msg))
-                .encode(env),
-        ),
+        Err(err_msg) => Ok((
+            atoms::error(),
+            atoms::environment_error(),
+            format!("Environment sync failed: {}", err_msg),
+        )
+            .encode(env)),
     }
 }
 
 #[rustler::nif]
 fn env_close<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
     if let Some(db_handle) = {
-        let databases = DATABASES.lock().unwrap();
+        let databases = DATABASES.lock().map_err(|_| Error::BadArg)?;
         databases.get(&env_handle.path).cloned()
     } {
         let _ = soft_close_db(&db_handle);
@@ -940,23 +971,27 @@ fn env_close<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Te
 #[rustler::nif]
 fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
     let path_string = if let Ok(binary) = path.decode::<Binary>() {
-        std::str::from_utf8(&binary).map_err(|_| Error::BadArg)?.to_string()
+        std::str::from_utf8(&binary)
+            .map_err(|_| Error::BadArg)?
+            .to_string()
     } else if let Ok(string) = path.decode::<String>() {
         string
     } else if let Ok(chars) = path.decode::<Vec<u8>>() {
-        std::str::from_utf8(&chars).map_err(|_| Error::BadArg)?.to_string()
+        std::str::from_utf8(&chars)
+            .map_err(|_| Error::BadArg)?
+            .to_string()
     } else {
         return Err(Error::BadArg);
     };
     let path_str = &path_string;
 
     let env_handle = {
-        let environments = ENVIRONMENTS.lock().unwrap();
+        let environments = ENVIRONMENTS.lock().map_err(|_| Error::BadArg)?;
         environments.get(path_str).cloned()
     };
 
     if let Some(db_handle) = {
-        let databases = DATABASES.lock().unwrap();
+        let databases = DATABASES.lock().map_err(|_| Error::BadArg)?;
         databases.get(path_str).cloned()
     } {
         let _ = soft_close_db(&db_handle);
@@ -1006,7 +1041,6 @@ fn db_open<'a>(
             return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
         }
     };
-    let lru_size = env_handle.lru_size().ok().flatten();
 
     let db_key = env_handle.path.clone();
     {
@@ -1037,10 +1071,12 @@ fn db_open<'a>(
                         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
                     }
                 }
-                reopen_db.flush_trigger_dirty.store(batch_size, Ordering::Release);
+                reopen_db
+                    .flush_trigger_dirty
+                    .store(batch_size, Ordering::Release);
                 reopen_db
                     .flush_batch_limit
-                    .store(flush_batch_limit(batch_size), Ordering::Release);
+                    .store(flush_batch_limit(), Ordering::Release);
                 if reopen_db.has_fatal_error.load(Ordering::Acquire) {
                     if reopen_db.needs_worker {
                         if let Ok(mut wh) = reopen_db.worker_handle.lock() {
@@ -1084,12 +1120,13 @@ fn db_open<'a>(
         env: env_handle.clone(),
         strategy_kind,
         ops: strategy_ops(strategy_kind),
-        needs_worker: matches!(strategy_kind, StrategyKind::DirtyReadWrite | StrategyKind::DirtyCacheReadWrite),
+        needs_worker: matches!(strategy_kind, StrategyKind::DirtyReadWrite),
         worker_running: AtomicBool::new(false),
-        overlay: ArcSwapOption::new(build_overlay(strategy_kind, batch_size, lru_size)),
+        overlay: ArcSwapOption::new(build_overlay(strategy_kind, batch_size)),
         overlay_generation: AtomicU64::new(env_handle.generation.load(Ordering::Acquire)),
         flush_trigger_dirty: AtomicUsize::new(batch_size),
-        flush_batch_limit: AtomicUsize::new(flush_batch_limit(batch_size)),
+        flush_batch_limit: AtomicUsize::new(flush_batch_limit()),
+        flush_hint: AtomicBool::new(false),
         state: Mutex::new(DbState {
             cached_db: None,
             create_if_missing: parsed_options.create,
@@ -1185,12 +1222,12 @@ impl LmdbDatabase {
             StrategyKind::DirectReadOnly => None,
             _ => {
                 let batch_size = self.flush_trigger_dirty.load(Ordering::Acquire);
-                let lru_size = self.env.lru_size().ok().flatten();
-                build_overlay(self.strategy_kind, batch_size, lru_size)
+                build_overlay(self.strategy_kind, batch_size)
             }
         };
         self.overlay.store(fresh);
-        self.overlay_generation.store(current_gen, Ordering::Release);
+        self.overlay_generation
+            .store(current_gen, Ordering::Release);
         Ok(())
     }
 
@@ -1198,10 +1235,7 @@ impl LmdbDatabase {
         let (live_env, env_generation) = self.env.ensure_open()?;
         self.reopen_if_closed()?;
         self.sync_overlay_generation()?;
-        let read_only = matches!(
-            self.strategy_kind,
-            StrategyKind::DirectReadOnly | StrategyKind::CacheReadOnly
-        );
+        let read_only = matches!(self.strategy_kind, StrategyKind::DirectReadOnly);
 
         let mut state = self
             .state
@@ -1302,17 +1336,6 @@ fn put<'a>(
     if let Err(error_msg) = db_handle.sync_overlay_generation() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    ensure_worker(&db_handle);
-    if db_handle.has_fatal_error.load(Ordering::Acquire) {
-        if let Ok(guard) = db_handle.fatal_error.lock() {
-            if let Some(ref err) = *guard {
-                return Ok(
-                    (atoms::error(), atoms::transaction_error(), err.clone()).encode(env),
-                );
-            }
-        }
-    }
-
     if !db_handle.needs_worker {
         return Ok((
             atoms::error(),
@@ -1321,6 +1344,10 @@ fn put<'a>(
         )
             .encode(env));
     }
+    if let Some(error_msg) = current_fatal_error(&db_handle) {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    }
+    ensure_worker(&db_handle);
 
     let key_vec = key.as_slice().to_vec();
     let value_vec = value.as_slice().to_vec();
@@ -1329,9 +1356,7 @@ fn put<'a>(
         let (live_env, live_db) = match db_handle.ensure_open_handles() {
             Ok(handles) => handles,
             Err(error_msg) => {
-                return Ok(
-                    (atoms::error(), atoms::database_error(), error_msg).encode(env),
-                );
+                return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
             }
         };
         let mut txn = match live_env.begin_rw_txn() {
@@ -1348,7 +1373,6 @@ fn put<'a>(
         match txn.put(live_db, &key_vec, &value_vec, WriteFlags::empty()) {
             Ok(()) => match txn.commit() {
                 Ok(()) => {
-                    (db_handle.ops.note_lmdb_hit)(&db_handle, &key_vec, &value_vec);
                     return Ok(atoms::ok().encode(env));
                 }
                 Err(_) => {
@@ -1365,9 +1389,7 @@ fn put<'a>(
                     lmdb::Error::BadValSize => "Empty key not supported".to_string(),
                     _ => format!("Failed to put value: {:?}", lmdb_err),
                 };
-                return Ok(
-                    (atoms::error(), atoms::transaction_error(), error_msg).encode(env),
-                );
+                return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
             }
         }
     }
@@ -1393,11 +1415,7 @@ fn put<'a>(
 }
 
 #[rustler::nif]
-fn get<'a>(
-    env: Env<'a>,
-    db_handle: &'a LmdbDatabase,
-    key: Binary,
-) -> NifResult<Term<'a>> {
+fn get<'a>(env: Env<'a>, db_handle: &'a LmdbDatabase, key: Binary) -> NifResult<Term<'a>> {
     let metric_start = begin_get_metric();
     if db_handle.is_closed.load(Ordering::Relaxed) {
         if let Err(error_msg) = db_handle.validate_database() {
@@ -1408,12 +1426,8 @@ fn get<'a>(
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
 
-    if db_handle.has_fatal_error.load(Ordering::Relaxed) {
-        if let Ok(guard) = db_handle.fatal_error.lock() {
-            if let Some(ref err) = *guard {
-                return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
-            }
-        }
+    if let Some(error_msg) = current_fatal_error(db_handle) {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
     }
 
     let key_bytes = key.as_slice();
@@ -1447,8 +1461,7 @@ fn get<'a>(
     match txn.get(live_db, &key_bytes) {
         Ok(value_bytes) => {
             record_get_metric(GetMetricKind::LmdbHit, metric_start);
-            (db_handle.ops.note_lmdb_hit)(db_handle, key_bytes, value_bytes);
-            let mut binary = OwnedBinary::new(value_bytes.len()).unwrap();
+            let mut binary = OwnedBinary::new(value_bytes.len()).ok_or(Error::BadArg)?;
             binary.as_mut_slice().copy_from_slice(value_bytes);
             Ok((atoms::ok(), binary.release(env)).encode(env))
         }
@@ -1456,10 +1469,12 @@ fn get<'a>(
             record_get_metric(GetMetricKind::Miss, metric_start);
             Ok(atoms::not_found().encode(env))
         }
-        Err(_) => Ok(
-            (atoms::error(), atoms::database_error(), "Failed to get value".to_string())
-                .encode(env),
-        ),
+        Err(_) => Ok((
+            atoms::error(),
+            atoms::database_error(),
+            "Failed to get value".to_string(),
+        )
+            .encode(env)),
     }
 }
 
@@ -1474,12 +1489,13 @@ fn flush<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Te
     if !db_handle.needs_worker {
         return Ok(atoms::ok().encode(env));
     }
+    if let Some(error_msg) = current_fatal_error(&db_handle) {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    }
     ensure_worker(&db_handle);
     match flush_sync(&db_handle) {
         Ok(()) => Ok(atoms::ok().encode(env)),
-        Err(error_msg) => {
-            Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env))
-        }
+        Err(error_msg) => Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env)),
     }
 }
 
@@ -1515,19 +1531,6 @@ fn put_batch<'a>(
     if let Err(error_msg) = db_handle.sync_overlay_generation() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    ensure_worker(&db_handle);
-
-    if key_value_pairs.is_empty() {
-        return Ok(atoms::ok().encode(env));
-    }
-
-    if db_handle.has_fatal_error.load(Ordering::Acquire) {
-        if let Ok(guard) = db_handle.fatal_error.lock() {
-            if let Some(ref err) = *guard {
-                return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
-            }
-        }
-    }
 
     if !db_handle.needs_worker {
         return Ok((
@@ -1537,14 +1540,32 @@ fn put_batch<'a>(
         )
             .encode(env));
     }
+    if let Some(error_msg) = current_fatal_error(&db_handle) {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    }
+    ensure_worker(&db_handle);
+
+    if key_value_pairs.is_empty() {
+        return Ok(atoms::ok().encode(env));
+    }
 
     for (key, _value) in key_value_pairs.iter() {
         let klen = key.as_slice().len();
         if klen == 0 {
-            return Ok((atoms::error(), atoms::validation_error(), "Empty key in batch".to_string()).encode(env));
+            return Ok((
+                atoms::error(),
+                atoms::validation_error(),
+                "Empty key in batch".to_string(),
+            )
+                .encode(env));
         }
         if klen > LMDB_DEFAULT_MAX_KEY_SIZE {
-            return Ok((atoms::error(), atoms::validation_error(), format!("Key size {klen} exceeds limit {LMDB_DEFAULT_MAX_KEY_SIZE}")).encode(env));
+            return Ok((
+                atoms::error(),
+                atoms::validation_error(),
+                format!("Key size {klen} exceeds limit {LMDB_DEFAULT_MAX_KEY_SIZE}"),
+            )
+                .encode(env));
         }
     }
 
@@ -1580,7 +1601,9 @@ fn iterator_next<'a>(
     if let Err(error_msg) = db_handle.sync_overlay_generation() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    ensure_worker(&db_handle);
+    if let Some(error_msg) = current_fatal_error(&db_handle) {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    }
 
     let cursor_token = match decode_iterator_cursor(cursor_term) {
         Ok(token) => token,
@@ -1590,6 +1613,7 @@ fn iterator_next<'a>(
     };
 
     if (db_handle.ops.dirty_len)(&db_handle) != 0 {
+        ensure_worker(&db_handle);
         if let Err(error_msg) = flush_sync(&db_handle) {
             return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
         }
@@ -1641,39 +1665,37 @@ fn iterator_next<'a>(
             }
         },
         IteratorCursor::AfterKey(last_key) => {
-            let positioned_entry =
-                match cursor.get(Some(last_key.as_slice()), None, MDB_SET_RANGE) {
-                    Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
+            let positioned_entry = match cursor.get(Some(last_key.as_slice()), None, MDB_SET_RANGE)
+            {
+                Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
+                Ok((None, _)) => None,
+                Err(lmdb::Error::NotFound) => None,
+                Err(_) => {
+                    return Ok((
+                        atoms::error(),
+                        atoms::database_error(),
+                        "Failed to position iterator cursor".to_string(),
+                    )
+                        .encode(env));
+                }
+            };
+
+            match positioned_entry {
+                Some((key, _value)) if key == last_key => match cursor.get(None, None, MDB_NEXT) {
+                    Ok((Some(next_key), next_value)) => {
+                        Some((next_key.to_vec(), next_value.to_vec()))
+                    }
                     Ok((None, _)) => None,
                     Err(lmdb::Error::NotFound) => None,
                     Err(_) => {
                         return Ok((
                             atoms::error(),
                             atoms::database_error(),
-                            "Failed to position iterator cursor".to_string(),
+                            "Failed to advance iterator cursor".to_string(),
                         )
                             .encode(env));
                     }
-                };
-
-            match positioned_entry {
-                Some((key, _value)) if key == last_key => {
-                    match cursor.get(None, None, MDB_NEXT) {
-                        Ok((Some(next_key), next_value)) => {
-                            Some((next_key.to_vec(), next_value.to_vec()))
-                        }
-                        Ok((None, _)) => None,
-                        Err(lmdb::Error::NotFound) => None,
-                        Err(_) => {
-                            return Ok((
-                                atoms::error(),
-                                atoms::database_error(),
-                                "Failed to advance iterator cursor".to_string(),
-                            )
-                                .encode(env));
-                        }
-                    }
-                }
+                },
                 Some((key, value)) => Some((key, value)),
                 None => None,
             }
@@ -1707,13 +1729,31 @@ fn list<'a>(
     if let Err(error_msg) = db_handle.sync_overlay_generation() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    ensure_worker(&db_handle);
+    if let Some(error_msg) = current_fatal_error(&db_handle) {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    }
 
     let prefix_bytes = key_prefix.as_slice();
+    let prefix_len = prefix_bytes.len();
+    let mut children = Vec::with_capacity(64);
+    let mut children_sorted = false;
 
     if (db_handle.ops.dirty_len)(&db_handle) != 0 {
-        if let Err(error_msg) = flush_sync(&db_handle) {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        // Disabled for perf isolation while benchmarking list() with pending dirty entries.
+        // send_flush_hint(&db_handle);
+        if let Some(overlay) = db_handle.overlay.load_full() {
+            overlay.for_each_prefix_key(
+                prefix_bytes,
+                |full_key| {
+                    collect_list_child_component(
+                        &mut children,
+                        full_key.as_slice(),
+                        prefix_len,
+                        &mut children_sorted,
+                    );
+                },
+                usize::MAX,
+            );
         }
     }
 
@@ -1748,53 +1788,13 @@ fn list<'a>(
         }
     };
 
-    let mut children = Vec::with_capacity(64);
-    let prefix_len = prefix_bytes.len();
-
-    let cursor_positioned = cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok();
-
-    if !cursor_positioned {
-        return Ok(atoms::not_found().encode(env));
-    }
-
-    let cursor_iter = cursor.iter_from(prefix_bytes);
-
-    for (key, _value) in cursor_iter {
-        if !key.starts_with(prefix_bytes) {
-            break;
-        }
-
-        let remaining = &key[prefix_len..];
-
-        if remaining.is_empty() {
-            continue;
-        }
-
-        let next_component = if let Some(sep_pos) = remaining.iter().position(|&b| b == b'/') {
-            &remaining[..sep_pos]
-        } else {
-            remaining
-        };
-
-        if next_component.is_empty() {
-            continue;
-        }
-
-        let component_exists = if children.len() < 16 {
-            children
-                .iter()
-                .any(|existing: &Vec<u8>| existing.as_slice() == next_component)
-        } else {
-            children.binary_search(&next_component.to_vec()).is_ok()
-        };
-
-        if !component_exists {
-            let component_vec = next_component.to_vec();
-            if children.len() < 16 {
-                children.push(component_vec);
-            } else if let Err(pos) = children.binary_search(&component_vec) {
-                children.insert(pos, component_vec);
+    if cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok() {
+        let cursor_iter = cursor.iter_from(prefix_bytes);
+        for (key, _value) in cursor_iter {
+            if !key.starts_with(prefix_bytes) {
+                break;
             }
+            collect_list_child_component(&mut children, key, prefix_len, &mut children_sorted);
         }
     }
 
@@ -1802,7 +1802,7 @@ fn list<'a>(
         return Ok(atoms::not_found().encode(env));
     }
 
-    if children.len() < 16 {
+    if !children_sorted {
         children.sort_unstable();
     }
 
@@ -1817,6 +1817,57 @@ fn list<'a>(
     Ok((atoms::ok(), result_binaries).encode(env))
 }
 
+fn collect_list_child_component(
+    children: &mut Vec<Vec<u8>>,
+    full_key: &[u8],
+    prefix_len: usize,
+    children_sorted: &mut bool,
+) {
+    let Some(remaining) = full_key.get(prefix_len..) else {
+        return;
+    };
+
+    if remaining.is_empty() {
+        return;
+    }
+
+    let next_component = if let Some(sep_pos) = remaining.iter().position(|&b| b == b'/') {
+        &remaining[..sep_pos]
+    } else {
+        remaining
+    };
+
+    if next_component.is_empty() {
+        return;
+    }
+
+    if !*children_sorted && children.len() >= 16 {
+        children.sort_unstable();
+        *children_sorted = true;
+    }
+
+    let component_exists = if !*children_sorted {
+        children
+            .iter()
+            .any(|existing: &Vec<u8>| existing.as_slice() == next_component)
+    } else {
+        children
+            .binary_search_by(|existing| existing.as_slice().cmp(next_component))
+            .is_ok()
+    };
+
+    if !component_exists {
+        let component_vec = next_component.to_vec();
+        if !*children_sorted {
+            children.push(component_vec);
+        } else if let Err(pos) =
+            children.binary_search_by(|existing| existing.as_slice().cmp(component_vec.as_slice()))
+        {
+            children.insert(pos, component_vec);
+        }
+    }
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn match_pattern<'a>(
     env: Env<'a>,
@@ -1829,7 +1880,9 @@ fn match_pattern<'a>(
     if let Err(error_msg) = db_handle.sync_overlay_generation() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    ensure_worker(&db_handle);
+    if let Some(error_msg) = current_fatal_error(&db_handle) {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    }
 
     if patterns.is_empty() {
         return Ok(atoms::not_found().encode(env));
@@ -1841,6 +1894,7 @@ fn match_pattern<'a>(
         .collect();
 
     if (db_handle.ops.dirty_len)(&db_handle) != 0 {
+        ensure_worker(&db_handle);
         if let Err(error_msg) = flush_sync(&db_handle) {
             return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
         }
@@ -1878,47 +1932,42 @@ fn match_pattern<'a>(
     };
 
     const MAX_RESULTS: usize = 100000;
-    let mut matching_ids: Vec<Vec<u8>> = Vec::new();
-    let mut current_id: Option<Vec<u8>> = None;
-    let mut seen_patterns: HashSet<usize> = HashSet::new();
-    let total_patterns = patterns_vec.len();
+    let anchor_idx = choose_anchor_pattern(&patterns_vec);
+    let (anchor_key, anchor_value) = patterns_vec[anchor_idx];
+    let mut candidate_ids: Vec<Vec<u8>> = Vec::new();
 
-    let iter = cursor.iter_start();
-    for (key_bytes, value_bytes) in iter {
-        let last_slash_pos = key_bytes.iter().rposition(|&b| b == b'/');
-
-        let (id, suffix) = if let Some(pos) = last_slash_pos {
-            let id = key_bytes[..pos].to_vec();
-            let suffix = key_bytes[pos + 1..].to_vec();
-            (id, suffix)
-        } else {
-            (key_bytes.to_vec(), Vec::new())
-        };
-
-        if current_id.as_ref() != Some(&id) {
-            if let Some(prev_id) = current_id.take() {
-                if seen_patterns.len() == total_patterns {
-                    matching_ids.push(prev_id);
-                    if matching_ids.len() >= MAX_RESULTS {
-                        break;
-                    }
-                }
-            }
-
-            current_id = Some(id.clone());
-            seen_patterns.clear();
+    for (key_bytes, value_bytes) in cursor.iter_start() {
+        if value_bytes != anchor_value {
+            continue;
         }
-
-        for (pattern_idx, (pattern_key, pattern_value)) in patterns_vec.iter().enumerate() {
-            if suffix.as_slice() == *pattern_key && value_bytes == *pattern_value {
-                seen_patterns.insert(pattern_idx);
+        let (id, suffix) = split_id_suffix(key_bytes);
+        if suffix == anchor_key {
+            let duplicate_tail = match candidate_ids.last() {
+                Some(prev) => prev.as_slice() == id,
+                None => false,
+            };
+            if !duplicate_tail {
+                candidate_ids.push(id.to_vec());
             }
         }
     }
 
-    if let Some(final_id) = current_id {
-        if seen_patterns.len() == total_patterns {
-            matching_ids.push(final_id);
+    if candidate_ids.is_empty() {
+        return Ok(atoms::not_found().encode(env));
+    }
+
+    let mut matching_ids: Vec<Vec<u8>> = Vec::new();
+    'candidate: for id in candidate_ids {
+        for (pattern_key, pattern_value) in patterns_vec.iter() {
+            let full_key = compose_match_key(&id, pattern_key);
+            match txn.get(live_db, &full_key) {
+                Ok(value) if value == *pattern_value => {}
+                _ => continue 'candidate,
+            }
+        }
+        matching_ids.push(id);
+        if matching_ids.len() >= MAX_RESULTS {
+            break;
         }
     }
 
@@ -1936,6 +1985,34 @@ fn match_pattern<'a>(
     }
 }
 
+fn choose_anchor_pattern(patterns: &[(&[u8], &[u8])]) -> usize {
+    patterns
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (key, value))| key.len().saturating_add(value.len()))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+fn split_id_suffix(full_key: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(pos) = full_key.iter().rposition(|&b| b == b'/') {
+        (&full_key[..pos], &full_key[pos + 1..])
+    } else {
+        (full_key, &[])
+    }
+}
+
+fn compose_match_key(id: &[u8], suffix: &[u8]) -> Vec<u8> {
+    if suffix.is_empty() {
+        return id.to_vec();
+    }
+    let mut key = Vec::with_capacity(id.len().saturating_add(1).saturating_add(suffix.len()));
+    key.extend_from_slice(id);
+    key.push(b'/');
+    key.extend_from_slice(suffix);
+    key
+}
+
 ///===================================================================
 /// Helper Functions
 ///===================================================================
@@ -1950,7 +2027,7 @@ fn begin_get_metric() -> Option<u64> {
         let mut metrics = metrics.borrow_mut();
         metrics.ops_since_check += 1;
         if metrics.ops_since_check & METRICS_CHECK_MASK == 0 {
-            read_cycle_counter()
+            Some(GET_METRIC_CLOCK.raw())
         } else {
             None
         }
@@ -1966,12 +2043,11 @@ fn record_get_metric(kind: GetMetricKind, started_at: Option<u64>) {
             GetMetricKind::Miss => metrics.misses += 1,
         }
 
-        if let Some(start_cycles) = started_at {
-            if let Some(end_cycles) = read_cycle_counter() {
-                let elapsed = end_cycles.saturating_sub(start_cycles);
-                let bucket = latency_bucket(elapsed);
-                metrics.latency_histogram[bucket] += 1;
-            }
+        if let Some(start_raw) = started_at {
+            let end_raw = GET_METRIC_CLOCK.raw();
+            let elapsed_ns = GET_METRIC_CLOCK.delta_as_nanos(start_raw, end_raw);
+            let bucket = latency_bucket(elapsed_ns);
+            metrics.latency_histogram[bucket] += 1;
         }
 
         if metrics.ops_since_check & METRICS_CHECK_MASK != 0
@@ -1984,7 +2060,7 @@ fn record_get_metric(kind: GetMetricKind, started_at: Option<u64>) {
         let lmdb_hits = std::mem::take(&mut metrics.lmdb_hits);
         let misses = std::mem::take(&mut metrics.misses);
         let latency_histogram = std::mem::take(&mut metrics.latency_histogram);
-        metrics.last_flush = Instant::now();
+        metrics.last_flush = StdInstant::now();
 
         if cache_hits != 0 {
             GET_CACHE_HIT_COUNT.fetch_add(cache_hits, Ordering::Relaxed);
@@ -2003,26 +2079,13 @@ fn record_get_metric(kind: GetMetricKind, started_at: Option<u64>) {
     });
 }
 
-fn latency_bucket(cycles: u64) -> usize {
-    if cycles == 0 {
+fn latency_bucket(elapsed_ns: u64) -> usize {
+    if elapsed_ns == 0 {
         0
     } else {
-        let bucket = (u64::BITS - 1 - cycles.leading_zeros()) as usize;
+        let bucket = (u64::BITS - 1 - elapsed_ns.leading_zeros()) as usize;
         bucket.min(GET_LATENCY_BUCKETS - 1)
     }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn read_cycle_counter() -> Option<u64> {
-    unsafe {
-        core::arch::x86_64::_mm_lfence();
-        Some(core::arch::x86_64::_rdtsc())
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn read_cycle_counter() -> Option<u64> {
-    None
 }
 
 fn encode_iterator_start<'a>(env: Env<'a>) -> Term<'a> {
@@ -2087,46 +2150,37 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
 
     for option in options {
         if let Ok((atom, value)) = option.decode::<(rustler::Atom, Term)>() {
-            let name = format!("{:?}", atom);
-            let name = name.trim_start_matches('"').trim_end_matches('"');
-            match name {
-                "map_size" => {
-                    if let Ok(size) = value.decode::<u64>() {
-                        env_opts.map_size = Some(size);
+            if atom == atoms::map_size() {
+                if let Ok(size) = value.decode::<u64>() {
+                    env_opts.map_size = Some(size);
+                }
+            } else if atom == atoms::max_readers() {
+                if let Ok(readers) = value.decode::<u32>() {
+                    env_opts.max_readers = Some(readers);
+                }
+            } else if atom == atoms::batch_size() {
+                if let Ok(size) = value.decode::<u64>() {
+                    if size > 0 && size <= usize::MAX as u64 {
+                        env_opts.batch_size = Some(size as usize);
                     }
                 }
-                "max_readers" => {
-                    if let Ok(readers) = value.decode::<u32>() {
-                        env_opts.max_readers = Some(readers);
-                    }
-                }
-                "batch_size" => {
-                    if let Ok(size) = value.decode::<u64>() {
-                        if size > 0 && size <= usize::MAX as u64 {
-                            env_opts.batch_size = Some(size as usize);
-                        }
-                    }
-                }
-                "lru_size" => {
-                    if let Ok(size) = value.decode::<u64>() {
-                        if size > 0 && size <= usize::MAX as u64 {
-                            env_opts.lru_size = Some(size as usize);
-                        }
-                    }
-                }
-                _ => {}
+            } else if atom == atoms::lru_size() {
+                // Accepted for backward compatibility, currently ignored.
+                let _ = value.decode::<u64>();
             }
         } else if let Ok(atom) = option.decode::<rustler::Atom>() {
-            let name = format!("{:?}", atom);
-            let name = name.trim_start_matches('"').trim_end_matches('"');
-            match name {
-                "no_mem_init" => env_opts.no_mem_init = true,
-                "no_sync" => env_opts.no_sync = true,
-                "no_lock" => env_opts.no_lock = true,
-                "read_only" => env_opts.read_only = true,
-                "write_map" => env_opts.write_map = true,
-                "no_readahead" => env_opts.no_readahead = true,
-                _ => {}
+            if atom == atoms::no_mem_init() {
+                env_opts.no_mem_init = true;
+            } else if atom == atoms::no_sync() {
+                env_opts.no_sync = true;
+            } else if atom == atoms::no_lock() {
+                env_opts.no_lock = true;
+            } else if atom == atoms::read_only() {
+                env_opts.read_only = true;
+            } else if atom == atoms::write_map() {
+                env_opts.write_map = true;
+            } else if atom == atoms::no_readahead() {
+                env_opts.no_readahead = true;
             }
         }
     }
@@ -2139,9 +2193,7 @@ fn parse_db_options(options: Vec<Term>) -> NifResult<DbOptions> {
 
     for option in options {
         if let Ok(atom) = option.decode::<rustler::Atom>() {
-            let name = format!("{:?}", atom);
-            let name = name.trim_start_matches('"').trim_end_matches('"');
-            if name == "create" {
+            if atom == atoms::create() {
                 db_opts.create = true;
             }
         }
@@ -2155,7 +2207,6 @@ struct EnvOptions {
     map_size: Option<u64>,
     max_readers: Option<u32>,
     batch_size: Option<usize>,
-    lru_size: Option<usize>,
     no_mem_init: bool,
     no_sync: bool,
     no_lock: bool,
