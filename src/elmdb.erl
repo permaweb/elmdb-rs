@@ -9,7 +9,7 @@
 -module(elmdb).
 
 %% Environment management
--export([env_open/2, env_sync/1, env_close/1, env_close_by_name/1, env_status/1]).
+-export([env_open/2, env_sync/1, env_close/1, env_close_by_name/1, env_status/1, env_stat/1]).
 
 %% Database operations
 -export([db_open/2, db_close/1]).
@@ -117,6 +117,27 @@ env_close_by_name(_Path) ->
 %% @returns {ok, Closed, RefCount, Path} where Closed is boolean, RefCount is integer
 -spec env_status(Env :: term()) -> {ok, boolean(), integer(), string()}.
 env_status(_Env) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Get size statistics for an LMDB environment.
+%%
+%% Returns the configured map_size limit and an estimate of bytes currently in
+%% use.  Used bytes are calculated as `(last_pgno + 1) * page_size`, which
+%% counts every page ever allocated (including free-list pages) and therefore
+%% represents the high-water mark rather than live data only.  This is the
+%% correct value for gauging proximity to the map_size limit.
+%%
+%% Only meaningful for writable environments; calling this on a read-only
+%% environment (opened with no_lock) is safe but may return stale values if
+%% another process is the primary writer.
+%%
+%% @param Env Environment handle from env_open
+%% @returns {ok, MapSize, UsedBytes} where both values are non-negative integers
+%%          in bytes, or {error, badarg} if the environment cannot be opened.
+-spec env_stat(Env :: term()) ->
+    {ok, MapSize :: non_neg_integer(), UsedBytes :: non_neg_integer()} |
+    {error, badarg}.
+env_stat(_Env) ->
     erlang:nif_error(nif_not_loaded).
 
 
