@@ -2265,4 +2265,34 @@ fn env_status<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<T
     Ok((atoms::ok(), closed, ref_count, env_handle.path.clone()).encode(env))
 }
 
+/// Returns the configured map_size and the approximate number of bytes currently
+/// used by the environment.
+///
+/// Used bytes are estimated as `(last_pgno + 1) * page_size`, which counts every
+/// page that has ever been allocated (including free-list pages).  The value is
+/// therefore an upper bound on live data size, but it is the right metric for
+/// deciding how close the environment is to hitting the map_size limit.
+///
+/// `lmdb 0.8` does not expose `mdb_env_info` in its safe API, so we call it
+/// through the `lmdb-sys` FFI layer directly.
+#[rustler::nif]
+fn env_stat<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
+    let (lmdb_env, _gen) = env_handle.ensure_open().map_err(|_| Error::BadArg)?;
+    let stat = lmdb_env.stat().map_err(|_| Error::BadArg)?;
+    let page_size = stat.page_size() as usize;
+
+    // mdb_env_info is not wrapped by the `lmdb` crate, so call it directly.
+    let (map_size, last_pgno) = unsafe {
+        let mut info: ffi::MDB_envinfo = std::mem::zeroed();
+        let rc = ffi::mdb_env_info(lmdb_env.env(), &mut info);
+        if rc != 0 {
+            return Err(Error::BadArg);
+        }
+        (info.me_mapsize, info.me_last_pgno)
+    };
+
+    let used_bytes = (last_pgno + 1) * page_size;
+    Ok((atoms::ok(), map_size, used_bytes).encode(env))
+}
+
 rustler::init!("elmdb", load = init);
