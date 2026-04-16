@@ -381,9 +381,9 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
             db.draining.store(Arc::new(None));
             Ok(())
         }
-        Err(_) => {
+        Err(e) => {
             restore_failed_flush(db, old_map);
-            Err("Failed to commit batch transaction".to_string())
+            Err(format!("Failed to commit batch transaction: {}", e))
         }
     }
 }
