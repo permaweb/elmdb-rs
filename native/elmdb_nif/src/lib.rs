@@ -25,6 +25,10 @@
 //! - Efficient cursor iteration for list operations
 //! - Early termination for prefix searches
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use rustler::{Env, Term, NifResult, Error, Encoder, ResourceArc};
 use rustler::types::binary::Binary;
 use rustler::types::binary::OwnedBinary;
