@@ -379,6 +379,10 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
     match txn.commit() {
         Ok(()) => {
             db.draining.store(Arc::new(None));
+            // Return freed overlay memory to the OS. The SccHashMap entries
+            // (Vec<u8> keys and values) were just dropped; without this call
+            // glibc holds the pages in its free list, keeping RSS high.
+            trim_heap();
             Ok(())
         }
         Err(e) => {
@@ -696,13 +700,19 @@ fn env_sync<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Ter
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn env_close<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
-    if let Some(db_handle) = {
-        let databases = DATABASES.lock().unwrap();
-        databases.get(&env_handle.path).cloned()
-    } {
+    let db_handle = {
+        let mut databases = DATABASES.lock().unwrap();
+        databases.remove(&env_handle.path)
+    };
+    if let Some(db_handle) = db_handle {
         let _ = soft_close_db(&db_handle);
+    }
+
+    {
+        let mut environments = ENVIRONMENTS.lock().unwrap();
+        environments.remove(&env_handle.path);
     }
 
     if let Err(error_msg) = env_handle.request_close() {
@@ -712,7 +722,7 @@ fn env_close<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Te
     Ok(atoms::ok().encode(env))
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
     let path_string = if let Ok(binary) = path.decode::<Binary>() {
         std::str::from_utf8(&binary).map_err(|_| Error::BadArg)?.to_string()
@@ -726,14 +736,15 @@ fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
     let path_str = &path_string;
 
     let env_handle = {
-        let environments = ENVIRONMENTS.lock().unwrap();
-        environments.get(path_str).cloned()
+        let mut environments = ENVIRONMENTS.lock().unwrap();
+        environments.remove(path_str)
     };
 
-    if let Some(db_handle) = {
-        let databases = DATABASES.lock().unwrap();
-        databases.get(path_str).cloned()
-    } {
+    let db_handle = {
+        let mut databases = DATABASES.lock().unwrap();
+        databases.remove(path_str)
+    };
+    if let Some(db_handle) = db_handle {
         let _ = soft_close_db(&db_handle);
     }
 
@@ -751,8 +762,13 @@ fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
 /// Database Operations
 ///===================================================================
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn db_close<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Term<'a>> {
+    let path = db_handle.env.path.clone();
+    {
+        let mut databases = DATABASES.lock().unwrap();
+        databases.remove(&path);
+    }
     match soft_close_db(&db_handle) {
         Ok(()) => Ok(atoms::ok().encode(env)),
         Err(error_msg) => Ok((atoms::error(), atoms::database_error(), error_msg).encode(env)),
@@ -1630,6 +1646,13 @@ fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
     let mut binary = OwnedBinary::new(bytes.len()).ok_or(Error::BadArg)?;
     binary.as_mut_slice().copy_from_slice(bytes);
     Ok(binary.release(env).encode(env))
+}
+
+/// Advises glibc to return freed heap pages to the OS after a flush.
+/// No-op on non-Linux targets.
+fn trim_heap() {
+    #[cfg(target_os = "linux")]
+    unsafe { libc::malloc_trim(0); }
 }
 
 fn send_background_flush_if_worker_present(db_handle: &LmdbDatabase) {
