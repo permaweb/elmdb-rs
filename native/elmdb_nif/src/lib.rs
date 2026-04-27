@@ -29,6 +29,8 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use tikv_jemalloc_ctl;
+
 use rustler::{Env, Term, NifResult, Error, Encoder, ResourceArc};
 use rustler::types::binary::Binary;
 use rustler::types::binary::OwnedBinary;
@@ -200,6 +202,13 @@ lazy_static::lazy_static! {
 /// Registers resource types with the Erlang runtime.
 /// This function is called automatically when the NIF is loaded.
 fn init(env: Env, _info: Term) -> bool {
+    // Enable jemalloc background thread so freed arena pages are returned to
+    // the OS automatically during idle periods (dirty_decay_ms / muzzy_decay_ms
+    // timers run in the background rather than only at allocation time).
+    // Without this, RSS stays high between indexing bursts despite no live
+    // allocations because jemalloc only decays arenas at allocation time.
+    let _ = tikv_jemalloc_ctl::background_thread::write(true);
+
     rustler::resource!(LmdbEnv, env) && rustler::resource!(LmdbDatabase, env)
 }
 
@@ -702,11 +711,16 @@ fn env_sync<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Ter
 
 #[rustler::nif]
 fn env_close<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
-    if let Some(db_handle) = {
-        let databases = DATABASES.lock().unwrap();
-        databases.get(&env_handle.path).cloned()
-    } {
-        let _ = soft_close_db(&db_handle);
+    {
+        let mut databases = DATABASES.lock().unwrap();
+        if let Some(db_handle) = databases.remove(&env_handle.path) {
+            let _ = soft_close_db(&db_handle);
+        }
+    }
+
+    {
+        let mut environments = ENVIRONMENTS.lock().unwrap();
+        environments.remove(&env_handle.path);
     }
 
     if let Err(error_msg) = env_handle.request_close() {
@@ -742,6 +756,10 @@ fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
     }
 
     if let Some(env_handle) = env_handle {
+        {
+            let mut environments = ENVIRONMENTS.lock().unwrap();
+            environments.remove(&env_handle.path);
+        }
         if let Err(error_msg) = env_handle.request_close() {
             return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
         }
@@ -757,6 +775,10 @@ fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
 
 #[rustler::nif]
 fn db_close<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Term<'a>> {
+    {
+        let mut databases = DATABASES.lock().unwrap();
+        databases.remove(&db_handle.env.path);
+    }
     match soft_close_db(&db_handle) {
         Ok(()) => Ok(atoms::ok().encode(env)),
         Err(error_msg) => Ok((atoms::error(), atoms::database_error(), error_msg).encode(env)),
