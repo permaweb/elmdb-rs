@@ -709,13 +709,14 @@ fn env_sync<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Ter
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn env_close<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
-    {
+    let db_handle = {
         let mut databases = DATABASES.lock().unwrap();
-        if let Some(db_handle) = databases.remove(&env_handle.path) {
-            let _ = soft_close_db(&db_handle);
-        }
+        databases.remove(&env_handle.path)
+    };
+    if let Some(db_handle) = db_handle {
+        let _ = soft_close_db(&db_handle);
     }
 
     {
@@ -730,7 +731,7 @@ fn env_close<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Te
     Ok(atoms::ok().encode(env))
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
     let path_string = if let Ok(binary) = path.decode::<Binary>() {
         std::str::from_utf8(&binary).map_err(|_| Error::BadArg)?.to_string()
@@ -773,11 +774,14 @@ fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
 /// Database Operations
 ///===================================================================
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn db_close<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Term<'a>> {
+    // Remove from registry before closing so the map lock is not held
+    // during the blocking handle.join() inside soft_close_db.
+    let path = db_handle.env.path.clone();
     {
         let mut databases = DATABASES.lock().unwrap();
-        databases.remove(&db_handle.env.path);
+        databases.remove(&path);
     }
     match soft_close_db(&db_handle) {
         Ok(()) => Ok(atoms::ok().encode(env)),
