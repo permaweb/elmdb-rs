@@ -79,6 +79,9 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %% @param Options Configuration options:
 %%   - {map_size, integer()}: Maximum database size in bytes
 %%   - {max_readers, integer()}: Maximum number of reader slots (default: 126)
+%%   - {batch_size, integer()}: Flush after this many buffered ops (default: 200000)
+%%   - {flush_bytes, integer()}: Flush when buffered key+value bytes exceed this threshold; 0 disables (default: 33554432, i.e. 32 MiB)
+%%   - {flush_idle_timeout_seconds, integer()}: Flush after this many idle seconds with pending writes; 0 disables (default: 30)
 %%   - no_mem_init: Don't initialize malloc'd memory before writing to disk
 %%   - no_sync: Don't flush system buffers to disk when committing
 %%   - write_map: Use a writeable memory map for better performance
