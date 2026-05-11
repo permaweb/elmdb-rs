@@ -28,23 +28,6 @@ test_dir() ->
     Unique = erlang:unique_integer([positive]),
     filename:join(["/tmp", "elmdb_test_" ++ integer_to_list(Unique)]).
 
-put_retry(DB, Key, Value) ->
-    put_retry(DB, Key, Value, 500).
-
-put_retry(DB, Key, Value, Retries) ->
-    put_retry(DB, Key, Value, Retries, 1).
-
-put_retry(DB, Key, Value, 0, _DelayMs) ->
-    elmdb:put(DB, Key, Value);
-put_retry(DB, Key, Value, Retries, DelayMs) ->
-    case elmdb:put(DB, Key, Value) of
-        {error, eagain, _} ->
-            timer:sleep(DelayMs),
-            put_retry(DB, Key, Value, Retries - 1, min(10, DelayMs * 2));
-        Result ->
-            Result
-    end.
-
 wait_for_overlay_count(DB, Expected) ->
     wait_for_overlay_count(DB, Expected, 20).
 
@@ -473,10 +456,10 @@ chain_writer(DB, W, Iters) ->
     WB = integer_to_binary(W),
     lists:foreach(fun(I) ->
         IB = integer_to_binary(I),
-        ok = put_retry(DB, <<"w", WB/binary, ":", IB/binary, "/leaf">>, <<"val", WB/binary, ":", IB/binary>>),
-        ok = put_retry(DB, <<"w", WB/binary, ":", IB/binary, "/c">>, <<"w", WB/binary, ":", IB/binary, "/leaf">>),
-        ok = put_retry(DB, <<"w", WB/binary, ":", IB/binary, "/b">>, <<"w", WB/binary, ":", IB/binary, "/c">>),
-        ok = put_retry(DB, <<"w", WB/binary, ":", IB/binary, "/a">>, <<"w", WB/binary, ":", IB/binary, "/b">>)
+        ok = elmdb:put(DB, <<"w", WB/binary, ":", IB/binary, "/leaf">>, <<"val", WB/binary, ":", IB/binary>>),
+        ok = elmdb:put(DB, <<"w", WB/binary, ":", IB/binary, "/c">>, <<"w", WB/binary, ":", IB/binary, "/leaf">>),
+        ok = elmdb:put(DB, <<"w", WB/binary, ":", IB/binary, "/b">>, <<"w", WB/binary, ":", IB/binary, "/c">>),
+        ok = elmdb:put(DB, <<"w", WB/binary, ":", IB/binary, "/a">>, <<"w", WB/binary, ":", IB/binary, "/b">>)
     end, lists:seq(1, Iters)).
 
 chain_reader(DB, StopFlag, Broken) ->
@@ -514,7 +497,7 @@ iterator_fold_performance_test_() ->
                 lists:foreach(fun(I) ->
                     Key = iolist_to_binary([<<"iter_perf/">>, integer_to_binary(I)]),
                     Value = integer_to_binary(I),
-                    ok = put_retry(DB, Key, Value)
+                    ok = elmdb:put(DB, Key, Value)
                 end, lists:seq(1, RecordCount)),
                 ok = elmdb:flush(DB),
 
@@ -566,7 +549,7 @@ environment_copy_test_() ->
                  lists:foreach(fun(I) ->
                      Key = iolist_to_binary([<<"test_key_">>, integer_to_binary(I)]),
                      Value = iolist_to_binary([<<"test_value_">>, integer_to_binary(I), <<"_data">>]),
-                     ok = put_retry(SourceDB, Key, Value)
+                     ok = elmdb:put(SourceDB, Key, Value)
                  end, lists:seq(1, 100000)),
                  
                  % Flush to ensure all data is written
@@ -866,15 +849,15 @@ match_performance_test_() ->
                      % Create a larger dataset for performance testing
                      lists:foreach(fun(I) ->
                          ID = iolist_to_binary([<<"user_">>, integer_to_binary(I)]),
-                         ok = put_retry(DB, <<ID/binary, "/name">>, <<"Name", (integer_to_binary(I))/binary>>),
-                         ok = put_retry(DB, <<ID/binary, "/email">>, <<(integer_to_binary(I))/binary, "@example.com">>),
-                         ok = put_retry(DB, <<ID/binary, "/status">>,
+                         ok = elmdb:put(DB, <<ID/binary, "/name">>, <<"Name", (integer_to_binary(I))/binary>>),
+                         ok = elmdb:put(DB, <<ID/binary, "/email">>, <<(integer_to_binary(I))/binary, "@example.com">>),
+                         ok = elmdb:put(DB, <<ID/binary, "/status">>,
                                        case I rem 3 of
                                            0 -> <<"active">>;
                                            1 -> <<"inactive">>;
                                            2 -> <<"pending">>
                                        end),
-                         ok = put_retry(DB, <<ID/binary, "/score">>,
+                         ok = elmdb:put(DB, <<ID/binary, "/score">>,
                                        integer_to_binary(I rem 100))
                      end, lists:seq(1, 1000)),
                      
@@ -1199,7 +1182,7 @@ put_returns_eagain_when_overlay_is_full_test_() ->
                     {K, <<"v">>}
                 end, lists:seq(1, 2000))),
                 ?assert(elmdb:overlay_count(DB) > 0),
-                ?assertMatch({error, eagain, _}, elmdb:put(DB, <<"bp_put_blocked">>, <<"v">>)),
+                ?assertMatch({error, eagain, _}, elmdb:put_nif(DB, <<"bp_put_blocked">>, <<"v">>)),
                 ?assert(elmdb:overlay_count(DB) > 0),
 
                 ok = elmdb:flush(DB),
@@ -1231,7 +1214,7 @@ put_batch_returns_eagain_without_partial_write_test_() ->
                 Batch = [{<<"bp_batch_1">>, <<"v">>},
                          {<<"bp_batch_2">>, <<"v">>},
                          {<<"bp_batch_3">>, <<"v">>}],
-                ?assertMatch({error, eagain, _}, elmdb:put_batch(DB, Batch)),
+                ?assertMatch({error, eagain, _}, elmdb:put_batch_nif(DB, Batch)),
                 ?assertEqual(not_found, elmdb:get(DB, <<"bp_batch_1">>)),
                 ?assert(elmdb:overlay_count(DB) > 0),
 
@@ -1399,7 +1382,7 @@ auto_flush_test_() ->
 
                 lists:foreach(fun(I) ->
                     K = <<"auto_", (integer_to_binary(I))/binary>>,
-                    ok = put_retry(DB, K, <<"v">>)
+                    ok = elmdb:put(DB, K, <<"v">>)
                 end, lists:seq(1, 10)),
                 case wait_for_overlay_count(DB, 0, 200) of
                     ok ->
@@ -1428,7 +1411,7 @@ concurrent_open_writers_auto_flush_test_() ->
                 Writer = spawn_monitor(fun() ->
                     lists:foreach(fun(I) ->
                         K = <<"race_", (integer_to_binary(I))/binary>>,
-                        put_retry(DB, K, <<"v">>)
+                        elmdb:put(DB, K, <<"v">>)
                     end, lists:seq(1, 20)),
                     Self ! {writer_done, self()}
                 end),
@@ -1473,7 +1456,7 @@ flush_pending_resets_after_recovery_test_() ->
                 {ok, DB2} = elmdb:db_open(Env, [create]),
                 lists:foreach(fun(I) ->
                     K = <<"fp_", (integer_to_binary(I))/binary>>,
-                    case put_retry(DB2, K, <<"v">>) of
+                    case elmdb:put(DB2, K, <<"v">>) of
                         ok ->
                             ?assertEqual({ok, <<"v">>}, elmdb:get(DB2, K));
                         Error ->
@@ -1508,7 +1491,7 @@ overlay_reservation_no_drift_under_contention_test_() ->
                     lists:foreach(fun(I) ->
                         IB = integer_to_binary(I),
                         K = <<"w", WB/binary, ":", IB/binary>>,
-                        ok = put_retry(DB, K, IB)
+                        ok = elmdb:put(DB, K, IB)
                     end, lists:seq(1, PerWriter)),
                     Parent ! {done, self()}
                 end) || W <- lists:seq(1, Writers)],
@@ -1528,7 +1511,7 @@ overlay_reservation_no_drift_under_contention_test_() ->
                     end, lists:seq(1, PerWriter))
                 end, lists:seq(1, Writers)),
 
-                ok = put_retry(DB, <<"sentinel">>, <<"ok">>),
+                ok = elmdb:put(DB, <<"sentinel">>, <<"ok">>),
                 ok = elmdb:flush(DB),
                 ?assertEqual({ok, <<"ok">>}, elmdb:get(DB, <<"sentinel">>)),
 
@@ -1549,24 +1532,24 @@ flush_append_mixed_keys_test_() ->
                 {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 2}]),
                 {ok, DB} = elmdb:db_open(Env, [create]),
 
-                ok = put_retry(DB, <<"k_b">>, <<"1">>),
+                ok = elmdb:put(DB, <<"k_b">>, <<"1">>),
                 ok = elmdb:flush(DB),
 
-                ok = put_retry(DB, <<"k_d">>, <<"2">>),
+                ok = elmdb:put(DB, <<"k_d">>, <<"2">>),
                 ok = elmdb:flush(DB),
                 ?assertEqual({ok, <<"2">>}, elmdb:get(DB, <<"k_d">>)),
 
-                ok = put_retry(DB, <<"k_a">>, <<"3">>),
+                ok = elmdb:put(DB, <<"k_a">>, <<"3">>),
                 ok = elmdb:flush(DB),
                 ?assertEqual({ok, <<"3">>}, elmdb:get(DB, <<"k_a">>)),
                 ?assertEqual({ok, <<"1">>}, elmdb:get(DB, <<"k_b">>)),
 
-                ok = put_retry(DB, <<"k_b">>, <<"99">>),
+                ok = elmdb:put(DB, <<"k_b">>, <<"99">>),
                 ok = elmdb:flush(DB),
                 ?assertEqual({ok, <<"99">>}, elmdb:get(DB, <<"k_b">>)),
 
-                ok = put_retry(DB, <<"k_c">>, <<"4">>),
-                ok = put_retry(DB, <<"k_a">>, <<"42">>),
+                ok = elmdb:put(DB, <<"k_c">>, <<"4">>),
+                ok = elmdb:put(DB, <<"k_a">>, <<"42">>),
                 ok = elmdb:flush(DB),
                 ?assertEqual({ok, <<"4">>}, elmdb:get(DB, <<"k_c">>)),
                 ?assertEqual({ok, <<"42">>}, elmdb:get(DB, <<"k_a">>)),
@@ -1595,9 +1578,9 @@ flush_bytes_triggers_test_() ->
                      {flush_idle_timeout_seconds, 0}]),
                 {ok, DB} = elmdb:db_open(Env, [create]),
                 Big = binary:copy(<<"x">>, 600),
-                ok = put_retry(DB, <<"a">>, Big),
-                ok = put_retry(DB, <<"b">>, Big),
-                ok = put_retry(DB, <<"c">>, Big),
+                ok = elmdb:put(DB, <<"a">>, Big),
+                ok = elmdb:put(DB, <<"b">>, Big),
+                ok = elmdb:put(DB, <<"c">>, Big),
                 ok = wait_for_overlay_count(DB, 0),
                 ?assertEqual({ok, Big}, elmdb:get(DB, <<"a">>)),
                 ?assertEqual({ok, Big}, elmdb:get(DB, <<"c">>)),
@@ -1620,7 +1603,7 @@ flush_idle_timeout_test_() ->
                 {ok, DB} = elmdb:db_open(Env, [create]),
                 lists:foreach(fun(N) ->
                                   K = <<"k", (integer_to_binary(N))/binary>>,
-                                  ok = put_retry(DB, K, <<"v">>)
+                                  ok = elmdb:put(DB, K, <<"v">>)
                               end, lists:seq(1, 5)),
                 timer:sleep(2000),
                 ok = wait_for_overlay_count(DB, 0),
@@ -1643,13 +1626,13 @@ flush_bytes_zero_disables_test_() ->
                 {ok, DB} = elmdb:db_open(Env, [create]),
                 lists:foreach(fun(N) ->
                                   K = <<"k", (integer_to_binary(N))/binary>>,
-                                  ok = put_retry(DB, K, <<"v">>)
+                                  ok = elmdb:put(DB, K, <<"v">>)
                               end, lists:seq(1, 50)),
                 timer:sleep(200),
                 ?assert(elmdb:overlay_count(DB) > 0),
                 lists:foreach(fun(N) ->
                                   K = <<"k", (integer_to_binary(N + 50))/binary>>,
-                                  ok = put_retry(DB, K, <<"v">>)
+                                  ok = elmdb:put(DB, K, <<"v">>)
                               end, lists:seq(1, 60)),
                 ok = wait_for_overlay_count(DB, 0),
                 _ = elmdb:db_close(DB),

@@ -430,42 +430,13 @@ write_records(DB, N, Count, SuccessCount, Errors) ->
     Key = <<"key", N:32>>,
     Value = <<"value", N:32>>,
 
-    case catch put_retry(DB, Key, Value) of
+    case catch elmdb:put(DB, Key, Value) of
         ok ->
             write_records(DB, N + 1, Count, SuccessCount + 1, Errors);
         {error, Reason} ->
             write_records(DB, N + 1, Count, SuccessCount, [{N, Reason} | Errors]);
         Error ->
             write_records(DB, N + 1, Count, SuccessCount, [{N, Error} | Errors])
-    end.
-
-%% @doc Put with exponential backoff retry on {error, eagain, _} backpressure.
-put_retry(DB, Key, Value) ->
-    put_retry(DB, Key, Value, 500, 1).
-
-put_retry(DB, Key, Value, 0, _DelayMs) ->
-    elmdb:put(DB, Key, Value);
-put_retry(DB, Key, Value, Retries, DelayMs) ->
-    case elmdb:put(DB, Key, Value) of
-        {error, eagain, _} ->
-            timer:sleep(DelayMs),
-            put_retry(DB, Key, Value, Retries - 1, min(200, DelayMs * 2));
-        Result ->
-            Result
-    end.
-
-put_batch_retry(DB, Batch) ->
-    put_batch_retry(DB, Batch, 500, 1).
-
-put_batch_retry(DB, Batch, 0, _DelayMs) ->
-    elmdb:put_batch(DB, Batch);
-put_batch_retry(DB, Batch, Retries, DelayMs) ->
-    case elmdb:put_batch(DB, Batch) of
-        {error, eagain, _} ->
-            timer:sleep(DelayMs),
-            put_batch_retry(DB, Batch, Retries - 1, min(200, DelayMs * 2));
-        Result ->
-            Result
     end.
 
 %% @doc Read N records with performance tracking
@@ -515,7 +486,7 @@ write_hierarchical_records(DB, TestData) ->
 write_hierarchical_records(_DB, [], SuccessCount, Errors) ->
     {ok, SuccessCount, lists:reverse(Errors)};
 write_hierarchical_records(DB, [{Key, Value} | Rest], SuccessCount, Errors) ->
-    case catch put_retry(DB, Key, Value) of
+    case catch elmdb:put(DB, Key, Value) of
         ok ->
             write_hierarchical_records(DB, Rest, SuccessCount + 1, Errors);
         Error ->
@@ -527,7 +498,7 @@ write_concurrent_records(DB, ProcessId, Count) ->
     lists:foreach(fun(N) ->
         Key = <<"proc", ProcessId:16, "_key", N:32>>,
         Value = <<"proc", ProcessId:16, "_value", N:32>>,
-        put_retry(DB, Key, Value)
+        elmdb:put(DB, Key, Value)
     end, lists:seq(1, Count)).
 
 %% @doc Generate key-value pairs for batch operations
@@ -555,7 +526,7 @@ write_batches(DB, Batches) ->
 write_batches(_DB, [], SuccessCount, Errors) ->
     {ok, SuccessCount, lists:reverse(Errors)};
 write_batches(DB, [Batch | Rest], SuccessCount, Errors) ->
-    case catch put_batch_retry(DB, Batch) of
+    case catch elmdb:put_batch(DB, Batch) of
         ok ->
             write_batches(DB, Rest, SuccessCount + 1, Errors);
         {ok, _BatchSuccessCount, BatchErrors} ->

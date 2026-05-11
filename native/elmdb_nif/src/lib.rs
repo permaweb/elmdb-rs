@@ -1220,7 +1220,7 @@ impl Drop for LmdbDatabase {
 /// Key-Value Operations
 ///===================================================================
 
-#[rustler::nif]
+#[rustler::nif(name = "put_nif")]
 fn put<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
@@ -1418,7 +1418,7 @@ fn overlay_count<'a>(env: Env<'a>, db_handle: &'a LmdbDatabase) -> NifResult<Ter
     Ok(count.encode(env))
 }
 
-#[rustler::nif]
+#[rustler::nif(name = "put_batch_nif")]
 fn put_batch<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
