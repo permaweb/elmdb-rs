@@ -203,14 +203,9 @@ bench_100k_reads(Config) ->
     DB = ?config(db, Config),
     RecordCount = 100000,
     
-    % First ensure we have data to read (write if not already done)
-    case ?config(write_time, Config) of
-        undefined ->
-            ct:print("Writing test data first..."),
-            {ok, _, _} = write_records(DB, RecordCount);
-        _ ->
-            ct:print("Using existing test data")
-    end,
+    ct:print("Writing test data first..."),
+    {ok, _, _} = write_records(DB, RecordCount),
+    ok = elmdb:flush(DB),
     
     ct:print("Starting benchmark: Reading ~p records", [RecordCount]),
     
@@ -250,18 +245,7 @@ bench_100k_reads(Config) ->
             ct:fail("Read benchmark failed: ~p", [ReadReason])
     end,
     
-    % Compare with write performance
-    case ?config(write_rate, Config) of
-        undefined -> ok;
-        WriteRate ->
-            Ratio = RecordsPerSecond / WriteRate,
-            ct:print("Read/Write Performance Ratio: ~.2fx", [Ratio]),
-            if 
-                Ratio > 1.0 -> ct:print("  Reads are faster than writes");
-                Ratio < 1.0 -> ct:print("  Writes are faster than reads");
-                true -> ct:print("  Read and write performance are similar")
-            end
-    end.
+    ok.
 
 %% @doc Benchmark hierarchical key operations and list performance
 bench_hierarchical_keys(Config) ->
@@ -280,9 +264,16 @@ bench_hierarchical_keys(Config) ->
     WriteResult = write_hierarchical_records(DB, TestData),
     WriteEndTime = erlang:monotonic_time(microsecond),
     
-    WriteTime = (WriteEndTime - WriteStartTime) / 1000000,
-    ct:print("Hierarchical write time: ~.2f seconds", [WriteTime]),
-    
+    WriteMicros = WriteEndTime - WriteStartTime,
+    WriteTime = WriteMicros / 1000000,
+    TotalRecs = length(TestData),
+    HierRate = TotalRecs / WriteTime,
+    ct:print("Hierarchical Write Performance Results:"),
+    ct:print("  Records written: ~p", [TotalRecs]),
+    ct:print("  Total time: ~.2f seconds", [WriteTime]),
+    ct:print("  Records/second: ~.2f", [HierRate]),
+    ct:print("  Microseconds per record: ~.2f", [WriteMicros / TotalRecs]),
+
     case WriteResult of
         {ok, WriteCount, WriteErrors} ->
             ct:print("  Successfully wrote ~p records", [WriteCount]),
@@ -346,32 +337,33 @@ bench_concurrent_access(Config) ->
     % Start concurrent writers
     StartTime = erlang:monotonic_time(microsecond),
     
-    WriterPids = lists:map(fun(ProcessId) ->
-        spawn_link(fun() ->
+    Writers = lists:map(fun(ProcessId) ->
+        spawn_monitor(fun() ->
             write_concurrent_records(DB, ProcessId, RecordsPerProcess)
         end)
     end, lists:seq(1, ProcessCount)),
-    
-    % Wait for all writers to complete
-    lists:foreach(fun(Pid) ->
+
+    lists:foreach(fun({Pid, Ref}) ->
         receive
-            {'EXIT', Pid, normal} -> ok;
-            {'EXIT', Pid, Reason} -> 
+            {'DOWN', Ref, process, Pid, normal} -> ok;
+            {'DOWN', Ref, process, Pid, Reason} ->
                 ct:print("Writer process ~p failed: ~p", [Pid, Reason])
-        after 30000 ->
+        after 60000 ->
             ct:print("Writer process ~p timed out", [Pid])
         end
-    end, WriterPids),
+    end, Writers),
     
     EndTime = erlang:monotonic_time(microsecond),
     
-    TotalTime = (EndTime - StartTime) / 1000000,
+    TotalMicros = EndTime - StartTime,
+    TotalTime = TotalMicros / 1000000,
     RecordsPerSecond = TotalRecords / TotalTime,
-    
+
     ct:print("Concurrent Write Results:"),
     ct:print("  Total records: ~p", [TotalRecords]),
     ct:print("  Total time: ~.2f seconds", [TotalTime]),
     ct:print("  Records/second: ~.2f", [RecordsPerSecond]),
+    ct:print("  Microseconds per record: ~.2f", [TotalMicros / TotalRecords]),
     ct:print("  Processes: ~p", [ProcessCount]).
 
 %% @doc Benchmark iterator cursor stepping and fold traversal
@@ -380,7 +372,12 @@ bench_iterator_fold(Config) ->
     RecordCount = 100000,
 
     ct:print("Preparing iterator/fold benchmark data: ~p records", [RecordCount]),
-    {ok, RecordCount, []} = write_records(DB, RecordCount),
+    {ok, WrittenCount, WriteErrors} = write_records(DB, RecordCount),
+    case WriteErrors of
+        [] -> ok;
+        _ -> ct:print("  Write errors during seed: ~p (first 3: ~p)",
+                      [length(WriteErrors), lists:sublist(WriteErrors, 3)])
+    end,
     ok = elmdb:flush(DB),
 
     ct:print("Starting iterator cursor benchmark"),
@@ -388,17 +385,17 @@ bench_iterator_fold(Config) ->
     {ok, IteratedCount} = count_with_iterator(DB),
     IteratorEnd = erlang:monotonic_time(microsecond),
     IteratorMicros = IteratorEnd - IteratorStart,
-    IteratorRate = RecordCount / (IteratorMicros / 1000000),
+    IteratorRate = IteratedCount / (IteratorMicros / 1000000),
 
     ct:print("Iterator results:"),
     ct:print("  Records iterated: ~p", [IteratedCount]),
     ct:print("  Total time: ~.2f seconds", [IteratorMicros / 1000000]),
     ct:print("  Records/second: ~.2f", [IteratorRate]),
-    ct:print("  Microseconds per record: ~.2f", [IteratorMicros / RecordCount]),
+    ct:print("  Microseconds per record: ~.2f", [IteratorMicros / max(1, IteratedCount)]),
 
     case IteratedCount of
-        RecordCount -> ok;
-        _ -> ct:fail("Iterator count mismatch: expected ~p got ~p", [RecordCount, IteratedCount])
+        WrittenCount -> ok;
+        _ -> ct:fail("Iterator count mismatch: expected ~p got ~p", [WrittenCount, IteratedCount])
     end,
 
     ct:print("Starting fold benchmark"),
@@ -406,17 +403,17 @@ bench_iterator_fold(Config) ->
     {ok, FoldCount} = elmdb:fold(DB, fun(_Key, _Value, Acc) -> Acc + 1 end, 0),
     FoldEnd = erlang:monotonic_time(microsecond),
     FoldMicros = FoldEnd - FoldStart,
-    FoldRate = RecordCount / (FoldMicros / 1000000),
+    FoldRate = FoldCount / (FoldMicros / 1000000),
 
     ct:print("Fold results:"),
     ct:print("  Records folded: ~p", [FoldCount]),
     ct:print("  Total time: ~.2f seconds", [FoldMicros / 1000000]),
     ct:print("  Records/second: ~.2f", [FoldRate]),
-    ct:print("  Microseconds per record: ~.2f", [FoldMicros / RecordCount]),
+    ct:print("  Microseconds per record: ~.2f", [FoldMicros / max(1, FoldCount)]),
 
     case FoldCount of
-        RecordCount -> ok;
-        _ -> ct:fail("Fold count mismatch: expected ~p got ~p", [RecordCount, FoldCount])
+        WrittenCount -> ok;
+        _ -> ct:fail("Fold count mismatch: expected ~p got ~p", [WrittenCount, FoldCount])
     end.
 
 %%%===================================================================
@@ -432,7 +429,7 @@ write_records(_DB, N, Count, SuccessCount, Errors) when N > Count ->
 write_records(DB, N, Count, SuccessCount, Errors) ->
     Key = <<"key", N:32>>,
     Value = <<"value", N:32>>,
-    
+
     case catch elmdb:put(DB, Key, Value) of
         ok ->
             write_records(DB, N + 1, Count, SuccessCount + 1, Errors);

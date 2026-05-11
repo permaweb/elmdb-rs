@@ -95,6 +95,7 @@ mod atoms {
         bad_val_size,
         bad_dbi,
         validation_error,
+        eagain,
     }
 }
 
@@ -155,6 +156,16 @@ pub struct LmdbDatabase {
     op_count: AtomicUsize,
     /// Flush threshold (number of ops before triggering background flush)
     batch_size: AtomicUsize,
+    /// Approximate bytes (key + value) currently buffered in the active overlay.
+    bytes_in_overlay: AtomicUsize,
+    /// Byte threshold for triggering a background flush. 0 disables the byte trigger.
+    flush_bytes: AtomicUsize,
+    /// Idle-timeout threshold in milliseconds. 0 disables the idle-timeout trigger.
+    flush_idle_timeout_ms: AtomicU64,
+    /// Last write time, expressed as milliseconds since `WORKER_EPOCH`.
+    last_write_at_ms: AtomicU64,
+    /// Approximate entries currently held in active and draining overlays.
+    overlay_entries: AtomicUsize,
     /// Coalesces redundant flush signals to worker
     flush_pending: AtomicBool,
     /// Cache: true when db is closed (atomic fast-path, no lock needed)
@@ -189,6 +200,13 @@ lazy_static::lazy_static! {
         Arc::new(Mutex::new(HashMap::new()));
     static ref DATABASES: Arc<Mutex<HashMap<String, ResourceArc<LmdbDatabase>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    /// Process-start anchor used to derive monotonic millis (fits in u64).
+    static ref WORKER_EPOCH: std::time::Instant = std::time::Instant::now();
+}
+
+#[inline]
+fn now_ms() -> u64 {
+    WORKER_EPOCH.elapsed().as_millis() as u64
 }
 
 /// Initialize the NIF module
@@ -201,6 +219,65 @@ fn init(env: Env, _info: Term) -> bool {
 
 fn new_overlay_map() -> OverlayMap {
     SccHashMap::with_hasher(ahash::RandomState::default())
+}
+
+fn release_overlay_entries(db: &LmdbDatabase, entries: usize) {
+    if entries == 0 {
+        return;
+    }
+    let _ = db
+        .overlay_entries
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(entries))
+        });
+}
+
+fn reserve_overlay_entries(db: &LmdbDatabase, entries: usize) -> bool {
+    if entries == 0 {
+        return true;
+    }
+    let max_entries = db
+        .batch_size
+        .load(Ordering::Acquire)
+        .saturating_mul(2);
+    let mut current = db.overlay_entries.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(entries) else {
+            return false;
+        };
+        if next > max_entries {
+            request_background_flush(db);
+            return false;
+        }
+        match db.overlay_entries.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn backpressure_error<'a>(env: Env<'a>) -> Term<'a> {
+    (
+        atoms::error(),
+        atoms::eagain(),
+        "Write overlay is full; retry later".to_string(),
+    )
+        .encode(env)
+}
+
+fn request_background_flush(db_handle: &LmdbDatabase) {
+    if db_handle
+        .flush_pending
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        send_background_flush_if_worker_present(db_handle);
+    }
 }
 
 fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lmdb::Error> {
@@ -252,7 +329,22 @@ impl LmdbEnv {
             .options
             .read()
             .map_err(|_| "Failed to read environment options".to_string())?;
-        Ok(options.batch_size.unwrap_or(1000))
+        Ok(options.batch_size.unwrap_or(200_000))
+    }
+
+    /// Returns `(flush_bytes, flush_idle_timeout_ms)`.
+    /// Defaults: 32 MiB and 30 seconds. A value of `0` disables that trigger.
+    fn flush_thresholds(&self) -> Result<(usize, u64), String> {
+        let options = self
+            .options
+            .read()
+            .map_err(|_| "Failed to read environment options".to_string())?;
+        let bytes = options.flush_bytes.unwrap_or(33_554_432);
+        let idle_ms = options
+            .flush_idle_timeout_seconds
+            .unwrap_or(30)
+            .saturating_mul(1000);
+        Ok((bytes, idle_ms))
     }
 
     fn ensure_open(&self) -> Result<(Arc<Environment>, u64), String> {
@@ -339,6 +431,7 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
     db.draining.store(Arc::new(Some(old_map.clone())));
     db.active.store(new_map);
     let _ = db.op_count.swap(0, Ordering::AcqRel);
+    let _ = db.bytes_in_overlay.swap(0, Ordering::AcqRel);
 
     if old_map.is_empty() {
         db.draining.store(Arc::new(None));
@@ -361,14 +454,75 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
         }
     };
 
-    let mut write_err = None;
+    let n = old_map.len();
+    let mut buf: Vec<u8> = Vec::with_capacity(n * 64);
+    let mut entries: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(n);
     (*old_map).iter_sync(|k, v| {
-        if let Err(e) = txn.put(live_db, k, v, WriteFlags::empty()) {
-            write_err = Some(format!("Failed to put value: {:?}", e));
-            return false;
-        }
+        let k_off = buf.len() as u32;
+        let k_len = k.len() as u32;
+        buf.extend_from_slice(k.as_slice());
+        let v_off = buf.len() as u32;
+        let v_len = v.len() as u32;
+        buf.extend_from_slice(v.as_slice());
+        entries.push((k_off, k_len, v_off, v_len));
         true
     });
+
+    let buf_slice: &[u8] = &buf;
+    let key_of = |e: &(u32, u32, u32, u32)| -> &[u8] {
+        &buf_slice[e.0 as usize..(e.0 + e.1) as usize]
+    };
+    if entries.len() >= 32_768 {
+        use rayon::slice::ParallelSliceMut;
+        entries.par_sort_unstable_by(|a, b| key_of(a).cmp(key_of(b)));
+    } else {
+        entries.sort_unstable_by(|a, b| key_of(a).cmp(key_of(b)));
+    }
+
+    let mut write_err = None;
+    let mut cursor_err = None;
+    match txn.open_rw_cursor(live_db) {
+        Ok(mut cursor) => {
+            const MDB_LAST: u32 = 6;
+            let last_key_owned: Option<Vec<u8>> = match cursor.get(None, None, MDB_LAST) {
+                Err(lmdb::Error::NotFound) => None,
+                Ok((Some(lk), _)) => Some(lk.to_vec()),
+                _ => None,
+            };
+            let split = match &last_key_owned {
+                None => 0,
+                Some(lk) => entries.partition_point(|e| {
+                    &buf[e.0 as usize..(e.0 + e.1) as usize] <= lk.as_slice()
+                }),
+            };
+            'write: {
+                for e in &entries[..split] {
+                    let k = &buf[e.0 as usize..(e.0 + e.1) as usize];
+                    let v = &buf[e.2 as usize..(e.2 + e.3) as usize];
+                    if let Err(err) = cursor.put(&k, &v, WriteFlags::empty()) {
+                        write_err = Some(format!("Failed to put value: {:?}", err));
+                        break 'write;
+                    }
+                }
+                for e in &entries[split..] {
+                    let k = &buf[e.0 as usize..(e.0 + e.1) as usize];
+                    let v = &buf[e.2 as usize..(e.2 + e.3) as usize];
+                    if let Err(err) = cursor.put(&k, &v, WriteFlags::APPEND) {
+                        write_err = Some(format!("Failed to put value: {:?}", err));
+                        break 'write;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            cursor_err = Some(format!("Failed to open cursor: {:?}", e));
+        }
+    }
+    if let Some(e) = cursor_err {
+        drop(txn);
+        restore_failed_flush(db, old_map);
+        return Err(e);
+    }
 
     if let Some(e) = write_err {
         drop(txn);
@@ -376,27 +530,44 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
         return Err(e);
     }
 
-    match txn.commit() {
+    let res = match txn.commit() {
         Ok(()) => {
             db.draining.store(Arc::new(None));
+            release_overlay_entries(db, n);
             Ok(())
         }
         Err(e) => {
-            restore_failed_flush(db, old_map);
+            restore_failed_flush(db, old_map.clone());
             Err(format!("Failed to commit batch transaction: {}", e))
         }
+    };
+    drop(entries);
+    drop(buf);
+    if Arc::strong_count(&old_map) == 1 {
+        std::thread::spawn(move || drop(old_map));
+    } else {
+        drop(old_map);
     }
+    res
 }
 
 fn restore_failed_flush(db: &LmdbDatabase, failed_map: Arc<OverlayMap>) {
     let current = db.active.load();
     let mut count = 0usize;
+    let mut overlap = 0usize;
+    let mut bytes = 0usize;
     (*failed_map).iter_sync(|k, v| {
-        let _ = current.insert_sync(k.clone(), v.clone());
+        // insert_sync returns Err only on key collision (scc 2.x), never for OOM.
+        bytes += k.len() + v.len();
+        if current.insert_sync(k.clone(), v.clone()).is_err() {
+            overlap += 1;
+        }
         count += 1;
         true
     });
+    release_overlay_entries(db, overlap);
     db.op_count.fetch_add(count, Ordering::Relaxed);
+    db.bytes_in_overlay.fetch_add(bytes, Ordering::Relaxed);
     db.draining.store(Arc::new(None));
 }
 
@@ -416,7 +587,41 @@ fn drain_remaining_sync_waiters(rx: &Receiver<WorkerCommand>, fatal_error: Optio
 fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
     let mut exit_error: Option<String> = None;
     loop {
-        match rx.recv() {
+        let idle_ms = db.flush_idle_timeout_ms.load(Ordering::Relaxed);
+        let check_interval = if idle_ms == 0 {
+            std::time::Duration::from_secs(60)
+        } else {
+            let quarter = std::cmp::max(idle_ms / 4, 50);
+            std::time::Duration::from_millis(std::cmp::min(quarter, 1000))
+        };
+        let recv_result = rx.recv_timeout(check_interval);
+        match recv_result {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let idle_ms = db.flush_idle_timeout_ms.load(Ordering::Relaxed);
+                if idle_ms == 0 {
+                    continue;
+                }
+                if db.op_count.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                let last = db.last_write_at_ms.load(Ordering::Relaxed);
+                let now = now_ms();
+                if now.saturating_sub(last) < idle_ms {
+                    continue;
+                }
+                db.flush_pending.store(false, Ordering::Release);
+                let result = do_flush(&db);
+                if let Err(e) = result {
+                    if let Ok(mut guard) = db.fatal_error.lock() {
+                        *guard = Some(e.clone());
+                    }
+                    db.has_fatal_error.store(true, Ordering::Release);
+                    exit_error = Some(e);
+                    break;
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(WorkerCommand::Flush) => {
                 db.flush_pending.store(false, Ordering::Release);
                 let result = do_flush(&db);
@@ -463,7 +668,6 @@ fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
                 }
                 break;
             }
-            Err(_) => break,
         }
     }
     drain_remaining_sync_waiters(&rx, exit_error);
@@ -775,7 +979,12 @@ fn db_open<'a>(
             return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
         }
     };
-
+    let (flush_bytes, flush_idle_ms) = match env_handle.flush_thresholds() {
+        Ok(v) => v,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
+        }
+    };
     let db_key = env_handle.path.clone();
     if let Some(existing_db) = {
         let databases = DATABASES.lock().map_err(|_| Error::BadArg)?;
@@ -786,7 +995,9 @@ fn db_open<'a>(
                 return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
             }
         }
-        existing_db.batch_size.store(batch_size, Ordering::Release);
+        // First-open wins: do not overwrite batch_size on an already-open DB.
+        // Callers that need a specific cap must open the env with that batch_size before
+        // calling db_open for the first time.
         if existing_db.has_fatal_error.load(Ordering::Acquire) {
             if let Ok(mut wh) = existing_db.worker_handle.lock() {
                 if let Some(handle) = wh.take() {
@@ -828,6 +1039,11 @@ fn db_open<'a>(
         draining: ArcSwap::from_pointee(None),
         op_count: AtomicUsize::new(0),
         batch_size: AtomicUsize::new(batch_size),
+        bytes_in_overlay: AtomicUsize::new(0),
+        flush_bytes: AtomicUsize::new(flush_bytes),
+        flush_idle_timeout_ms: AtomicU64::new(flush_idle_ms),
+        last_write_at_ms: AtomicU64::new(now_ms()),
+        overlay_entries: AtomicUsize::new(0),
         flush_pending: AtomicBool::new(false),
         state: Mutex::new(DbState {
             cached_db: None,
@@ -1004,7 +1220,7 @@ impl Drop for LmdbDatabase {
 /// Key-Value Operations
 ///===================================================================
 
-#[rustler::nif]
+#[rustler::nif(name = "put_nif")]
 fn put<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
@@ -1072,23 +1288,35 @@ fn put<'a>(
         }
     }
 
+    if !reserve_overlay_entries(&db_handle, 1) {
+        return Ok(backpressure_error(env));
+    }
     loop {
         let map = db_handle.active.load();
-        let _ = map.upsert_sync(key_vec.clone(), value_vec.clone());
+        let was_upsert = map.upsert_sync(key_vec.clone(), value_vec.clone()).is_some();
         if Arc::ptr_eq(&map, &db_handle.active.load()) {
+            // Committed to this map: release reservation only if key already existed.
+            if was_upsert {
+                release_overlay_entries(&db_handle, 1);
+            }
             break;
         }
+        // Map swapped under us; retry without releasing — reservation is still held.
     }
 
     let count = db_handle.op_count.fetch_add(1, Ordering::Relaxed) + 1;
+    let bytes_added = key_vec.len().saturating_add(value_vec.len());
+    let total_bytes = db_handle
+        .bytes_in_overlay
+        .fetch_add(bytes_added, Ordering::Relaxed)
+        .saturating_add(bytes_added);
+    db_handle
+        .last_write_at_ms
+        .store(now_ms(), Ordering::Relaxed);
     let threshold = db_handle.batch_size.load(Ordering::Relaxed);
-    if count >= threshold
-        && db_handle
-            .flush_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        send_background_flush_if_worker_present(&db_handle);
+    let byte_threshold = db_handle.flush_bytes.load(Ordering::Relaxed);
+    if count >= threshold || (byte_threshold > 0 && total_bytes >= byte_threshold) {
+        request_background_flush(&db_handle);
     }
 
     Ok(atoms::ok().encode(env))
@@ -1186,12 +1414,11 @@ fn flush<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Te
 
 #[rustler::nif]
 fn overlay_count<'a>(env: Env<'a>, db_handle: &'a LmdbDatabase) -> NifResult<Term<'a>> {
-    let active = db_handle.active.load();
-    let count = active.len();
+    let count = db_handle.overlay_entries.load(Ordering::Acquire);
     Ok(count.encode(env))
 }
 
-#[rustler::nif]
+#[rustler::nif(name = "put_batch_nif")]
 fn put_batch<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
@@ -1224,25 +1451,41 @@ fn put_batch<'a>(
         }
     }
 
+    if !reserve_overlay_entries(&db_handle, key_value_pairs.len()) {
+        return Ok(backpressure_error(env));
+    }
     loop {
         let m = db_handle.active.load();
         let _reserved = m.reserve(key_value_pairs.len());
+        let mut collision_count = 0usize;
         for (key, value) in key_value_pairs.iter() {
-            let _ = m.upsert_sync(key.as_slice().to_vec(), value.as_slice().to_vec());
+            if m.upsert_sync(key.as_slice().to_vec(), value.as_slice().to_vec()).is_some() {
+                collision_count += 1;
+            }
         }
         if Arc::ptr_eq(&m, &db_handle.active.load()) {
+            // Committed: release one slot per key that already existed in the map.
+            release_overlay_entries(&db_handle, collision_count);
             break;
         }
+        // Map swapped; retry — reservations are still held, collision_count is discarded.
     }
     let count = db_handle.op_count.fetch_add(key_value_pairs.len(), Ordering::Relaxed) + key_value_pairs.len();
+    let bytes_added: usize = key_value_pairs
+        .iter()
+        .map(|(k, v)| k.as_slice().len().saturating_add(v.as_slice().len()))
+        .sum();
+    let total_bytes = db_handle
+        .bytes_in_overlay
+        .fetch_add(bytes_added, Ordering::Relaxed)
+        .saturating_add(bytes_added);
+    db_handle
+        .last_write_at_ms
+        .store(now_ms(), Ordering::Relaxed);
     let threshold = db_handle.batch_size.load(Ordering::Relaxed);
-    if count >= threshold
-        && db_handle
-            .flush_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        send_background_flush_if_worker_present(&db_handle);
+    let byte_threshold = db_handle.flush_bytes.load(Ordering::Relaxed);
+    if count >= threshold || (byte_threshold > 0 && total_bytes >= byte_threshold) {
+        request_background_flush(&db_handle);
     }
 
     Ok(atoms::ok().encode(env))
@@ -1722,6 +1965,18 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
                         }
                     }
                 }
+                "flush_bytes" => {
+                    if let Ok(size) = value.decode::<u64>() {
+                        if size <= usize::MAX as u64 {
+                            env_opts.flush_bytes = Some(size as usize);
+                        }
+                    }
+                }
+                "flush_idle_timeout_seconds" => {
+                    if let Ok(secs) = value.decode::<u64>() {
+                        env_opts.flush_idle_timeout_seconds = Some(secs);
+                    }
+                }
                 _ => {}
             }
         } else if let Ok(atom) = option.decode::<rustler::Atom>() {
@@ -1762,6 +2017,8 @@ struct EnvOptions {
     map_size: Option<u64>,
     max_readers: Option<u32>,
     batch_size: Option<usize>,
+    flush_bytes: Option<usize>,
+    flush_idle_timeout_seconds: Option<u64>,
     no_mem_init: bool,
     no_sync: bool,
     no_lock: bool,

@@ -17,6 +17,9 @@
 %% Key-value operations
 -export([put/3, put_batch/2, get/2, flush/1]).
 
+%% Internal NIF entry points (bypass retry on EAGAIN). Exposed only for tests
+-export([put_nif/3, put_batch_nif/2]).
+
 %% Diagnostics
 -export([overlay_count/1]).
 
@@ -79,6 +82,9 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %% @param Options Configuration options:
 %%   - {map_size, integer()}: Maximum database size in bytes
 %%   - {max_readers, integer()}: Maximum number of reader slots (default: 126)
+%%   - {batch_size, integer()}: Flush after this many buffered ops (default: 200000)
+%%   - {flush_bytes, integer()}: Flush when buffered key+value bytes exceed this threshold; 0 disables (default: 33554432, i.e. 32 MiB)
+%%   - {flush_idle_timeout_seconds, integer()}: Flush after this many idle seconds with pending writes; 0 disables (default: 30)
 %%   - no_mem_init: Don't initialize malloc'd memory before writing to disk
 %%   - no_sync: Don't flush system buffers to disk when committing
 %%   - write_map: Use a writeable memory map for better performance
@@ -148,25 +154,71 @@ db_close(_DBInstance) ->
 %%% Key-Value Operations
 %%%===================================================================
 
-%% @doc Write a key-value pair to the database
+%% @doc Write a key-value pair to the database.
+%%
+%%      Transparently retries with exponential backoff when the write
+%%      overlay is at the backpressure cap; callers should not see
+%%      `{error, eagain, _}`. Retries up to ~5s total (500 attempts ×
+%%      backoff doubling from 1ms, capped at 200ms) before surfacing the
+%%      final result. All other errors short-circuit immediately.
 %% @param DBInstance Database handle
 %% @param Key The key to write (binary)
 %% @param Value The value to store (binary)
 %% @returns ok on success
 %% @throws {error, Type, Description} on failure
--spec put(DBInstance :: term(), Key :: binary(), Value :: binary()) -> 
+-spec put(DBInstance :: term(), Key :: binary(), Value :: binary()) ->
     ok | {error, term(), binary()}.
-put(_DBInstance, _Key, _Value) ->
-    erlang:nif_error(nif_not_loaded).
+put(DBInstance, Key, Value) ->
+    put_loop(DBInstance, Key, Value, 500, 1).
 
-%% @doc Write multiple key-value pairs to the database in a single transaction
+put_loop(DBInstance, Key, Value, 0, _DelayMs) ->
+    put_nif(DBInstance, Key, Value);
+put_loop(DBInstance, Key, Value, Retries, DelayMs) ->
+    case put_nif(DBInstance, Key, Value) of
+        {error, eagain, _} ->
+            timer:sleep(DelayMs),
+            put_loop(DBInstance, Key, Value, Retries - 1, min(200, DelayMs * 2));
+        Result ->
+            Result
+    end.
+
+%% @doc Write multiple key-value pairs to the database in a single transaction.
+%%
+%%      Transparently retries with exponential backoff when the write
+%%      overlay is at the backpressure cap; callers should not see
+%%      `{error, eagain, _}`. Same retry schedule as put/3.
 %% @param DBInstance Database handle
 %% @param KeyValuePairs List of {Key, Value} tuples where Key and Value are binaries
 %% @returns ok on success, or {ok, SuccessCount, Errors} if some writes failed
 %% @throws {error, Type, Description} on failure
--spec put_batch(DBInstance :: term(), KeyValuePairs :: [{binary(), binary()}]) -> 
+-spec put_batch(DBInstance :: term(), KeyValuePairs :: [{binary(), binary()}]) ->
     ok | {ok, integer(), list()} | {error, term(), binary()}.
-put_batch(_DBInstance, _KeyValuePairs) ->
+put_batch(DBInstance, KeyValuePairs) ->
+    put_batch_loop(DBInstance, KeyValuePairs, 500, 1).
+
+put_batch_loop(DBInstance, KeyValuePairs, 0, _DelayMs) ->
+    put_batch_nif(DBInstance, KeyValuePairs);
+put_batch_loop(DBInstance, KeyValuePairs, Retries, DelayMs) ->
+    case put_batch_nif(DBInstance, KeyValuePairs) of
+        {error, eagain, _} ->
+            timer:sleep(DelayMs),
+            put_batch_loop(DBInstance, KeyValuePairs, Retries - 1, min(200, DelayMs * 2));
+        Result ->
+            Result
+    end.
+
+%% @doc Internal NIF entry point for put/3. Bypasses retry — returns
+%%      `{error, eagain, _}` immediately when backpressure engages.
+-spec put_nif(DBInstance :: term(), Key :: binary(), Value :: binary()) ->
+    ok | {error, term(), binary()}.
+put_nif(_DBInstance, _Key, _Value) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Internal NIF entry point for put_batch/2. Bypasses retry — returns
+%%      `{error, eagain, _}` immediately when backpressure engages.
+-spec put_batch_nif(DBInstance :: term(), KeyValuePairs :: [{binary(), binary()}]) ->
+    ok | {ok, integer(), list()} | {error, term(), binary()}.
+put_batch_nif(_DBInstance, _KeyValuePairs) ->
     erlang:nif_error(nif_not_loaded).
  
 %% @doc Read a value by key from the database
