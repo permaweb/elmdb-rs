@@ -1384,13 +1384,7 @@ auto_flush_test_() ->
                     K = <<"auto_", (integer_to_binary(I))/binary>>,
                     ok = elmdb:put(DB, K, <<"v">>)
                 end, lists:seq(1, 10)),
-                case wait_for_overlay_count(DB, 0, 200) of
-                    ok ->
-                        ok;
-                    {error, timeout} ->
-                        ok = elmdb:flush(DB),
-                        ?assertEqual(ok, wait_for_overlay_count(DB, 0, 200))
-                end,
+                ?assertEqual(ok, wait_for_overlay_count(DB, 0, 200)),
 
                 _ = elmdb:db_close(DB),
                 _ = elmdb:env_close(Env),
@@ -1403,7 +1397,11 @@ concurrent_open_writers_auto_flush_test_() ->
                 Dir = test_dir(),
                 file:del_dir_r(Dir),
                 filelib:ensure_dir(Dir ++ "/"),
+                % flush_idle_timeout_seconds=1: sub-threshold stragglers that land
+                % right after an overlay swap are drained by the idle trigger; the
+                % count trigger alone is pinned by auto_flush_test_.
                 {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {batch_size, 3},
+                                                  {flush_idle_timeout_seconds, 1},
                                                   no_sync, no_mem_init, write_map]),
                 {ok, DB} = elmdb:db_open(Env, [create]),
 
@@ -1429,13 +1427,7 @@ concurrent_open_writers_auto_flush_test_() ->
                 receive {'DOWN', OpenerRef, process, OpenerPid, normal} -> ok
                 after 5000 -> ?assert(false) end,
 
-                case wait_for_overlay_count(DB, 0, 200) of
-                    ok ->
-                        ok;
-                    {error, timeout} ->
-                        ok = elmdb:flush(DB),
-                        ?assertEqual(ok, wait_for_overlay_count(DB, 0, 200))
-                end,
+                ?assertEqual(ok, wait_for_overlay_count(DB, 0, 200)),
 
                 _ = elmdb:db_close(DB),
                 _ = elmdb:env_close(Env),
@@ -1635,6 +1627,196 @@ flush_bytes_zero_disables_test_() ->
                                   ok = elmdb:put(DB, K, <<"v">>)
                               end, lists:seq(1, 60)),
                 ok = wait_for_overlay_count(DB, 0),
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+%%%===================================================================
+%%% Byte-based admission cap Tests (2x flush_bytes backpressure)
+%%%===================================================================
+
+byte_cap_env_opts() ->
+    [{map_size, 104857600}, {batch_size, 1000000}, {flush_bytes, 100000},
+     no_sync, no_mem_init, write_map].
+
+byte_cap_seed_pairs() ->
+    Value = binary:copy(<<"x">>, 1000),
+    [{<<"bseed_", (integer_to_binary(I))/binary>>, Value} || I <- lists:seq(1, 90)].
+
+put_returns_eagain_when_overlay_bytes_full_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, byte_cap_env_opts()),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                ok = elmdb:flush(DB),
+                ok = elmdb:put_batch(DB, byte_cap_seed_pairs()),
+                ?assert(elmdb:overlay_count(DB) > 0),
+                BigValue = <<0:1200000>>,
+                ?assertMatch({error, eagain, _}, elmdb:put_nif(DB, <<"big">>, BigValue)),
+                ok = elmdb:put_nif(DB, <<"small">>, <<"v">>),
+                ok = elmdb:flush(DB),
+                ?assertEqual(0, elmdb:overlay_count(DB)),
+                ok = elmdb:put_nif(DB, <<"big">>, BigValue),
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+oversized_op_admitted_on_empty_overlay_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, byte_cap_env_opts()),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                ok = elmdb:flush(DB),
+                ?assertEqual(0, elmdb:overlay_count(DB)),
+                %% A value far larger than the byte cap (2x flush_bytes) must still be
+                %% admitted into an empty overlay rather than rejected forever.
+                Huge = binary:copy(<<"z">>, 5 * 1024 * 1024),
+                ?assertEqual(ok, elmdb:put_nif(DB, <<"huge">>, Huge)),
+                ok = elmdb:flush(DB),
+                ?assertEqual({ok, Huge}, elmdb:get(DB, <<"huge">>)),
+                %% Same for an oversized single-call batch.
+                ok = elmdb:flush(DB),
+                ?assertEqual(0, elmdb:overlay_count(DB)),
+                BigBatch = [{<<"hb_", (integer_to_binary(I))/binary>>,
+                             binary:copy(<<"q">>, 200000)} || I <- lists:seq(1, 40)],
+                ?assertEqual(ok, elmdb:put_batch_nif(DB, BigBatch)),
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+put_batch_returns_eagain_on_bytes_without_partial_write_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, byte_cap_env_opts()),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                ok = elmdb:flush(DB),
+                ok = elmdb:put_batch(DB, byte_cap_seed_pairs()),
+                ?assert(elmdb:overlay_count(DB) > 0),
+                BatchValue = binary:copy(<<"y">>, 50000),
+                Batch = [{<<"bbytes_1">>, BatchValue},
+                         {<<"bbytes_2">>, BatchValue},
+                         {<<"bbytes_3">>, BatchValue}],
+                ?assertMatch({error, eagain, _}, elmdb:put_batch_nif(DB, Batch)),
+                ?assertEqual(not_found, elmdb:get(DB, <<"bbytes_1">>)),
+                ok = elmdb:flush(DB),
+                ?assertEqual(0, elmdb:overlay_count(DB)),
+                ok = elmdb:put_batch_nif(DB, Batch),
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+overlay_bytes_released_on_overwrite_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, byte_cap_env_opts()),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                ok = elmdb:flush(DB),
+                lists:foreach(fun(I) ->
+                    Value = binary:copy(integer_to_binary(I), 60000),
+                    ok = elmdb:put(DB, <<"ow_key">>, Value)
+                end, lists:seq(1, 4)),
+                ?assertEqual(ok, wait_for_overlay_count(DB, 0, 200)),
+                % The admission byte counter is never zeroed: if the three overwrites
+                % or the flush leaked their ~180KB of reservations, this fresh ~199KB
+                % would exceed the 200KB cap and eagain instead of succeeding.
+                FreshValue = binary:copy(<<"y">>, 1000),
+                FreshPairs = [{<<"f", (integer_to_binary(I))/binary>>, FreshValue}
+                              || I <- lists:seq(1, 199)],
+                ?assertEqual(ok, elmdb:put_batch(DB, FreshPairs)),
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+flush_bytes_zero_disables_byte_admission_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 104857600}, {batch_size, 1000000},
+                                                 {flush_bytes, 0}, {flush_idle_timeout_seconds, 0},
+                                                 no_sync, no_mem_init, write_map]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                Value = binary:copy(<<"m">>, 1048576),
+                lists:foreach(fun(I) ->
+                    K = <<"mb_", (integer_to_binary(I))/binary>>,
+                    ok = elmdb:put_nif(DB, K, Value)
+                end, lists:seq(1, 5)),
+                ok = elmdb:flush(DB),
+                ?assertEqual({ok, Value}, elmdb:get(DB, <<"mb_3">>)),
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+%%%===================================================================
+%%% Empty key validation Tests
+%%%===================================================================
+
+put_empty_key_rejected_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                ?assertMatch({error, validation_error, _}, elmdb:put_nif(DB, <<>>, <<"v">>)),
+                ?assertEqual(0, elmdb:overlay_count(DB)),
+                StartMs = erlang:monotonic_time(millisecond),
+                ?assertMatch({error, validation_error, _}, elmdb:put(DB, <<>>, <<"v">>)),
+                ElapsedMs = erlang:monotonic_time(millisecond) - StartMs,
+                ?assert(ElapsedMs < 1000),
+                _ = elmdb:db_close(DB),
+                _ = elmdb:env_close(Env),
+                file:del_dir_r(Dir)
+            end)}.
+
+%%%===================================================================
+%%% EAGAIN retry budget Tests
+%%%===================================================================
+
+eagain_retry_budget_config_test_() ->
+    {timeout, 15,
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                {ok, Env} = elmdb:env_open(Dir, [{map_size, 104857600}, {batch_size, 1000},
+                                                 no_sync, no_mem_init, write_map]),
+                {ok, DB} = elmdb:db_open(Env, [create]),
+                try
+                    ok = elmdb:flush(DB),
+                    ok = application:set_env(elmdb, eagain_retry_budget_ms, 0),
+                    Seed = [{<<"rb_seed_", (integer_to_binary(I))/binary>>, <<"v">>}
+                            || I <- lists:seq(1, 2000)],
+                    ok = elmdb:put_batch(DB, Seed),
+                    StartMs = erlang:monotonic_time(millisecond),
+                    ?assertMatch({error, eagain, _}, elmdb:put(DB, <<"k">>, <<"v">>)),
+                    ElapsedMs = erlang:monotonic_time(millisecond) - StartMs,
+                    ?assert(ElapsedMs < 1000),
+                    ok = application:set_env(elmdb, eagain_retry_budget_ms, 10000),
+                    ok = elmdb:put(DB, <<"k2">>, <<"v">>)
+                after
+                    application:unset_env(elmdb, eagain_retry_budget_ms)
+                end,
                 _ = elmdb:db_close(DB),
                 _ = elmdb:env_close(Env),
                 file:del_dir_r(Dir)

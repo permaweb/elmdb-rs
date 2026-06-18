@@ -88,6 +88,10 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %%   - no_mem_init: Don't initialize malloc'd memory before writing to disk
 %%   - no_sync: Don't flush system buffers to disk when committing
 %%   - write_map: Use a writeable memory map for better performance
+%%
+%%   batch_size, flush_bytes and flush_idle_timeout_seconds are fixed by the
+%%   FIRST open of an environment path (first-open wins): reopening the same
+%%   path with different values does not change a live database.
 %% @returns {ok, Env} where Env is an opaque environment handle
 %%          {error, directory_not_found} if the directory doesn't exist
 %%          {error, permission_denied} if lacking permissions
@@ -156,11 +160,14 @@ db_close(_DBInstance) ->
 
 %% @doc Write a key-value pair to the database.
 %%
-%%      Transparently retries with exponential backoff when the write
-%%      overlay is at the backpressure cap; callers should not see
-%%      `{error, eagain, _}`. Retries up to ~5s total (500 attempts ×
-%%      backoff doubling from 1ms, capped at 200ms) before surfacing the
-%%      final result. All other errors short-circuit immediately.
+%%      Transparently retries when the write overlay is at the
+%%      backpressure cap: on `{error, eagain, _}` the call backs off
+%%      (delay doubling from 1ms, capped at 200ms) and re-attempts until
+%%      the `eagain_retry_budget_ms` application environment budget
+%%      (default: 100000 ms, ~100s) is spent, then surfaces the last eagain
+%%      error. A budget of 0 or less disables retrying. Non-eagain
+%%      errors surface immediately without consuming any retry budget.
+%%      An empty key is rejected with `{error, validation_error, _}`.
 %% @param DBInstance Database handle
 %% @param Key The key to write (binary)
 %% @param Value The value to store (binary)
@@ -169,24 +176,23 @@ db_close(_DBInstance) ->
 -spec put(DBInstance :: term(), Key :: binary(), Value :: binary()) ->
     ok | {error, term(), binary()}.
 put(DBInstance, Key, Value) ->
-    put_loop(DBInstance, Key, Value, 500, 1).
-
-put_loop(DBInstance, Key, Value, 0, _DelayMs) ->
-    put_nif(DBInstance, Key, Value);
-put_loop(DBInstance, Key, Value, Retries, DelayMs) ->
     case put_nif(DBInstance, Key, Value) of
-        {error, eagain, _} ->
-            timer:sleep(DelayMs),
-            put_loop(DBInstance, Key, Value, Retries - 1, min(200, DelayMs * 2));
+        {error, eagain, _} = FirstError ->
+            RetryFun = fun() -> put_nif(DBInstance, Key, Value) end,
+            retry_eagain(RetryFun, FirstError);
         Result ->
             Result
     end.
 
 %% @doc Write multiple key-value pairs to the database in a single transaction.
 %%
-%%      Transparently retries with exponential backoff when the write
-%%      overlay is at the backpressure cap; callers should not see
-%%      `{error, eagain, _}`. Same retry schedule as put/3.
+%%      Transparently retries when the write overlay is at the
+%%      backpressure cap: on `{error, eagain, _}` the call backs off
+%%      (delay doubling from 1ms, capped at 200ms) and re-attempts until
+%%      the `eagain_retry_budget_ms` application environment budget
+%%      (default: 100000 ms, ~100s) is spent, then surfaces the last eagain
+%%      error. A budget of 0 or less disables retrying. Non-eagain
+%%      errors surface immediately without consuming any retry budget.
 %% @param DBInstance Database handle
 %% @param KeyValuePairs List of {Key, Value} tuples where Key and Value are binaries
 %% @returns ok on success, or {ok, SuccessCount, Errors} if some writes failed
@@ -194,17 +200,37 @@ put_loop(DBInstance, Key, Value, Retries, DelayMs) ->
 -spec put_batch(DBInstance :: term(), KeyValuePairs :: [{binary(), binary()}]) ->
     ok | {ok, integer(), list()} | {error, term(), binary()}.
 put_batch(DBInstance, KeyValuePairs) ->
-    put_batch_loop(DBInstance, KeyValuePairs, 500, 1).
-
-put_batch_loop(DBInstance, KeyValuePairs, 0, _DelayMs) ->
-    put_batch_nif(DBInstance, KeyValuePairs);
-put_batch_loop(DBInstance, KeyValuePairs, Retries, DelayMs) ->
     case put_batch_nif(DBInstance, KeyValuePairs) of
-        {error, eagain, _} ->
-            timer:sleep(DelayMs),
-            put_batch_loop(DBInstance, KeyValuePairs, Retries - 1, min(200, DelayMs * 2));
+        {error, eagain, _} = FirstError ->
+            RetryFun = fun() -> put_batch_nif(DBInstance, KeyValuePairs) end,
+            retry_eagain(RetryFun, FirstError);
         Result ->
             Result
+    end.
+
+retry_eagain(RetryFun, FirstError) ->
+    BudgetMs = application:get_env(elmdb, eagain_retry_budget_ms, 100000),
+    case BudgetMs =< 0 of
+        true ->
+            FirstError;
+        false ->
+            Deadline = erlang:monotonic_time(millisecond) + BudgetMs,
+            retry_eagain_loop(RetryFun, FirstError, Deadline, 1)
+    end.
+
+retry_eagain_loop(RetryFun, LastError, Deadline, DelayMs) ->
+    TimeLeftMs = Deadline - erlang:monotonic_time(millisecond),
+    case TimeLeftMs =< 0 of
+        true ->
+            LastError;
+        false ->
+            timer:sleep(min(DelayMs, TimeLeftMs)),
+            case RetryFun() of
+                {error, eagain, _} = Error ->
+                    retry_eagain_loop(RetryFun, Error, Deadline, min(200, DelayMs * 2));
+                Result ->
+                    Result
+            end
     end.
 
 %% @doc Internal NIF entry point for put/3. Bypasses retry — returns
@@ -345,7 +371,9 @@ match_pattern(_DBInstance, _Patterns) ->
 flush(_DBInstance) ->
     erlang:nif_error(nif_not_loaded).
 
-%% @doc Return the number of entries in the write overlay (diagnostic)
+%% @doc Return the number of reserved entries across the active AND
+%%      draining write overlays (diagnostic). Approximate: includes
+%%      entries currently being flushed to LMDB.
 -spec overlay_count(DBInstance :: term()) -> non_neg_integer().
 overlay_count(_DBInstance) ->
     erlang:nif_error(nif_not_loaded).

@@ -166,6 +166,10 @@ pub struct LmdbDatabase {
     last_write_at_ms: AtomicU64,
     /// Approximate entries currently held in active and draining overlays.
     overlay_entries: AtomicUsize,
+    /// Reserved key+value bytes across active AND draining overlays. Never zeroed,
+    /// only adjusted by reserve/release — unlike `bytes_in_overlay`, which is the
+    /// per-epoch flush-trigger counter zeroed at the start of each flush.
+    overlay_bytes: AtomicUsize,
     /// Coalesces redundant flush signals to worker
     flush_pending: AtomicBool,
     /// Cache: true when db is closed (atomic fast-path, no lock needed)
@@ -221,44 +225,80 @@ fn new_overlay_map() -> OverlayMap {
     SccHashMap::with_hasher(ahash::RandomState::default())
 }
 
-fn release_overlay_entries(db: &LmdbDatabase, entries: usize) {
-    if entries == 0 {
-        return;
+fn release_overlay(db: &LmdbDatabase, entries: usize, bytes: usize) {
+    if entries > 0 {
+        let _ = db
+            .overlay_entries
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(entries))
+            });
     }
-    let _ = db
-        .overlay_entries
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            Some(current.saturating_sub(entries))
-        });
+    if bytes > 0 {
+        let _ = db
+            .overlay_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(bytes))
+            });
+    }
 }
 
-fn reserve_overlay_entries(db: &LmdbDatabase, entries: usize) -> bool {
-    if entries == 0 {
-        return true;
-    }
-    let max_entries = db
-        .batch_size
-        .load(Ordering::Acquire)
-        .saturating_mul(2);
-    let mut current = db.overlay_entries.load(Ordering::Acquire);
-    loop {
-        let Some(next) = current.checked_add(entries) else {
-            return false;
-        };
-        if next > max_entries {
-            request_background_flush(db);
-            return false;
+// Overlay accounting is approximate: map-swap races cause only bounded, downward drift.
+// Caps are only enforced when the overlay is non-empty, so a single op larger than a
+// cap still makes progress on an empty overlay (it lands, then trips the flush trigger)
+// rather than being rejected forever.
+fn reserve_overlay(db: &LmdbDatabase, entries: usize, bytes: usize) -> bool {
+    if entries > 0 {
+        let max_entries = db
+            .batch_size
+            .load(Ordering::Acquire)
+            .saturating_mul(2);
+        let mut current = db.overlay_entries.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(entries) else {
+                return false;
+            };
+            if current > 0 && next > max_entries {
+                request_background_flush(db);
+                return false;
+            }
+            match db.overlay_entries.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
-        match db.overlay_entries.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return true,
-            Err(actual) => current = actual,
+    }
+    let flush_bytes = db.flush_bytes.load(Ordering::Acquire);
+    if bytes > 0 && flush_bytes > 0 {
+        let max_bytes = flush_bytes.saturating_mul(2);
+        let mut current = db.overlay_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                release_overlay(db, entries, 0);
+                request_background_flush(db);
+                return false;
+            };
+            if current > 0 && next > max_bytes {
+                release_overlay(db, entries, 0);
+                request_background_flush(db);
+                return false;
+            }
+            match db.overlay_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
     }
+    true
 }
 
 fn backpressure_error<'a>(env: Env<'a>) -> Term<'a> {
@@ -300,6 +340,11 @@ fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lm
     if options.no_sync {
         flags |= EnvironmentFlags::NO_SYNC;
     }
+    // MDB_NOLOCK disables LMDB's lock table, which this design relies on for
+    // (1) serializing write txns (flush worker vs. lazy create_db on a BEAM thread) and
+    // (2) reader-aware page reclamation (concurrent get/list/match vs. the flush).
+    // Unsafe with any concurrent read/write workload; only pass `no_lock` when the
+    // caller guarantees single-threaded access.
     if options.no_lock {
         flags |= EnvironmentFlags::NO_LOCK;
     }
@@ -456,22 +501,24 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
 
     let n = old_map.len();
     let mut buf: Vec<u8> = Vec::with_capacity(n * 64);
-    let mut entries: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(n);
+    let mut entries: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(n);
     (*old_map).iter_sync(|k, v| {
-        let k_off = buf.len() as u32;
-        let k_len = k.len() as u32;
+        let k_off = buf.len();
+        let k_len = k.len();
         buf.extend_from_slice(k.as_slice());
-        let v_off = buf.len() as u32;
-        let v_len = v.len() as u32;
+        let v_off = buf.len();
+        let v_len = v.len();
         buf.extend_from_slice(v.as_slice());
         entries.push((k_off, k_len, v_off, v_len));
         true
     });
 
     let buf_slice: &[u8] = &buf;
-    let key_of = |e: &(u32, u32, u32, u32)| -> &[u8] {
-        &buf_slice[e.0 as usize..(e.0 + e.1) as usize]
+    let key_of = |e: &(usize, usize, usize, usize)| -> &[u8] {
+        &buf_slice[e.0..e.0 + e.1]
     };
+    // Parallel sort is measurably faster for large batches; the threshold keeps
+    // small flushes off rayon's thread pool.
     if entries.len() >= 32_768 {
         use rayon::slice::ParallelSliceMut;
         entries.par_sort_unstable_by(|a, b| key_of(a).cmp(key_of(b)));
@@ -483,30 +530,27 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
     let mut cursor_err = None;
     match txn.open_rw_cursor(live_db) {
         Ok(mut cursor) => {
+            // MDB_cursor_op::MDB_LAST (lmdb-sys)
             const MDB_LAST: u32 = 6;
-            let last_key_owned: Option<Vec<u8>> = match cursor.get(None, None, MDB_LAST) {
-                Err(lmdb::Error::NotFound) => None,
-                Ok((Some(lk), _)) => Some(lk.to_vec()),
-                _ => None,
-            };
-            let split = match &last_key_owned {
-                None => 0,
-                Some(lk) => entries.partition_point(|e| {
-                    &buf[e.0 as usize..(e.0 + e.1) as usize] <= lk.as_slice()
-                }),
+            let split = match cursor.get(None, None, MDB_LAST) {
+                Err(lmdb::Error::NotFound) => 0,
+                Ok((Some(lk), _)) => {
+                    entries.partition_point(|e| &buf[e.0..e.0 + e.1] <= lk)
+                }
+                _ => entries.len(),
             };
             'write: {
                 for e in &entries[..split] {
-                    let k = &buf[e.0 as usize..(e.0 + e.1) as usize];
-                    let v = &buf[e.2 as usize..(e.2 + e.3) as usize];
+                    let k = &buf[e.0..e.0 + e.1];
+                    let v = &buf[e.2..e.2 + e.3];
                     if let Err(err) = cursor.put(&k, &v, WriteFlags::empty()) {
                         write_err = Some(format!("Failed to put value: {:?}", err));
                         break 'write;
                     }
                 }
                 for e in &entries[split..] {
-                    let k = &buf[e.0 as usize..(e.0 + e.1) as usize];
-                    let v = &buf[e.2 as usize..(e.2 + e.3) as usize];
+                    let k = &buf[e.0..e.0 + e.1];
+                    let v = &buf[e.2..e.2 + e.3];
                     if let Err(err) = cursor.put(&k, &v, WriteFlags::APPEND) {
                         write_err = Some(format!("Failed to put value: {:?}", err));
                         break 'write;
@@ -533,7 +577,7 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
     let res = match txn.commit() {
         Ok(()) => {
             db.draining.store(Arc::new(None));
-            release_overlay_entries(db, n);
+            release_overlay(db, n, buf.len());
             Ok(())
         }
         Err(e) => {
@@ -543,6 +587,8 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
     };
     drop(entries);
     drop(buf);
+    // Known limitation: a concurrent reader still holding the draining ref can
+    // become the final dropper and pay the teardown cost on its own thread.
     if Arc::strong_count(&old_map) == 1 {
         std::thread::spawn(move || drop(old_map));
     } else {
@@ -555,17 +601,19 @@ fn restore_failed_flush(db: &LmdbDatabase, failed_map: Arc<OverlayMap>) {
     let current = db.active.load();
     let mut count = 0usize;
     let mut overlap = 0usize;
+    let mut overlap_bytes = 0usize;
     let mut bytes = 0usize;
     (*failed_map).iter_sync(|k, v| {
-        // insert_sync returns Err only on key collision (scc 2.x), never for OOM.
+        // insert_sync returns Err only on key collision (scc 3), never for OOM.
         bytes += k.len() + v.len();
         if current.insert_sync(k.clone(), v.clone()).is_err() {
             overlap += 1;
+            overlap_bytes += k.len() + v.len();
         }
         count += 1;
         true
     });
-    release_overlay_entries(db, overlap);
+    release_overlay(db, overlap, overlap_bytes);
     db.op_count.fetch_add(count, Ordering::Relaxed);
     db.bytes_in_overlay.fetch_add(bytes, Ordering::Relaxed);
     db.draining.store(Arc::new(None));
@@ -1044,6 +1092,7 @@ fn db_open<'a>(
         flush_idle_timeout_ms: AtomicU64::new(flush_idle_ms),
         last_write_at_ms: AtomicU64::new(now_ms()),
         overlay_entries: AtomicUsize::new(0),
+        overlay_bytes: AtomicUsize::new(0),
         flush_pending: AtomicBool::new(false),
         state: Mutex::new(DbState {
             cached_db: None,
@@ -1245,67 +1294,31 @@ fn put<'a>(
     let value_vec = value.as_slice().to_vec();
 
     if key_vec.is_empty() {
-        let (live_env, live_db) = match db_handle.ensure_open_handles() {
-            Ok(handles) => handles,
-            Err(error_msg) => {
-                return Ok(
-                    (atoms::error(), atoms::database_error(), error_msg).encode(env),
-                );
-            }
-        };
-        let mut txn = match live_env.begin_rw_txn() {
-            Ok(txn) => txn,
-            Err(_) => {
-                return Ok((
-                    atoms::error(),
-                    atoms::transaction_error(),
-                    "Failed to begin write transaction".to_string(),
-                )
-                    .encode(env));
-            }
-        };
-        match txn.put(live_db, &key_vec, &value_vec, WriteFlags::empty()) {
-            Ok(()) => match txn.commit() {
-                Ok(()) => return Ok(atoms::ok().encode(env)),
-                Err(_) => {
-                    return Ok((
-                        atoms::error(),
-                        atoms::transaction_error(),
-                        "Failed to commit transaction".to_string(),
-                    )
-                        .encode(env))
-                }
-            },
-            Err(lmdb_err) => {
-                let error_msg = match lmdb_err {
-                    lmdb::Error::BadValSize => "Empty key not supported".to_string(),
-                    _ => format!("Failed to put value: {:?}", lmdb_err),
-                };
-                return Ok(
-                    (atoms::error(), atoms::transaction_error(), error_msg).encode(env),
-                );
-            }
-        }
+        return Ok((atoms::error(), atoms::validation_error(), "Empty key not supported".to_string()).encode(env));
     }
 
-    if !reserve_overlay_entries(&db_handle, 1) {
+    let bytes_added = key_vec.len().saturating_add(value_vec.len());
+    if !reserve_overlay(&db_handle, 1, bytes_added) {
         return Ok(backpressure_error(env));
     }
     loop {
         let map = db_handle.active.load();
-        let was_upsert = map.upsert_sync(key_vec.clone(), value_vec.clone()).is_some();
+        let prev = map.upsert_sync(key_vec.clone(), value_vec.clone());
         if Arc::ptr_eq(&map, &db_handle.active.load()) {
             // Committed to this map: release reservation only if key already existed.
-            if was_upsert {
-                release_overlay_entries(&db_handle, 1);
+            if let Some(old_v) = prev {
+                release_overlay(&db_handle, 1, key_vec.len() + old_v.len());
             }
             break;
         }
-        // Map swapped under us; retry without releasing — reservation is still held.
+        // Map swapped under us; retry — the entry reservation is still held, but the
+        // displaced value's bytes are released now.
+        if let Some(old_v) = prev {
+            release_overlay(&db_handle, 0, key_vec.len() + old_v.len());
+        }
     }
 
     let count = db_handle.op_count.fetch_add(1, Ordering::Relaxed) + 1;
-    let bytes_added = key_vec.len().saturating_add(value_vec.len());
     let total_bytes = db_handle
         .bytes_in_overlay
         .fetch_add(bytes_added, Ordering::Relaxed)
@@ -1451,30 +1464,34 @@ fn put_batch<'a>(
         }
     }
 
-    if !reserve_overlay_entries(&db_handle, key_value_pairs.len()) {
+    let bytes_added: usize = key_value_pairs
+        .iter()
+        .map(|(k, v)| k.as_slice().len().saturating_add(v.as_slice().len()))
+        .sum();
+    if !reserve_overlay(&db_handle, key_value_pairs.len(), bytes_added) {
         return Ok(backpressure_error(env));
     }
     loop {
         let m = db_handle.active.load();
         let _reserved = m.reserve(key_value_pairs.len());
         let mut collision_count = 0usize;
+        let mut collision_bytes = 0usize;
         for (key, value) in key_value_pairs.iter() {
-            if m.upsert_sync(key.as_slice().to_vec(), value.as_slice().to_vec()).is_some() {
+            if let Some(old_v) = m.upsert_sync(key.as_slice().to_vec(), value.as_slice().to_vec()) {
                 collision_count += 1;
+                collision_bytes += key.as_slice().len() + old_v.len();
             }
         }
         if Arc::ptr_eq(&m, &db_handle.active.load()) {
             // Committed: release one slot per key that already existed in the map.
-            release_overlay_entries(&db_handle, collision_count);
+            release_overlay(&db_handle, collision_count, collision_bytes);
             break;
         }
-        // Map swapped; retry — reservations are still held, collision_count is discarded.
+        // Map swapped; retry — entry reservations are still held, but the displaced
+        // values' bytes are released now.
+        release_overlay(&db_handle, 0, collision_bytes);
     }
     let count = db_handle.op_count.fetch_add(key_value_pairs.len(), Ordering::Relaxed) + key_value_pairs.len();
-    let bytes_added: usize = key_value_pairs
-        .iter()
-        .map(|(k, v)| k.as_slice().len().saturating_add(v.as_slice().len()))
-        .sum();
     let total_bytes = db_handle
         .bytes_in_overlay
         .fetch_add(bytes_added, Ordering::Relaxed)
@@ -1808,24 +1825,22 @@ fn match_pattern<'a>(
     };
 
     const MAX_RESULTS: usize = 100000;
-    let mut matching_ids: Vec<Vec<u8>> = Vec::new();
-    let mut current_id: Option<Vec<u8>> = None;
+    // Cursor items are valid for the whole read txn, so ids/suffixes are borrowed
+    // slices into the mmap — no per-key allocation. Only matched ids are copied,
+    // at the end.
+    let mut matching_ids: Vec<&[u8]> = Vec::new();
+    let mut current_id: Option<&[u8]> = None;
     let mut seen_patterns: HashSet<usize> = HashSet::new();
     let total_patterns = patterns_vec.len();
 
     let iter = cursor.iter_start();
     for (key_bytes, value_bytes) in iter {
-        let last_slash_pos = key_bytes.iter().rposition(|&b| b == b'/');
-
-        let (id, suffix) = if let Some(pos) = last_slash_pos {
-            let id = key_bytes[..pos].to_vec();
-            let suffix = key_bytes[pos + 1..].to_vec();
-            (id, suffix)
-        } else {
-            (key_bytes.to_vec(), Vec::new())
+        let (id, suffix): (&[u8], &[u8]) = match key_bytes.iter().rposition(|&b| b == b'/') {
+            Some(pos) => (&key_bytes[..pos], &key_bytes[pos + 1..]),
+            None => (key_bytes, &[][..]),
         };
 
-        if current_id.as_ref() != Some(&id) {
+        if current_id != Some(id) {
             if let Some(prev_id) = current_id.take() {
                 if seen_patterns.len() == total_patterns {
                     matching_ids.push(prev_id);
@@ -1835,12 +1850,12 @@ fn match_pattern<'a>(
                 }
             }
 
-            current_id = Some(id.clone());
+            current_id = Some(id);
             seen_patterns.clear();
         }
 
         for (pattern_idx, (pattern_key, pattern_value)) in patterns_vec.iter().enumerate() {
-            if suffix.as_slice() == *pattern_key && value_bytes == *pattern_value {
+            if suffix == *pattern_key && value_bytes == *pattern_value {
                 seen_patterns.insert(pattern_idx);
             }
         }
@@ -1858,7 +1873,7 @@ fn match_pattern<'a>(
         let mut result_binaries = Vec::with_capacity(matching_ids.len());
         for id in matching_ids {
             let mut binary = OwnedBinary::new(id.len()).ok_or(Error::BadArg)?;
-            binary.as_mut_slice().copy_from_slice(&id);
+            binary.as_mut_slice().copy_from_slice(id);
             result_binaries.push(binary.release(env));
         }
 
