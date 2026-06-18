@@ -1644,7 +1644,7 @@ fn iterator_next<'a>(
 /// List Operations
 ///===================================================================
 
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif]
 fn list<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
