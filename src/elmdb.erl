@@ -24,7 +24,7 @@
 -export([iterator/1, iterator_next/2, foreach/2, fold/3, map/2]).
 
 %% List operations
--export([list/2]).
+-export([list/2, read_prefix/2]).
 
 %% Pattern matching operations
 -export([match/2]).
@@ -260,6 +260,15 @@ map(DBInstance, Fun) when is_function(Fun, 2) ->
 -spec list(DBInstance :: term(), Key :: binary()) ->
     {ok, [binary()]} | not_found.
 list(_DBInstance, _Key) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Read all direct child entries under a prefix.
+%% @param DBInstance Database handle
+%% @param Key The key prefix to search for (binary)
+%% @returns {ok, Entries} where Entries is [{ChildKey, Value}], or not_found.
+-spec read_prefix(DBInstance :: term(), Key :: binary()) ->
+    {ok, [{binary(), binary()}]} | not_found.
+read_prefix(_DBInstance, _Key) ->
     erlang:nif_error(nif_not_loaded).
 
 %%%===================================================================

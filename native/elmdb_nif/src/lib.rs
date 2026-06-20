@@ -1396,7 +1396,6 @@ fn list<'a>(
     ensure_worker(&db_handle);
 
     let prefix_bytes = key_prefix.as_slice();
-
     let active_empty = db_handle.active.load().is_empty();
     let draining_empty = db_handle.draining.load().is_none();
     if !active_empty || !draining_empty {
@@ -1503,6 +1502,106 @@ fn list<'a>(
     }
 
     Ok((atoms::ok(), result_binaries).encode(env))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn read_prefix<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>,
+    key_prefix: Binary,
+) -> NifResult<Term<'a>> {
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+    ensure_worker(&db_handle);
+
+    let prefix_bytes = key_prefix.as_slice();
+    let active_empty = db_handle.active.load().is_empty();
+    let draining_empty = db_handle.draining.load().is_none();
+    if !active_empty || !draining_empty {
+        if let Err(error_msg) = flush_sync(&db_handle) {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    }
+
+    let (live_env, live_db) = match db_handle.fast_get_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
+    let txn = match live_env.begin_ro_txn() {
+        Ok(txn) => txn,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::transaction_error(),
+                "Failed to begin read transaction".to_string(),
+            )
+                .encode(env));
+        }
+    };
+
+    let mut cursor = match txn.open_ro_cursor(live_db) {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to open cursor".to_string(),
+            )
+                .encode(env));
+        }
+    };
+
+    let mut entries: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(64);
+    let prefix_len = prefix_bytes.len();
+
+    let cursor_positioned = cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok();
+
+    if !cursor_positioned {
+        return Ok(atoms::not_found().encode(env));
+    }
+
+    let cursor_iter = cursor.iter_from(prefix_bytes);
+
+    for (key, value) in cursor_iter {
+        if !key.starts_with(prefix_bytes) {
+            break;
+        }
+
+        let remaining = &key[prefix_len..];
+
+        if remaining.is_empty() {
+            continue;
+        }
+
+        if let Some(sep_pos) = remaining.iter().position(|&b| b == b'/') {
+            let child = &remaining[..sep_pos];
+            if !child.is_empty() && !entries.contains_key(child) {
+                entries.insert(child.to_vec(), b"group".to_vec());
+            }
+        } else {
+            entries.insert(remaining.to_vec(), value.to_vec());
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(atoms::not_found().encode(env));
+    }
+
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = entries.into_iter().collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut result = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        let key_term = encode_binary(env, &key)?;
+        let value_term = encode_binary(env, &value)?;
+        result.push((key_term, value_term));
+    }
+
+    Ok((atoms::ok(), result).encode(env))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
