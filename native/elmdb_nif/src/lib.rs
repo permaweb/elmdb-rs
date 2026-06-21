@@ -1504,7 +1504,7 @@ fn list<'a>(
     Ok((atoms::ok(), result_binaries).encode(env))
 }
 
-#[rustler::nif(schedule = "DirtyIo")]
+#[rustler::nif]
 fn read_prefix<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
@@ -1543,7 +1543,7 @@ fn read_prefix<'a>(
         }
     };
 
-    let mut cursor = match txn.open_ro_cursor(live_db) {
+    let cursor = match txn.open_ro_cursor(live_db) {
         Ok(cursor) => cursor,
         Err(_) => {
             return Ok((
@@ -1555,55 +1555,44 @@ fn read_prefix<'a>(
         }
     };
 
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(64);
+    let mut result = Vec::with_capacity(64);
+    let mut first = true;
 
-    let mut current = match cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE) {
-        Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
-        Ok((None, _value)) => None,
-        Err(lmdb::Error::NotFound) => None,
-        Err(_) => {
-            return Ok((
-                atoms::error(),
-                atoms::database_error(),
-                "Failed to position prefix cursor".to_string(),
-            )
-                .encode(env));
-        }
-    };
+    loop {
+        let positioning = first;
+        let current = if positioning {
+            first = false;
+            cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE)
+        } else {
+            cursor.get(None, None, MDB_NEXT)
+        };
 
-    while let Some((key, value)) = current {
-        if !key.starts_with(prefix_bytes) {
-            break;
-        }
-
-        entries.push((key, value));
-
-        current = match cursor.get(None, None, MDB_NEXT) {
-            Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
-            Ok((None, _value)) => None,
-            Err(lmdb::Error::NotFound) => None,
+        match current {
+            Ok((Some(key), value)) if key.starts_with(prefix_bytes) => {
+                let key_term = encode_binary(env, key)?;
+                let value_term = encode_binary(env, value)?;
+                result.push((key_term, value_term));
+            }
+            Ok((Some(_), _)) | Ok((None, _)) | Err(lmdb::Error::NotFound) => {
+                break;
+            }
             Err(_) => {
+                let message = match positioning {
+                    true => "Failed to position prefix cursor",
+                    false => "Failed to advance prefix cursor",
+                };
                 return Ok((
                     atoms::error(),
                     atoms::database_error(),
-                    "Failed to advance prefix cursor".to_string(),
+                    message.to_string(),
                 )
                     .encode(env));
             }
-        };
+        }
     }
 
-    if entries.is_empty() {
+    if result.is_empty() {
         return Ok(atoms::not_found().encode(env));
-    }
-
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-    let mut result = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
-        let key_term = encode_binary(env, &key)?;
-        let value_term = encode_binary(env, &value)?;
-        result.push((key_term, value_term));
     }
 
     Ok((atoms::ok(), result).encode(env))
