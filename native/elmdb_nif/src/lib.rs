@@ -1556,30 +1556,41 @@ fn read_prefix<'a>(
     };
 
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(64);
-    let prefix_len = prefix_bytes.len();
 
-    let cursor_positioned = cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok();
+    let mut current = match cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE) {
+        Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
+        Ok((None, _value)) => None,
+        Err(lmdb::Error::NotFound) => None,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to position prefix cursor".to_string(),
+            )
+                .encode(env));
+        }
+    };
 
-    if !cursor_positioned {
-        return Ok(atoms::not_found().encode(env));
-    }
-
-    let cursor_iter = cursor.iter_from(prefix_bytes);
-
-    for (key, value) in cursor_iter {
+    while let Some((key, value)) = current {
         if !key.starts_with(prefix_bytes) {
             break;
         }
 
-        let remaining = &key[prefix_len..];
+        entries.push((key, value));
 
-        if remaining.is_empty() {
-            continue;
-        }
-
-        if !remaining.iter().any(|&b| b == b'/') {
-            entries.push((remaining.to_vec(), value.to_vec()));
-        }
+        current = match cursor.get(None, None, MDB_NEXT) {
+            Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
+            Ok((None, _value)) => None,
+            Err(lmdb::Error::NotFound) => None,
+            Err(_) => {
+                return Ok((
+                    atoms::error(),
+                    atoms::database_error(),
+                    "Failed to advance prefix cursor".to_string(),
+                )
+                    .encode(env));
+            }
+        };
     }
 
     if entries.is_empty() {

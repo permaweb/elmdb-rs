@@ -163,14 +163,22 @@ list_operations_test_() ->
                      {ok, AliceAttrs} = elmdb:list(DB, <<"users/alice/">>),
                      ?assertEqual(lists:sort([<<"name">>, <<"email">>]), lists:sort(AliceAttrs)),
 
-                     % Prefix reads include direct child row values, but do
-                     % not synthesize values for deeper descendants.
-                     ?assertEqual(not_found, elmdb:read_prefix(DB, <<"users/">>)),
+                     % Prefix reads return raw full keys and values.
+                     {ok, UserRows} = elmdb:read_prefix(DB, <<"users/">>),
+                     ?assertEqual(
+                         lists:sort([
+                             {<<"users/alice/email">>, <<"alice@example.com">>},
+                             {<<"users/alice/name">>, <<"Alice">>},
+                             {<<"users/bob/email">>, <<"bob@example.com">>},
+                             {<<"users/bob/name">>, <<"Bob">>}
+                         ]),
+                         lists:sort(UserRows)
+                     ),
                      {ok, AliceRows} = elmdb:read_prefix(DB, <<"users/alice/">>),
                      ?assertEqual(
                          lists:sort([
-                             {<<"email">>, <<"alice@example.com">>},
-                             {<<"name">>, <<"Alice">>}
+                             {<<"users/alice/email">>, <<"alice@example.com">>},
+                             {<<"users/alice/name">>, <<"Alice">>}
                          ]),
                          lists:sort(AliceRows)
                      ),
