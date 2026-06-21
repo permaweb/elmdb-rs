@@ -162,6 +162,18 @@ list_operations_test_() ->
                      % List alice's attributes
                      {ok, AliceAttrs} = elmdb:list(DB, <<"users/alice/">>),
                      ?assertEqual(lists:sort([<<"name">>, <<"email">>]), lists:sort(AliceAttrs)),
+
+                     % Prefix reads include direct child row values, but do
+                     % not synthesize values for deeper descendants.
+                     ?assertEqual(not_found, elmdb:read_prefix(DB, <<"users/">>)),
+                     {ok, AliceRows} = elmdb:read_prefix(DB, <<"users/alice/">>),
+                     ?assertEqual(
+                         lists:sort([
+                             {<<"email">>, <<"alice@example.com">>},
+                             {<<"name">>, <<"Alice">>}
+                         ]),
+                         lists:sort(AliceRows)
+                     ),
                      
                      % List non-existent prefix
                      ?assertEqual(not_found, elmdb:list(DB, <<"nonexistent/">>))

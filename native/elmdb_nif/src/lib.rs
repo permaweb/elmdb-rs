@@ -1555,7 +1555,7 @@ fn read_prefix<'a>(
         }
     };
 
-    let mut entries: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(64);
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(64);
     let prefix_len = prefix_bytes.len();
 
     let cursor_positioned = cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok();
@@ -1577,13 +1577,8 @@ fn read_prefix<'a>(
             continue;
         }
 
-        if let Some(sep_pos) = remaining.iter().position(|&b| b == b'/') {
-            let child = &remaining[..sep_pos];
-            if !child.is_empty() && !entries.contains_key(child) {
-                entries.insert(child.to_vec(), b"group".to_vec());
-            }
-        } else {
-            entries.insert(remaining.to_vec(), value.to_vec());
+        if !remaining.iter().any(|&b| b == b'/') {
+            entries.push((remaining.to_vec(), value.to_vec()));
         }
     }
 
@@ -1591,7 +1586,6 @@ fn read_prefix<'a>(
         return Ok(atoms::not_found().encode(env));
     }
 
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = entries.into_iter().collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     let mut result = Vec::with_capacity(entries.len());

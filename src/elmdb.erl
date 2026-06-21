@@ -262,7 +262,7 @@ map(DBInstance, Fun) when is_function(Fun, 2) ->
 list(_DBInstance, _Key) ->
     erlang:nif_error(nif_not_loaded).
 
-%% @doc Read all direct child entries under a prefix.
+%% @doc Read all direct child row entries under a prefix.
 %% @param DBInstance Database handle
 %% @param Key The key prefix to search for (binary)
 %% @returns {ok, Entries} where Entries is [{ChildKey, Value}], or not_found.
