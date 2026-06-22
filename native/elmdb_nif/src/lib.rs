@@ -24,19 +24,75 @@
 //! - Efficient cursor iteration for list operations
 //! - Early termination for prefix searches
 
-use rustler::{Env, Term, NifResult, Error, Encoder, ResourceArc};
+use lmdb::{
+    Cursor, Database, DatabaseFlags, Environment, EnvironmentFlags, Transaction, WriteFlags,
+};
+use lmdb_sys as ffi;
 use rustler::types::binary::Binary;
+use rustler::types::binary::NewBinary;
 use rustler::types::binary::OwnedBinary;
+use rustler::{Encoder, Env, Error, NifResult, ResourceArc, Term};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
 use std::path::Path;
-use lmdb::{Environment, EnvironmentFlags, Database, DatabaseFlags, Transaction, WriteFlags, Cursor};
+use std::slice;
+use std::sync::{Arc, Mutex};
 
 // LMDB cursor operation constants (instead of importing lmdb-sys only for constants from lmdb_sys::ffi).
 // To be improved in the future.
 const MDB_FIRST: u32 = 0;
 const MDB_NEXT: u32 = 8;
 const MDB_SET_RANGE: u32 = 17;
+const LMDB_DEFAULT_MAX_KEY_SIZE: usize = 511;
+
+struct RawReadTxn {
+    txn: *mut ffi::MDB_txn,
+}
+
+impl RawReadTxn {
+    fn begin(env: &Environment) -> Result<Self, String> {
+        let mut txn = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::mdb_txn_begin(env.env(), std::ptr::null_mut(), ffi::MDB_RDONLY, &mut txn)
+        };
+        if rc == ffi::MDB_SUCCESS {
+            Ok(Self { txn })
+        } else {
+            Err("Failed to begin read transaction".to_string())
+        }
+    }
+}
+
+impl Drop for RawReadTxn {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::mdb_txn_abort(self.txn);
+        }
+    }
+}
+
+struct RawCursor {
+    cursor: *mut ffi::MDB_cursor,
+}
+
+impl RawCursor {
+    fn open(txn: &RawReadTxn, db: Database) -> Result<Self, String> {
+        let mut cursor = std::ptr::null_mut();
+        let rc = unsafe { ffi::mdb_cursor_open(txn.txn, db.dbi(), &mut cursor) };
+        if rc == ffi::MDB_SUCCESS {
+            Ok(Self { cursor })
+        } else {
+            Err("Failed to open cursor".to_string())
+        }
+    }
+}
+
+impl Drop for RawCursor {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::mdb_cursor_close(self.cursor);
+        }
+    }
+}
 
 mod atoms {
     rustler::atoms! {
@@ -50,6 +106,7 @@ mod atoms {
         no_mem_init,
         no_sync,
         write_map,
+        no_readahead,
         create,
         iterator,
         start,
@@ -84,6 +141,7 @@ mod atoms {
         bad_txn,
         bad_val_size,
         bad_dbi,
+        validation_error,
     }
 }
 
@@ -105,7 +163,7 @@ struct WriteOperation {
 }
 
 /// Buffer for accumulating write operations before committing
-/// 
+///
 /// This buffer improves write performance by batching multiple small
 /// writes into a single LMDB transaction, reducing overhead significantly.
 #[derive(Debug)]
@@ -145,7 +203,7 @@ impl WriteBuffer {
 }
 
 /// LMDB Environment resource
-/// 
+///
 /// Represents an LMDB environment that can contain multiple databases.
 /// Environments are reference-counted and shared across database instances.
 #[derive(Debug)]
@@ -161,7 +219,7 @@ pub struct LmdbEnv {
 }
 
 /// LMDB Database resource
-/// 
+///
 /// Represents a database within an LMDB environment.
 /// Each database has its own write buffer for batching operations.
 pub struct LmdbDatabase {
@@ -185,18 +243,18 @@ struct EnvState {
 }
 
 // Global registry of open environments
-// 
+//
 // Ensures that each directory path has at most one environment open,
 // preventing LMDB conflicts and improving resource sharing.
 lazy_static::lazy_static! {
-    static ref ENVIRONMENTS: Arc<Mutex<HashMap<String, ResourceArc<LmdbEnv>>>> = 
+    static ref ENVIRONMENTS: Arc<Mutex<HashMap<String, ResourceArc<LmdbEnv>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     static ref DATABASES: Arc<Mutex<HashMap<String, ResourceArc<LmdbDatabase>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 }
 
 /// Initialize the NIF module
-/// 
+///
 /// Registers resource types with the Erlang runtime.
 /// This function is called automatically when the NIF is loaded.
 fn init(env: Env, _info: Term) -> bool {
@@ -228,6 +286,9 @@ fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lm
     }
     if options.write_map {
         flags |= EnvironmentFlags::WRITE_MAP;
+    }
+    if options.no_readahead {
+        flags |= EnvironmentFlags::NO_READAHEAD;
     }
     env_builder.set_flags(flags);
 
@@ -317,7 +378,10 @@ impl LmdbEnv {
 fn soft_close_db(db_handle: &ResourceArc<LmdbDatabase>) -> Result<(), String> {
     if let Err(error_msg) = db_handle.force_flush_buffer() {
         // Close remains best-effort; keep old behavior of not failing close on flush errors.
-        eprintln!("Warning: Failed to flush buffer during db_close: {}", error_msg);
+        eprintln!(
+            "Warning: Failed to flush buffer during db_close: {}",
+            error_msg
+        );
     }
 
     let was_open = {
@@ -359,12 +423,16 @@ fn soft_close_db(db_handle: &ResourceArc<LmdbDatabase>) -> Result<(), String> {
 #[rustler::nif]
 fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResult<Term<'a>> {
     let path_string = if let Ok(binary) = path.decode::<Binary>() {
-        std::str::from_utf8(&binary).map_err(|_| Error::BadArg)?.to_string()
+        std::str::from_utf8(&binary)
+            .map_err(|_| Error::BadArg)?
+            .to_string()
     } else if let Ok(string) = path.decode::<String>() {
         string
     } else if let Ok(chars) = path.decode::<Vec<u8>>() {
         // Handle Erlang strings (lists of integers)
-        std::str::from_utf8(&chars).map_err(|_| Error::BadArg)?.to_string()
+        std::str::from_utf8(&chars)
+            .map_err(|_| Error::BadArg)?
+            .to_string()
     } else {
         return Err(Error::BadArg);
     };
@@ -392,15 +460,15 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
         }
         return Ok((atoms::ok(), existing_env).encode(env));
     }
-    
+
     let lmdb_env_result = build_environment(path_str, &parsed_options);
-    
+
     let lmdb_environment = match lmdb_env_result {
         Ok(env) => env,
         Err(e) => {
             // Check if the directory itself exists
             let path = Path::new(path_str);
-            
+
             let error_atom = if !path.exists() {
                 atoms::directory_not_found()
             } else if path.is_file() {
@@ -414,22 +482,20 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
                         let _ = std::fs::remove_file(path.join(".lmdb_test"));
                         // Permission is OK, surface the specific LMDB error atom.
                         lmdb_error_to_atom(e)
-                    },
-                    Err(io_err) => {
-                        match io_err.kind() {
-                            std::io::ErrorKind::PermissionDenied => atoms::permission_denied(),
-                            _ => atoms::environment_error()
-                        }
                     }
+                    Err(io_err) => match io_err.kind() {
+                        std::io::ErrorKind::PermissionDenied => atoms::permission_denied(),
+                        _ => atoms::environment_error(),
+                    },
                 }
             };
-            
+
             return Ok((atoms::error(), error_atom).encode(env));
         }
     };
-    
+
     // Create our wrapper struct
-    let lmdb_env = LmdbEnv { 
+    let lmdb_env = LmdbEnv {
         path: path_str.to_string(),
         options: Arc::new(Mutex::new(parsed_options.clone())),
         state: Arc::new(Mutex::new(EnvState {
@@ -440,13 +506,13 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
         ref_count: Arc::new(Mutex::new(0)),
     };
     let resource = ResourceArc::new(lmdb_env);
-    
+
     // Store in global environments map
     {
         let mut environments = ENVIRONMENTS.lock().unwrap();
         environments.insert(path_str.to_string(), resource.clone());
     }
-    
+
     Ok((atoms::ok(), resource).encode(env))
 }
 
@@ -461,8 +527,12 @@ fn env_sync<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Ter
 
     match live_env.sync(true) {
         Ok(()) => Ok(atoms::ok().encode(env)),
-        Err(err_msg) => Ok((atoms::error(), atoms::environment_error(), 
-                      format!("Environment sync failed: {}", err_msg)).encode(env))
+        Err(err_msg) => Ok((
+            atoms::error(),
+            atoms::environment_error(),
+            format!("Environment sync failed: {}", err_msg),
+        )
+            .encode(env)),
     }
 }
 
@@ -485,17 +555,21 @@ fn env_close<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Te
 #[rustler::nif]
 fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
     let path_string = if let Ok(binary) = path.decode::<Binary>() {
-        std::str::from_utf8(&binary).map_err(|_| Error::BadArg)?.to_string()
+        std::str::from_utf8(&binary)
+            .map_err(|_| Error::BadArg)?
+            .to_string()
     } else if let Ok(string) = path.decode::<String>() {
         string
     } else if let Ok(chars) = path.decode::<Vec<u8>>() {
         // Handle Erlang strings (lists of integers)
-        std::str::from_utf8(&chars).map_err(|_| Error::BadArg)?.to_string()
+        std::str::from_utf8(&chars)
+            .map_err(|_| Error::BadArg)?
+            .to_string()
     } else {
         return Err(Error::BadArg);
     };
     let path_str = &path_string;
-    
+
     let env_handle = {
         let environments = ENVIRONMENTS.lock().unwrap();
         environments.get(path_str).cloned()
@@ -523,10 +597,7 @@ fn env_close_by_name<'a>(env: Env<'a>, path: Term<'a>) -> NifResult<Term<'a>> {
 ///===================================================================
 
 #[rustler::nif]
-fn db_close<'a>(
-    env: Env<'a>,
-    db_handle: ResourceArc<LmdbDatabase>
-) -> NifResult<Term<'a>> {
+fn db_close<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Term<'a>> {
     match soft_close_db(&db_handle) {
         Ok(()) => Ok(atoms::ok().encode(env)),
         Err(error_msg) => Ok((atoms::error(), atoms::database_error(), error_msg).encode(env)),
@@ -535,9 +606,9 @@ fn db_close<'a>(
 
 #[rustler::nif]
 fn db_open<'a>(
-    env: Env<'a>, 
-    env_handle: ResourceArc<LmdbEnv>, 
-    options: Vec<Term<'a>>
+    env: Env<'a>,
+    env_handle: ResourceArc<LmdbEnv>,
+    options: Vec<Term<'a>>,
 ) -> NifResult<Term<'a>> {
     let parsed_options = parse_db_options(options)?;
     if let Err(error_msg) = env_handle.ensure_open() {
@@ -571,15 +642,15 @@ fn db_open<'a>(
         }
         return Ok((atoms::ok(), existing_db).encode(env));
     }
-    
+
     // Increment reference count for this environment
     {
         let mut ref_count = env_handle.ref_count.lock().map_err(|_| Error::BadArg)?;
         *ref_count += 1;
     }
-    
+
     // Create database resource with write buffer (default buffer size: 1000 operations)
-    let lmdb_db = LmdbDatabase { 
+    let lmdb_db = LmdbDatabase {
         env: env_handle.clone(),
         write_buffer: Arc::new(Mutex::new(WriteBuffer::new(batch_size))),
         cached_db: Arc::new(Mutex::new(None)),
@@ -606,7 +677,7 @@ fn db_open<'a>(
         }
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    
+
     Ok((atoms::ok(), resource).encode(env))
 }
 
@@ -641,7 +712,7 @@ impl LmdbDatabase {
     // 3. Explicit flush is called
     // 4. Database is being closed
     // This dramatically improves write performance by reducing transaction overhead
-    
+
     fn set_create_if_missing(&self, create: bool) -> Result<(), String> {
         if !create {
             return Ok(());
@@ -738,30 +809,48 @@ impl LmdbDatabase {
         Ok((live_env, db))
     }
 
-
-    // New method for immediate batched write without buffering
-    fn write_immediate_batch(&self, operations: Vec<WriteOperation>) -> Result<(), String> {
+    fn write_immediate_batch(&self, mut operations: Vec<WriteOperation>) -> Result<(), String> {
         if operations.is_empty() {
             return Ok(());
+        }
+        if operations
+            .windows(2)
+            .any(|pair| pair[0].key.as_slice() > pair[1].key.as_slice())
+        {
+            operations.sort_by(|a, b| a.key.cmp(&b.key));
         }
 
         let (live_env, live_db) = self.ensure_open_handles()?;
 
-        // Create a write transaction for the batch
-        let mut txn = live_env.begin_rw_txn()
+        let mut txn = live_env
+            .begin_rw_txn()
             .map_err(|_| "Failed to begin write transaction")?;
-        
-        // Execute all operations in the batch
-        for op in operations {
-            txn.put(live_db, &op.key, &op.value, WriteFlags::empty())
-                .map_err(|e| format!("Failed to put value: key_len={}, value_len={}, error={:?}", 
-                                     op.key.len(), op.value.len(), e))?;
+
+        let mut cursor = txn
+            .open_rw_cursor(live_db)
+            .map_err(|_| "Failed to open write cursor")?;
+
+        for op in operations.iter() {
+            cursor
+                .put(
+                    &op.key.as_slice(),
+                    &op.value.as_slice(),
+                    WriteFlags::empty(),
+                )
+                .map_err(|e| {
+                    format!(
+                        "Failed to put value: key_len={}, value_len={}, error={:?}",
+                        op.key.len(),
+                        op.value.len(),
+                        e
+                    )
+                })?;
         }
-        
-        // Commit the transaction
+        drop(cursor);
+
         txn.commit()
             .map_err(|_| "Failed to commit batch transaction")?;
-        
+
         Ok(())
     }
 
@@ -769,9 +858,12 @@ impl LmdbDatabase {
     fn put_with_batching(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
         // First, add to buffer
         let (should_batch_immediately, current_ops) = {
-            let mut buffer = self.write_buffer.lock().map_err(|_| "Failed to lock write buffer")?;
+            let mut buffer = self
+                .write_buffer
+                .lock()
+                .map_err(|_| "Failed to lock write buffer")?;
             buffer.add_without_check(key, value);
-            
+
             // If buffer is full, drain it for immediate processing
             if buffer.should_flush() {
                 let ops = buffer.drain();
@@ -789,10 +881,36 @@ impl LmdbDatabase {
         Ok(())
     }
 
+    fn put_batch_with_buffering(&self, operations: Vec<WriteOperation>) -> Result<(), String> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+
+        let pending_ops = {
+            let mut buffer = self
+                .write_buffer
+                .lock()
+                .map_err(|_| "Failed to lock write buffer")?;
+            for op in operations {
+                buffer.operations.push_back(op);
+            }
+            if buffer.should_flush() {
+                buffer.drain()
+            } else {
+                Vec::new()
+            }
+        };
+
+        self.write_immediate_batch(pending_ops)
+    }
+
     // Force flush any pending writes - used before reads and on close
     fn force_flush_buffer(&self) -> Result<(), String> {
         let pending_ops = {
-            let mut buffer = self.write_buffer.lock().map_err(|_| "Failed to lock write buffer")?;
+            let mut buffer = self
+                .write_buffer
+                .lock()
+                .map_err(|_| "Failed to lock write buffer")?;
             if buffer.is_empty() {
                 return Ok(());
             }
@@ -828,14 +946,14 @@ impl Drop for LmdbDatabase {
                 false
             }
         };
-        
+
         // Only decrement reference count if not already closed
         // (explicit close already decremented it)
         if !already_closed {
             // Attempt to flush any remaining buffered writes when the database is dropped
             // We ignore errors here since we can't handle them in Drop
             let _ = self.force_flush_buffer();
-            
+
             // Decrement reference count for the environment
             if let Ok(mut ref_count) = self.env.ref_count.lock() {
                 if *ref_count > 0 {
@@ -855,7 +973,7 @@ fn put<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
     key: Binary,
-    value: Binary
+    value: Binary,
 ) -> NifResult<Term<'a>> {
     // Validate database and environment status
     if let Err(error_msg) = db_handle.validate_database() {
@@ -864,7 +982,7 @@ fn put<'a>(
 
     let key_vec = key.as_slice().to_vec();
     let value_vec = value.as_slice().to_vec();
-    
+
     // Handle empty keys directly (don't buffer them as they cause issues in LMDB batch operations)
     if key_vec.is_empty() {
         let (live_env, live_db) = match db_handle.ensure_open_handles() {
@@ -877,32 +995,42 @@ fn put<'a>(
         let mut txn = match live_env.begin_rw_txn() {
             Ok(txn) => txn,
             Err(_) => {
-                return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin write transaction".to_string()).encode(env));
+                return Ok((
+                    atoms::error(),
+                    atoms::transaction_error(),
+                    "Failed to begin write transaction".to_string(),
+                )
+                    .encode(env));
             }
         };
-        
+
         match txn.put(live_db, &key_vec, &value_vec, WriteFlags::empty()) {
-            Ok(()) => {
-                match txn.commit() {
-                    Ok(()) => return Ok(atoms::ok().encode(env)),
-                    Err(_) => return Ok((atoms::error(), atoms::transaction_error(), "Failed to commit transaction".to_string()).encode(env))
+            Ok(()) => match txn.commit() {
+                Ok(()) => return Ok(atoms::ok().encode(env)),
+                Err(_) => {
+                    return Ok((
+                        atoms::error(),
+                        atoms::transaction_error(),
+                        "Failed to commit transaction".to_string(),
+                    )
+                        .encode(env))
                 }
             },
             Err(lmdb_err) => {
                 let error_msg = match lmdb_err {
                     lmdb::Error::BadValSize => "Empty key not supported".to_string(),
-                    _ => format!("Failed to put value: {:?}", lmdb_err)
+                    _ => format!("Failed to put value: {:?}", lmdb_err),
                 };
                 return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
             }
         }
     }
-    
+
     // Add to write buffer for non-empty keys using new batching logic
     if let Err(error_msg) = db_handle.put_with_batching(key_vec, value_vec) {
         return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
     }
-    
+
     Ok(atoms::ok().encode(env))
 }
 
@@ -910,98 +1038,115 @@ fn put<'a>(
 fn put_batch<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
-    key_value_pairs: Vec<(Binary, Binary)>
+    key_value_pairs: Vec<(Binary, Binary)>,
 ) -> NifResult<Term<'a>> {
-    // Validate database and environment status
     if let Err(error_msg) = db_handle.validate_database() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    
+
     if key_value_pairs.is_empty() {
         return Ok(atoms::ok().encode(env));
     }
 
-    // Preserve ordering when mixed with buffered put/3 calls.
+    let mut operations = Vec::with_capacity(key_value_pairs.len());
+    for (key, value) in key_value_pairs.iter() {
+        let klen = key.as_slice().len();
+        if klen == 0 {
+            return Ok((
+                atoms::error(),
+                atoms::validation_error(),
+                "Empty key in batch".to_string(),
+            )
+                .encode(env));
+        }
+        if klen > LMDB_DEFAULT_MAX_KEY_SIZE {
+            return Ok((
+                atoms::error(),
+                atoms::validation_error(),
+                format!("Key size {klen} exceeds limit {LMDB_DEFAULT_MAX_KEY_SIZE}"),
+            )
+                .encode(env));
+        }
+        operations.push(WriteOperation {
+            key: key.as_slice().to_vec(),
+            value: value.as_slice().to_vec(),
+        });
+    }
+
+    if let Err(error_msg) = db_handle.put_batch_with_buffering(operations) {
+        return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+    }
+
+    Ok(atoms::ok().encode(env))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn put_batch_direct<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>,
+    key_value_pairs: Vec<(Binary, Binary)>,
+) -> NifResult<Term<'a>> {
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+
+    if key_value_pairs.is_empty() {
+        return Ok(atoms::ok().encode(env));
+    }
+
     if db_handle.has_pending_writes() {
         if let Err(error_msg) = db_handle.force_flush_buffer() {
             return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
         }
     }
-    
-    let (live_env, live_db) = match db_handle.ensure_open_handles() {
-        Ok(handles) => handles,
-        Err(error_msg) => {
-            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
-        }
-    };
 
-    // Create a write transaction for the entire batch
-    let mut txn = match live_env.begin_rw_txn() {
-        Ok(txn) => txn,
-        Err(_) => {
-            return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin write transaction".to_string()).encode(env));
+    let mut operations = Vec::with_capacity(key_value_pairs.len());
+    for (key, value) in key_value_pairs.iter() {
+        let klen = key.as_slice().len();
+        if klen == 0 {
+            return Ok((
+                atoms::error(),
+                atoms::validation_error(),
+                "Empty key in batch".to_string(),
+            )
+                .encode(env));
         }
-    };
-    
-    let mut success_count = 0;
-    let mut errors = Vec::new();
-    
-    // Process all key-value pairs in a single transaction
-    for (i, (key, value)) in key_value_pairs.iter().enumerate() {
-        let key_bytes = key.as_slice();
-        let value_bytes = value.as_slice();
-        
-        match txn.put(live_db, &key_bytes, &value_bytes, WriteFlags::empty()) {
-            Ok(()) => {
-                success_count += 1;
-            },
-            Err(lmdb_err) => {
-                let error_detail = match lmdb_err {
-                    lmdb::Error::KeyExist => "Key already exists".to_string(),
-                    lmdb::Error::MapFull => "Database is full".to_string(),
-                    lmdb::Error::TxnFull => "Transaction is full".to_string(),
-                    _ => "Failed to put value".to_string()
-                };
-                errors.push((i, error_detail));
-            }
+        if klen > LMDB_DEFAULT_MAX_KEY_SIZE {
+            return Ok((
+                atoms::error(),
+                atoms::validation_error(),
+                format!("Key size {klen} exceeds limit {LMDB_DEFAULT_MAX_KEY_SIZE}"),
+            )
+                .encode(env));
         }
+        operations.push(WriteOperation {
+            key: key.as_slice().to_vec(),
+            value: value.as_slice().to_vec(),
+        });
     }
-    
-    // Commit the transaction
-    match txn.commit() {
-        Ok(()) => {
-            if errors.is_empty() {
-                Ok(atoms::ok().encode(env))
-            } else {
-                Ok((atoms::ok(), success_count, errors).encode(env))
-            }
-        },
-        Err(_) => {
-            Ok((atoms::error(), atoms::transaction_error(), "Failed to commit batch transaction".to_string()).encode(env))
-        }
+
+    match db_handle.write_immediate_batch(operations) {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(error_msg) => Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env)),
     }
 }
 
 #[rustler::nif]
-fn get<'a>(
-    env: Env<'a>,
-    db_handle: ResourceArc<LmdbDatabase>,
-    key: Binary
-) -> NifResult<Term<'a>> {
+fn get<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>, key: Binary) -> NifResult<Term<'a>> {
     // Validate database and environment status
     if let Err(error_msg) = db_handle.validate_database() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    
+
     let key_bytes = key.as_slice();
-    
+
     // Only flush write buffer if there are pending writes
     if db_handle.has_pending_writes() {
         if let Err(error_msg) = db_handle.force_flush_buffer() {
             return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
         }
     }
-    
+
     let (live_env, live_db) = match db_handle.ensure_open_handles() {
         Ok(handles) => handles,
         Err(error_msg) => {
@@ -1013,26 +1158,32 @@ fn get<'a>(
     let txn = match live_env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
-            return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
+            return Ok((
+                atoms::error(),
+                atoms::transaction_error(),
+                "Failed to begin read transaction".to_string(),
+            )
+                .encode(env));
         }
     };
-    
+
     // Get the value for the key
     let result = txn.get(live_db, &key_bytes);
-    
+
     match result {
         Ok(value_bytes) => {
             // Convert the value to a binary that Erlang can use
             let mut binary = rustler::types::binary::OwnedBinary::new(value_bytes.len()).unwrap();
             binary.as_mut_slice().copy_from_slice(value_bytes);
             Ok((atoms::ok(), binary.release(env)).encode(env))
-        },
-        Err(lmdb::Error::NotFound) => {
-            Ok(atoms::not_found().encode(env))
-        },
-        Err(_) => {
-            Ok((atoms::error(), atoms::database_error(), "Failed to get value".to_string()).encode(env))
         }
+        Err(lmdb::Error::NotFound) => Ok(atoms::not_found().encode(env)),
+        Err(_) => Ok((
+            atoms::error(),
+            atoms::database_error(),
+            "Failed to get value".to_string(),
+        )
+            .encode(env)),
     }
 }
 
@@ -1041,10 +1192,7 @@ fn get<'a>(
 ///===================================================================
 
 #[rustler::nif]
-fn iterator<'a>(
-    env: Env<'a>,
-    db_handle: ResourceArc<LmdbDatabase>
-) -> NifResult<Term<'a>> {
+fn iterator<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Term<'a>> {
     if let Err(error_msg) = db_handle.validate_database() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
@@ -1056,7 +1204,7 @@ fn iterator<'a>(
 fn iterator_next<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
-    cursor_term: Term<'a>
+    cursor_term: Term<'a>,
 ) -> NifResult<Term<'a>> {
     // Validate database and environment status
     if let Err(error_msg) = db_handle.validate_database() {
@@ -1090,7 +1238,12 @@ fn iterator_next<'a>(
     let txn = match live_env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
-            return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
+            return Ok((
+                atoms::error(),
+                atoms::transaction_error(),
+                "Failed to begin read transaction".to_string(),
+            )
+                .encode(env));
         }
     };
 
@@ -1098,46 +1251,65 @@ fn iterator_next<'a>(
     let cursor = match txn.open_ro_cursor(live_db) {
         Ok(cursor) => cursor,
         Err(_) => {
-            return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to open cursor".to_string(),
+            )
+                .encode(env));
         }
     };
 
     let next_entry = match cursor_token {
-        IteratorCursor::Start => {
-            match cursor.get(None, None, MDB_FIRST) {
-                Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
-                Ok((None, _)) => None,
-                Err(lmdb::Error::NotFound) => None,
-                Err(_) => {
-                    return Ok((atoms::error(), atoms::database_error(), "Failed to read first cursor entry".to_string()).encode(env));
-                }
+        IteratorCursor::Start => match cursor.get(None, None, MDB_FIRST) {
+            Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
+            Ok((None, _)) => None,
+            Err(lmdb::Error::NotFound) => None,
+            Err(_) => {
+                return Ok((
+                    atoms::error(),
+                    atoms::database_error(),
+                    "Failed to read first cursor entry".to_string(),
+                )
+                    .encode(env));
             }
-        }
+        },
         IteratorCursor::AfterKey(last_key) => {
-            let positioned_entry = match cursor.get(Some(last_key.as_slice()), None, MDB_SET_RANGE) {
+            let positioned_entry = match cursor.get(Some(last_key.as_slice()), None, MDB_SET_RANGE)
+            {
                 Ok((Some(key), value)) => Some((key.to_vec(), value.to_vec())),
                 Ok((None, _)) => None,
                 Err(lmdb::Error::NotFound) => None,
                 Err(_) => {
-                    return Ok((atoms::error(), atoms::database_error(), "Failed to position iterator cursor".to_string()).encode(env));
+                    return Ok((
+                        atoms::error(),
+                        atoms::database_error(),
+                        "Failed to position iterator cursor".to_string(),
+                    )
+                        .encode(env));
                 }
             };
 
             match positioned_entry {
                 // If LMDB positioned on the same key, advance once so semantics stay "after cursor".
-                Some((key, _value)) if key == last_key => {
-                    match cursor.get(None, None, MDB_NEXT) {
-                        Ok((Some(next_key), next_value)) => Some((next_key.to_vec(), next_value.to_vec())),
-                        Ok((None, _)) => None,
-                        Err(lmdb::Error::NotFound) => None,
-                        Err(_) => {
-                            return Ok((atoms::error(), atoms::database_error(), "Failed to advance iterator cursor".to_string()).encode(env));
-                        }
+                Some((key, _value)) if key == last_key => match cursor.get(None, None, MDB_NEXT) {
+                    Ok((Some(next_key), next_value)) => {
+                        Some((next_key.to_vec(), next_value.to_vec()))
                     }
-                }
+                    Ok((None, _)) => None,
+                    Err(lmdb::Error::NotFound) => None,
+                    Err(_) => {
+                        return Ok((
+                            atoms::error(),
+                            atoms::database_error(),
+                            "Failed to advance iterator cursor".to_string(),
+                        )
+                            .encode(env));
+                    }
+                },
                 // Key was deleted or moved; return the first lexicographically greater key if present.
                 Some((key, value)) => Some((key, value)),
-                None => None
+                None => None,
             }
         }
     };
@@ -1149,7 +1321,7 @@ fn iterator_next<'a>(
             let next_cursor = encode_iterator_after_key(env, &key)?;
             Ok((atoms::ok(), key_term, value_term, next_cursor).encode(env))
         }
-        None => Ok(atoms::undefined().encode(env))
+        None => Ok(atoms::undefined().encode(env)),
     }
 }
 
@@ -1161,15 +1333,15 @@ fn iterator_next<'a>(
 fn list<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
-    key_prefix: Binary
+    key_prefix: Binary,
 ) -> NifResult<Term<'a>> {
     // Validate database and environment status
     if let Err(error_msg) = db_handle.validate_database() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    
+
     let prefix_bytes = key_prefix.as_slice();
-    
+
     // Only flush write buffer if there are pending writes
     if db_handle.has_pending_writes() {
         if let Err(error_msg) = db_handle.force_flush_buffer() {
@@ -1183,12 +1355,17 @@ fn list<'a>(
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
         }
     };
-    
+
     // Create a read-only transaction
     let txn = match live_env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
-            return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
+            return Ok((
+                atoms::error(),
+                atoms::transaction_error(),
+                "Failed to begin read transaction".to_string(),
+            )
+                .encode(env));
         }
     };
 
@@ -1196,34 +1373,38 @@ fn list<'a>(
     let mut cursor = match txn.open_ro_cursor(live_db) {
         Ok(cursor) => cursor,
         Err(_) => {
-            return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to open cursor".to_string(),
+            )
+                .encode(env));
         }
     };
-    
+
     // OPTIMIZATION: Use Vec instead of HashSet for better performance with small collections
     // Pre-allocate with reasonable capacity to avoid reallocations
     let mut children = Vec::with_capacity(64);
     let prefix_len = prefix_bytes.len();
-    
+
     // OPTIMIZATION: Start cursor at prefix position instead of scanning from beginning
     // This dramatically reduces iterations for sparse data
-    
+
     // Safe iteration approach that handles empty databases and missing prefixes
     // First, try to position cursor at prefix using MDB_SET_RANGE to check if key exists
     // First, try to position cursor at prefix using MDB_SET_RANGE to check if key exists
     let cursor_positioned = cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok();
-    
+
     if !cursor_positioned {
         // No keys >= prefix exist, return not_found immediately
         return Ok(atoms::not_found().encode(env));
     }
-    
+
     // Keys exist that are >= prefix, now safely use iter_from
     let cursor_iter = cursor.iter_from(prefix_bytes);
-    
+
     // Iterate through keys starting from the prefix
     for (key, _value) in cursor_iter {
-        
         // OPTIMIZATION: Early termination - if key doesn't start with prefix and we've already
         // found matches, we can break since keys are sorted
         if !key.starts_with(prefix_bytes) {
@@ -1231,36 +1412,38 @@ fn list<'a>(
             // no subsequent keys will match either
             break;
         }
-        
+
         // Extract the next path component after the prefix
         let remaining = &key[prefix_len..];
-        
+
         // Skip if there's no remaining path (exact match with prefix)
         if remaining.is_empty() {
             continue;
         }
-        
+
         // OPTIMIZATION: Find separator using unsafe slice operation for better performance
         let next_component = if let Some(sep_pos) = remaining.iter().position(|&b| b == b'/') {
             &remaining[..sep_pos]
         } else {
             remaining
         };
-        
+
         // Only process non-empty components
         if next_component.is_empty() {
             continue;
         }
-        
+
         // OPTIMIZATION: Use binary search for duplicate detection once we have enough items
         // For small collections, linear search is still faster
         let component_exists = if children.len() < 16 {
-            children.iter().any(|existing: &Vec<u8>| existing.as_slice() == next_component)
+            children
+                .iter()
+                .any(|existing: &Vec<u8>| existing.as_slice() == next_component)
         } else {
             // For larger collections, use binary search on sorted data
             children.binary_search(&next_component.to_vec()).is_ok()
         };
-        
+
         if !component_exists {
             let component_vec = next_component.to_vec();
             if children.len() < 16 {
@@ -1274,14 +1457,14 @@ fn list<'a>(
             }
         }
     }
-    
+
     if children.is_empty() {
         return Ok(atoms::not_found().encode(env));
     }
-    
+
     // OPTIMIZATION: Pre-allocate result vector and minimize allocations
     let mut result_binaries = Vec::with_capacity(children.len());
-    
+
     // OPTIMIZATION: Sort results only if we didn't maintain sorted order during insertion
     if children.len() >= 16 {
         // Already sorted during insertion via binary search
@@ -1289,40 +1472,181 @@ fn list<'a>(
         // Sort small collections
         children.sort_unstable();
     }
-    
+
     for child in children {
         // OPTIMIZATION: Direct binary creation without intermediate copy when possible
-        let mut binary = rustler::types::binary::OwnedBinary::new(child.len())
-            .ok_or(Error::BadArg)?;
+        let mut binary =
+            rustler::types::binary::OwnedBinary::new(child.len()).ok_or(Error::BadArg)?;
         binary.as_mut_slice().copy_from_slice(&child);
         result_binaries.push(binary.release(env));
     }
-    
+
     Ok((atoms::ok(), result_binaries).encode(env))
+}
+
+#[rustler::nif]
+fn read_prefix_rows<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>,
+    key_prefix: Binary,
+) -> NifResult<Term<'a>> {
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+
+    if db_handle.has_pending_writes() {
+        if let Err(error_msg) = db_handle.force_flush_buffer() {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    }
+
+    let prefix_bytes = key_prefix.as_slice();
+    let (live_env, live_db) = match db_handle.ensure_open_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
+    let txn = match RawReadTxn::begin(&live_env) {
+        Ok(txn) => txn,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    };
+
+    let cursor = match RawCursor::open(&txn, live_db) {
+        Ok(cursor) => cursor,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
+    let mut count = 0usize;
+    let mut total_size = 0usize;
+    let mut key = ffi::MDB_val {
+        mv_size: prefix_bytes.len(),
+        mv_data: prefix_bytes.as_ptr() as *mut _,
+    };
+    let mut value = ffi::MDB_val {
+        mv_size: 0,
+        mv_data: std::ptr::null_mut(),
+    };
+    let mut rc =
+        unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_SET_RANGE) };
+
+    while rc == ffi::MDB_SUCCESS && raw_key_has_prefix(&key, prefix_bytes) {
+        count += 1;
+        if count > u32::MAX as usize {
+            return Ok((
+                atoms::error(),
+                atoms::validation_error(),
+                "Packed prefix result too large".to_string(),
+            )
+                .encode(env));
+        }
+        total_size = match row_bytes_size(total_size, key.mv_size, value.mv_size) {
+            Some(size) => size,
+            None => {
+                return Ok((
+                    atoms::error(),
+                    atoms::validation_error(),
+                    "Packed prefix result too large".to_string(),
+                )
+                    .encode(env));
+            }
+        };
+        rc = unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_NEXT) };
+    }
+
+    if rc != ffi::MDB_SUCCESS && rc != ffi::MDB_NOTFOUND {
+        return Ok((
+            atoms::error(),
+            atoms::database_error(),
+            "Failed to advance prefix cursor".to_string(),
+        )
+            .encode(env));
+    }
+
+    if count == 0 {
+        return Ok(atoms::not_found().encode(env));
+    }
+
+    let mut binary = NewBinary::new(env, total_size);
+    let out = binary.as_mut_slice().as_mut_ptr();
+    let mut offset = 0usize;
+    let mut rows = Vec::with_capacity(count);
+
+    key = ffi::MDB_val {
+        mv_size: prefix_bytes.len(),
+        mv_data: prefix_bytes.as_ptr() as *mut _,
+    };
+    value = ffi::MDB_val {
+        mv_size: 0,
+        mv_data: std::ptr::null_mut(),
+    };
+    rc = unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_SET_RANGE) };
+
+    while rc == ffi::MDB_SUCCESS && raw_key_has_prefix(&key, prefix_bytes) {
+        unsafe {
+            let key_offset = offset;
+            std::ptr::copy_nonoverlapping(key.mv_data as *const u8, out.add(offset), key.mv_size);
+            offset += key.mv_size;
+            let value_offset = offset;
+            std::ptr::copy_nonoverlapping(
+                value.mv_data as *const u8,
+                out.add(offset),
+                value.mv_size,
+            );
+            offset += value.mv_size;
+            rows.push((key_offset, key.mv_size, value_offset, value.mv_size));
+        }
+        rc = unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_NEXT) };
+    }
+
+    if rc != ffi::MDB_SUCCESS && rc != ffi::MDB_NOTFOUND {
+        return Ok((
+            atoms::error(),
+            atoms::database_error(),
+            "Failed to advance second prefix cursor".to_string(),
+        )
+            .encode(env));
+    }
+
+    let packed = Term::from(binary).into_binary()?;
+    let mut result = Vec::with_capacity(rows.len());
+    for (key_offset, key_size, value_offset, value_size) in rows {
+        result.push((
+            packed.make_subbinary(key_offset, key_size)?,
+            packed.make_subbinary(value_offset, value_size)?,
+        ));
+    }
+
+    Ok((atoms::ok(), result).encode(env))
 }
 
 #[rustler::nif]
 fn match_pattern<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
-    patterns: Vec<(Binary, Binary)>
+    patterns: Vec<(Binary, Binary)>,
 ) -> NifResult<Term<'a>> {
     // Validate database and environment status
     if let Err(error_msg) = db_handle.validate_database() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    
+
     // Return not_found if patterns is empty
     if patterns.is_empty() {
         return Ok(atoms::not_found().encode(env));
     }
-    
+
     // Keep patterns as references for efficient comparison
     let patterns_vec: Vec<(&[u8], &[u8])> = patterns
         .iter()
         .map(|(k, v)| (k.as_slice(), v.as_slice()))
         .collect();
-    
+
     // Only flush write buffer if there are pending writes
     if db_handle.has_pending_writes() {
         if let Err(error_msg) = db_handle.force_flush_buffer() {
@@ -1336,37 +1660,47 @@ fn match_pattern<'a>(
             return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
         }
     };
-    
+
     // Create a read-only transaction
     let txn = match live_env.begin_ro_txn() {
         Ok(txn) => txn,
         Err(_) => {
-            return Ok((atoms::error(), atoms::transaction_error(), "Failed to begin read transaction".to_string()).encode(env));
+            return Ok((
+                atoms::error(),
+                atoms::transaction_error(),
+                "Failed to begin read transaction".to_string(),
+            )
+                .encode(env));
         }
     };
-    
+
     // Open a cursor for the database
     let mut cursor = match txn.open_ro_cursor(live_db) {
         Ok(cursor) => cursor,
         Err(_) => {
-            return Ok((atoms::error(), atoms::database_error(), "Failed to open cursor".to_string()).encode(env));
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to open cursor".to_string(),
+            )
+                .encode(env));
         }
     };
-    
+
     // Data structures for tracking matches
-    const MAX_RESULTS: usize = 100000;  // Reasonable limit to prevent unbounded memory growth
+    const MAX_RESULTS: usize = 100000; // Reasonable limit to prevent unbounded memory growth
     let mut matching_ids: Vec<Vec<u8>> = Vec::new();
     let mut current_id: Option<Vec<u8>> = None;
     let mut seen_patterns: HashSet<usize> = HashSet::new();
     let total_patterns = patterns_vec.len();
-    
+
     // Iterate through all key-value pairs in the database
     let iter = cursor.iter_start();
     for (key_bytes, value_bytes) in iter {
         // Parse key to extract ID and suffix
         // Find the position of the last '/' to extract the ID and suffix
         let last_slash_pos = key_bytes.iter().rposition(|&b| b == b'/');
-        
+
         let (id, suffix) = if let Some(pos) = last_slash_pos {
             // Has hierarchy - split into ID and suffix
             let id = key_bytes[..pos].to_vec();
@@ -1376,7 +1710,7 @@ fn match_pattern<'a>(
             // No hierarchy - the entire key is the ID
             (key_bytes.to_vec(), Vec::new())
         };
-        
+
         // Check if we've moved to a new ID
         if current_id.as_ref() != Some(&id) {
             // Check if previous ID matched all patterns
@@ -1389,12 +1723,12 @@ fn match_pattern<'a>(
                     }
                 }
             }
-            
+
             // Reset for new ID
             current_id = Some(id.clone());
             seen_patterns.clear();
         }
-        
+
         // Check if this key-value pair matches any pattern
         for (pattern_idx, (pattern_key, pattern_value)) in patterns_vec.iter().enumerate() {
             // Check if suffix matches pattern key and value matches pattern value
@@ -1403,14 +1737,14 @@ fn match_pattern<'a>(
             }
         }
     }
-    
+
     // Check the final ID
     if let Some(final_id) = current_id {
         if seen_patterns.len() == total_patterns {
             matching_ids.push(final_id);
         }
     }
-    
+
     // Return results
     if matching_ids.is_empty() {
         Ok(atoms::not_found().encode(env))
@@ -1418,29 +1752,25 @@ fn match_pattern<'a>(
         // Convert matching IDs to Erlang binaries
         let mut result_binaries = Vec::with_capacity(matching_ids.len());
         for id in matching_ids {
-            let mut binary = OwnedBinary::new(id.len())
-                .ok_or(Error::BadArg)?;
+            let mut binary = OwnedBinary::new(id.len()).ok_or(Error::BadArg)?;
             binary.as_mut_slice().copy_from_slice(&id);
             result_binaries.push(binary.release(env));
         }
-        
+
         Ok((atoms::ok(), result_binaries).encode(env))
     }
 }
 
 #[rustler::nif]
-fn flush<'a>(
-    env: Env<'a>,
-    db_handle: ResourceArc<LmdbDatabase>
-) -> NifResult<Term<'a>> {
+fn flush<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Term<'a>> {
     // Validate database and environment status
     if let Err(error_msg) = db_handle.validate_database() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
-    
+
     match db_handle.force_flush_buffer() {
         Ok(()) => Ok(atoms::ok().encode(env)),
-        Err(error_msg) => Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env))
+        Err(error_msg) => Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env)),
     }
 }
 
@@ -1449,10 +1779,21 @@ fn flush<'a>(
 ///===================================================================
 
 fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
-    let mut binary = OwnedBinary::new(bytes.len())
-        .ok_or(Error::BadArg)?;
+    let mut binary = OwnedBinary::new(bytes.len()).ok_or(Error::BadArg)?;
     binary.as_mut_slice().copy_from_slice(bytes);
     Ok(binary.release(env).encode(env))
+}
+
+fn raw_key_has_prefix(key: &ffi::MDB_val, prefix: &[u8]) -> bool {
+    prefix.is_empty()
+        || key.mv_size >= prefix.len()
+            && unsafe { slice::from_raw_parts(key.mv_data as *const u8, prefix.len()) == prefix }
+}
+
+fn row_bytes_size(total_size: usize, key_size: usize, value_size: usize) -> Option<usize> {
+    total_size
+        .checked_add(key_size)
+        .and_then(|size| size.checked_add(value_size))
 }
 
 fn encode_iterator_start<'a>(env: Env<'a>) -> Term<'a> {
@@ -1514,7 +1855,7 @@ fn lmdb_error_to_atom(error: lmdb::Error) -> rustler::Atom {
 
 fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
     let mut env_opts = EnvOptions::default();
-    
+
     for option in options {
         if let Ok((atom, value)) = option.decode::<(rustler::Atom, Term)>() {
             let name = format!("{:?}", atom);
@@ -1549,17 +1890,18 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
                 "no_sync" => env_opts.no_sync = true,
                 "no_lock" => env_opts.no_lock = true,
                 "write_map" => env_opts.write_map = true,
+                "no_readahead" => env_opts.no_readahead = true,
                 _ => {} // Ignore unknown options
             }
         }
     }
-    
+
     Ok(env_opts)
 }
 
 fn parse_db_options(options: Vec<Term>) -> NifResult<DbOptions> {
     let mut db_opts = DbOptions::default();
-    
+
     for option in options {
         if let Ok(atom) = option.decode::<rustler::Atom>() {
             let name = format!("{:?}", atom);
@@ -1571,7 +1913,7 @@ fn parse_db_options(options: Vec<Term>) -> NifResult<DbOptions> {
             }
         }
     }
-    
+
     Ok(db_opts)
 }
 
@@ -1584,6 +1926,7 @@ struct EnvOptions {
     no_sync: bool,
     no_lock: bool,
     write_map: bool,
+    no_readahead: bool,
 }
 
 #[derive(Default)]
@@ -1598,12 +1941,12 @@ struct DbOptions {
 #[rustler::nif]
 fn env_status<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
     let closed = env_handle.is_closed().map_err(|_| Error::BadArg)?;
-    
+
     let ref_count = {
         let ref_count = env_handle.ref_count.lock().map_err(|_| Error::BadArg)?;
         *ref_count
     };
-    
+
     Ok((atoms::ok(), closed, ref_count, env_handle.path.clone()).encode(env))
 }
 

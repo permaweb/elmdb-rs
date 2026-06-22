@@ -15,13 +15,13 @@
 -export([db_open/2, db_close/1]).
 
 %% Key-value operations
--export([put/3, put_batch/2, get/2, flush/1]).
+-export([put/3, put_batch/2, put_batch_direct/2, get/2, flush/1]).
 
 %% Iterator operations
 -export([iterator/1, iterator_next/2, foreach/2, fold/3, map/2]).
 
 %% List operations
--export([list/2]).
+-export([list/2, read_prefix/2]).
 
 %% Pattern matching operations
 -export([match/2]).
@@ -165,6 +165,12 @@ put(_DBInstance, _Key, _Value) ->
     ok | {ok, integer(), list()} | {error, term(), binary()}.
 put_batch(_DBInstance, _KeyValuePairs) ->
     erlang:nif_error(nif_not_loaded).
+
+%% @doc Write multiple key-value pairs directly to LMDB in one transaction.
+-spec put_batch_direct(DBInstance :: term(), KeyValuePairs :: [{binary(), binary()}]) ->
+    ok | {error, term(), binary()}.
+put_batch_direct(_DBInstance, _KeyValuePairs) ->
+    erlang:nif_error(nif_not_loaded).
  
 %% @doc Read a value by key from the database
 %% @param DBInstance Database handle
@@ -257,6 +263,18 @@ map(DBInstance, Fun) when is_function(Fun, 2) ->
 -spec list(DBInstance :: term(), Key :: binary()) -> 
     {ok, [binary()]} | not_found.
 list(_DBInstance, _Key) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Read all raw row entries under a prefix.
+%% @param DBInstance Database handle
+%% @param Key The key prefix to search for (binary)
+%% @returns {ok, Entries} where Entries is [{FullKey, Value}], or not_found.
+-spec read_prefix(DBInstance :: term(), Key :: binary()) ->
+    {ok, [{binary(), binary()}]} | not_found.
+read_prefix(DBInstance, Key) ->
+    read_prefix_rows(DBInstance, Key).
+
+read_prefix_rows(_DBInstance, _Key) ->
     erlang:nif_error(nif_not_loaded).
 
 %%%===================================================================
