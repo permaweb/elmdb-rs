@@ -1353,6 +1353,13 @@ fn put_batch_direct<'a>(
             return Ok((atoms::error(), atoms::validation_error(), format!("Key size {klen} exceeds limit {LMDB_DEFAULT_MAX_KEY_SIZE}")).encode(env));
         }
     }
+    let mut key_value_pairs = key_value_pairs;
+    if key_value_pairs
+        .windows(2)
+        .any(|pair| pair[0].0.as_slice() > pair[1].0.as_slice())
+    {
+        key_value_pairs.sort_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
+    }
 
     let active_empty = db_handle.active.load().is_empty();
     let draining_empty = db_handle.draining.load().is_none();
