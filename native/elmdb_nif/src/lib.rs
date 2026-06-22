@@ -27,6 +27,7 @@
 
 use rustler::{Env, Term, NifResult, Error, Encoder, ResourceArc};
 use rustler::types::binary::Binary;
+use rustler::types::binary::NewBinary;
 use rustler::types::binary::OwnedBinary;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -35,8 +36,10 @@ use std::sync::mpsc::{self, Sender, Receiver};
 use std::thread::{self, JoinHandle};
 use arc_swap::ArcSwap;
 use std::path::Path;
+use std::slice;
 use scc::HashMap as SccHashMap;
 use lmdb::{Environment, EnvironmentFlags, Database, DatabaseFlags, Transaction, WriteFlags, Cursor};
+use lmdb_sys as ffi;
 
 // LMDB cursor operation constants (instead of importing lmdb-sys only for constants from lmdb_sys::ffi).
 // To be improved in the future.
@@ -46,6 +49,61 @@ const MDB_SET_RANGE: u32 = 17;
 // Default LMDB max key size. This is controlled by LMDB's compile-time MDB_MAXKEYSIZE.
 // If the Rust lmdb crate exposes mdb_env_get_maxkeysize safely in the future, prefer that.
 const LMDB_DEFAULT_MAX_KEY_SIZE: usize = 511;
+
+struct RawReadTxn {
+    txn: *mut ffi::MDB_txn,
+}
+
+impl RawReadTxn {
+    fn begin(env: &Environment) -> Result<Self, String> {
+        let mut txn = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::mdb_txn_begin(
+                env.env(),
+                std::ptr::null_mut(),
+                ffi::MDB_RDONLY,
+                &mut txn,
+            )
+        };
+        if rc == ffi::MDB_SUCCESS {
+            Ok(Self { txn })
+        } else {
+            Err("Failed to begin read transaction".to_string())
+        }
+    }
+}
+
+impl Drop for RawReadTxn {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::mdb_txn_abort(self.txn);
+        }
+    }
+}
+
+struct RawCursor {
+    cursor: *mut ffi::MDB_cursor,
+}
+
+impl RawCursor {
+    fn open(txn: &RawReadTxn, db: Database) -> Result<Self, String> {
+        let mut cursor = std::ptr::null_mut();
+        let rc = unsafe { ffi::mdb_cursor_open(txn.txn, db.dbi(), &mut cursor) };
+        if rc == ffi::MDB_SUCCESS {
+            Ok(Self { cursor })
+        } else {
+            Err("Failed to open cursor".to_string())
+        }
+    }
+}
+
+impl Drop for RawCursor {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::mdb_cursor_close(self.cursor);
+        }
+    }
+}
 
 mod atoms {
     rustler::atoms! {
@@ -1505,7 +1563,7 @@ fn list<'a>(
 }
 
 #[rustler::nif]
-fn read_prefix<'a>(
+fn read_prefix_rows<'a>(
     env: Env<'a>,
     db_handle: ResourceArc<LmdbDatabase>,
     key_prefix: Binary,
@@ -1531,68 +1589,131 @@ fn read_prefix<'a>(
         }
     };
 
-    let txn = match live_env.begin_ro_txn() {
+    let txn = match RawReadTxn::begin(&live_env) {
         Ok(txn) => txn,
-        Err(_) => {
+        Err(error_msg) => {
             return Ok((
                 atoms::error(),
                 atoms::transaction_error(),
-                "Failed to begin read transaction".to_string(),
+                error_msg,
             )
                 .encode(env));
         }
     };
 
-    let cursor = match txn.open_ro_cursor(live_db) {
+    let cursor = match RawCursor::open(&txn, live_db) {
         Ok(cursor) => cursor,
-        Err(_) => {
+        Err(error_msg) => {
             return Ok((
                 atoms::error(),
                 atoms::database_error(),
-                "Failed to open cursor".to_string(),
+                error_msg,
             )
                 .encode(env));
         }
     };
 
-    let mut result = Vec::with_capacity(64);
-    let mut first = true;
+    let mut count = 0usize;
+    let mut total_size = 0usize;
+    let mut key = ffi::MDB_val {
+        mv_size: prefix_bytes.len(),
+        mv_data: prefix_bytes.as_ptr() as *mut _,
+    };
+    let mut value = ffi::MDB_val {
+        mv_size: 0,
+        mv_data: std::ptr::null_mut(),
+    };
+    let mut rc = unsafe {
+        ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_SET_RANGE)
+    };
 
-    loop {
-        let positioning = first;
-        let current = if positioning {
-            first = false;
-            cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE)
-        } else {
-            cursor.get(None, None, MDB_NEXT)
-        };
-
-        match current {
-            Ok((Some(key), value)) if key.starts_with(prefix_bytes) => {
-                let key_term = encode_binary(env, key)?;
-                let value_term = encode_binary(env, value)?;
-                result.push((key_term, value_term));
-            }
-            Ok((Some(_), _)) | Ok((None, _)) | Err(lmdb::Error::NotFound) => {
-                break;
-            }
-            Err(_) => {
-                let message = match positioning {
-                    true => "Failed to position prefix cursor",
-                    false => "Failed to advance prefix cursor",
-                };
+    while rc == ffi::MDB_SUCCESS && raw_key_has_prefix(&key, prefix_bytes) {
+        count += 1;
+        if count > u32::MAX as usize {
+            return Ok((
+                atoms::error(),
+                atoms::validation_error(),
+                "Packed prefix result too large".to_string(),
+            )
+                .encode(env));
+        }
+        total_size = match row_bytes_size(total_size, key.mv_size, value.mv_size) {
+            Some(size) => size,
+            None => {
                 return Ok((
                     atoms::error(),
-                    atoms::database_error(),
-                    message.to_string(),
+                    atoms::validation_error(),
+                    "Packed prefix result too large".to_string(),
                 )
                     .encode(env));
             }
-        }
+        };
+        rc = unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_NEXT) };
     }
 
-    if result.is_empty() {
+    if rc != ffi::MDB_SUCCESS && rc != ffi::MDB_NOTFOUND {
+        return Ok((
+            atoms::error(),
+            atoms::database_error(),
+            "Failed to advance prefix cursor".to_string(),
+        )
+            .encode(env));
+    }
+
+    if count == 0 {
         return Ok(atoms::not_found().encode(env));
+    }
+
+    let mut binary = NewBinary::new(env, total_size);
+    let out = binary.as_mut_slice().as_mut_ptr();
+
+    let mut offset = 0usize;
+    let mut rows = Vec::with_capacity(count);
+    key = ffi::MDB_val {
+        mv_size: prefix_bytes.len(),
+        mv_data: prefix_bytes.as_ptr() as *mut _,
+    };
+    value = ffi::MDB_val {
+        mv_size: 0,
+        mv_data: std::ptr::null_mut(),
+    };
+    rc = unsafe {
+        ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_SET_RANGE)
+    };
+
+    while rc == ffi::MDB_SUCCESS && raw_key_has_prefix(&key, prefix_bytes) {
+        unsafe {
+            let key_offset = offset;
+            std::ptr::copy_nonoverlapping(key.mv_data as *const u8, out.add(offset), key.mv_size);
+            offset += key.mv_size;
+            let value_offset = offset;
+            std::ptr::copy_nonoverlapping(
+                value.mv_data as *const u8,
+                out.add(offset),
+                value.mv_size,
+            );
+            offset += value.mv_size;
+            rows.push((key_offset, key.mv_size, value_offset, value.mv_size));
+        }
+        rc = unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_NEXT) };
+    }
+
+    if rc != ffi::MDB_SUCCESS && rc != ffi::MDB_NOTFOUND {
+        return Ok((
+            atoms::error(),
+            atoms::database_error(),
+            "Failed to advance second prefix cursor".to_string(),
+        )
+            .encode(env));
+    }
+
+    let packed = Term::from(binary).into_binary()?;
+    let mut result = Vec::with_capacity(rows.len());
+    for (key_offset, key_size, value_offset, value_size) in rows {
+        result.push((
+            packed.make_subbinary(key_offset, key_size)?,
+            packed.make_subbinary(value_offset, value_size)?,
+        ));
     }
 
     Ok((atoms::ok(), result).encode(env))
@@ -1723,6 +1844,18 @@ fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
     let mut binary = OwnedBinary::new(bytes.len()).ok_or(Error::BadArg)?;
     binary.as_mut_slice().copy_from_slice(bytes);
     Ok(binary.release(env).encode(env))
+}
+
+fn raw_key_has_prefix(key: &ffi::MDB_val, prefix: &[u8]) -> bool {
+    prefix.is_empty()
+        || key.mv_size >= prefix.len()
+        && unsafe { slice::from_raw_parts(key.mv_data as *const u8, prefix.len()) == prefix }
+}
+
+fn row_bytes_size(total_size: usize, key_size: usize, value_size: usize) -> Option<usize> {
+    total_size
+        .checked_add(key_size)
+        .and_then(|size| size.checked_add(value_size))
 }
 
 fn send_background_flush_if_worker_present(db_handle: &LmdbDatabase) {

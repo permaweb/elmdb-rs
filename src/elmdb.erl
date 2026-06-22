@@ -268,7 +268,10 @@ list(_DBInstance, _Key) ->
 %% @returns {ok, Entries} where Entries is [{FullKey, Value}], or not_found.
 -spec read_prefix(DBInstance :: term(), Key :: binary()) ->
     {ok, [{binary(), binary()}]} | not_found.
-read_prefix(_DBInstance, _Key) ->
+read_prefix(DBInstance, Key) ->
+    read_prefix_rows(DBInstance, Key).
+
+read_prefix_rows(_DBInstance, _Key) ->
     erlang:nif_error(nif_not_loaded).
 
 %%%===================================================================
