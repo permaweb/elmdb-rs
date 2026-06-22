@@ -1187,6 +1187,25 @@ put_batch_oversized_key_test_() ->
          ]
      end}.
 
+put_batch_direct_flushes_overlay_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     ok = elmdb:put(DB, <<"queued">>, <<"old">>),
+                     ok = elmdb:put_batch_direct(DB, [
+                         {<<"queued">>, <<"new">>},
+                         {<<"queued/child">>, <<"child">>}
+                     ]),
+                     ?assertEqual(0, elmdb:overlay_count(DB)),
+                     ?assertEqual({ok, <<"new">>}, elmdb:get(DB, <<"queued">>)),
+                     ?assertEqual({ok, <<"child">>}, elmdb:get(DB, <<"queued/child">>))
+                 end)
+         ]
+     end}.
+
 concurrent_ops_no_hang_test_() ->
     {timeout, 15,
      ?_test(begin

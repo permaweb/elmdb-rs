@@ -1306,6 +1306,105 @@ fn put_batch<'a>(
     Ok(atoms::ok().encode(env))
 }
 
+#[rustler::nif(schedule = "DirtyIo")]
+fn put_batch_direct<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>,
+    key_value_pairs: Vec<(Binary, Binary)>,
+) -> NifResult<Term<'a>> {
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+    ensure_worker(&db_handle);
+
+    if key_value_pairs.is_empty() {
+        return Ok(atoms::ok().encode(env));
+    }
+
+    if db_handle.has_fatal_error.load(Ordering::Acquire) {
+        if let Ok(guard) = db_handle.fatal_error.lock() {
+            if let Some(ref err) = *guard {
+                return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
+            }
+        }
+    }
+
+    for (key, _value) in key_value_pairs.iter() {
+        let klen = key.as_slice().len();
+        if klen == 0 {
+            return Ok((atoms::error(), atoms::validation_error(), "Empty key in batch".to_string()).encode(env));
+        }
+        if klen > LMDB_DEFAULT_MAX_KEY_SIZE {
+            return Ok((atoms::error(), atoms::validation_error(), format!("Key size {klen} exceeds limit {LMDB_DEFAULT_MAX_KEY_SIZE}")).encode(env));
+        }
+    }
+
+    let active_empty = db_handle.active.load().is_empty();
+    let draining_empty = db_handle.draining.load().is_none();
+    if !active_empty || !draining_empty {
+        if let Err(error_msg) = flush_sync(&db_handle) {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    }
+
+    let (live_env, live_db) = match db_handle.fast_get_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
+    let mut txn = match live_env.begin_rw_txn() {
+        Ok(txn) => txn,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::transaction_error(),
+                "Failed to begin write transaction".to_string(),
+            )
+                .encode(env));
+        }
+    };
+
+    let mut cursor = match txn.open_rw_cursor(live_db) {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to open write cursor".to_string(),
+            )
+                .encode(env));
+        }
+    };
+
+    for (key, value) in key_value_pairs.iter() {
+        if let Err(lmdb_err) = cursor.put(
+            &key.as_slice(),
+            &value.as_slice(),
+            WriteFlags::empty(),
+        ) {
+            return Ok((
+                atoms::error(),
+                lmdb_error_to_atom(lmdb_err),
+                format!("Failed to put batch value: {:?}", lmdb_err),
+            )
+                .encode(env));
+        }
+    }
+    drop(cursor);
+
+    match txn.commit() {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(lmdb_err) => Ok((
+            atoms::error(),
+            lmdb_error_to_atom(lmdb_err),
+            format!("Failed to commit batch transaction: {:?}", lmdb_err),
+        )
+            .encode(env)),
+    }
+}
+
 ///===================================================================
 /// Iterator Operations
 ///===================================================================

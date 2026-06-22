@@ -15,7 +15,7 @@
 -export([db_open/2, db_close/1]).
 
 %% Key-value operations
--export([put/3, put_batch/2, get/2, flush/1]).
+-export([put/3, put_batch/2, put_batch_direct/2, get/2, flush/1]).
 
 %% Diagnostics
 -export([overlay_count/1]).
@@ -167,6 +167,14 @@ put(_DBInstance, _Key, _Value) ->
 -spec put_batch(DBInstance :: term(), KeyValuePairs :: [{binary(), binary()}]) -> 
     ok | {ok, integer(), list()} | {error, term(), binary()}.
 put_batch(_DBInstance, _KeyValuePairs) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Write multiple key-value pairs directly to LMDB in one transaction.
+%%      The buffered overlay is flushed first so older queued writes cannot
+%%      later overwrite this batch.
+-spec put_batch_direct(DBInstance :: term(), KeyValuePairs :: [{binary(), binary()}]) ->
+    ok | {error, term(), binary()}.
+put_batch_direct(_DBInstance, _KeyValuePairs) ->
     erlang:nif_error(nif_not_loaded).
  
 %% @doc Read a value by key from the database
