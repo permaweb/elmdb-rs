@@ -419,14 +419,29 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
         }
     };
 
-    let mut write_err = None;
+    let mut entries = Vec::with_capacity(old_map.len());
     (*old_map).iter_sync(|k, v| {
-        if let Err(e) = txn.put(live_db, k, v, WriteFlags::empty()) {
-            write_err = Some(format!("Failed to put value: {:?}", e));
-            return false;
-        }
+        entries.push((k.clone(), v.clone()));
         true
     });
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut cursor = match txn.open_rw_cursor(live_db) {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            restore_failed_flush(db, old_map);
+            return Err("Failed to open write cursor".to_string());
+        }
+    };
+
+    let mut write_err = None;
+    for (k, v) in entries.iter() {
+        if let Err(e) = cursor.put(&k.as_slice(), &v.as_slice(), WriteFlags::empty()) {
+            write_err = Some(format!("Failed to put value: {:?}", e));
+            break;
+        }
+    }
+    drop(cursor);
 
     if let Some(e) = write_err {
         drop(txn);
