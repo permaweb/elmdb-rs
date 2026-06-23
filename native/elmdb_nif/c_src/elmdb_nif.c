@@ -1340,55 +1340,60 @@ static ERL_NIF_TERM read_prefix_rows_nif(ErlNifEnv *env, int argc, const ERL_NIF
 
     if (rc == MDB_SUCCESS && count > 0) {
         ErlNifBinary packed;
-        RowRef *rows = enif_alloc(sizeof(RowRef) * count);
-        if (rows == NULL || !enif_alloc_binary(total, &packed)) {
-            if (rows != NULL) {
-                enif_free(rows);
-            }
+        if (count > SIZE_MAX / sizeof(RowRef)) {
             rc = ENOMEM;
         } else {
-            key.mv_size = prefix.size;
-            key.mv_data = prefix.data;
-            value.mv_size = 0;
-            value.mv_data = NULL;
-            rc = prefix.size == 0
-                ? mdb_cursor_get(cursor, &key, &value, MDB_FIRST)
-                : mdb_cursor_get(cursor, &key, &value, MDB_SET_RANGE);
-            size_t offset = 0;
-            size_t row = 0;
-            while (rc == MDB_SUCCESS && row < count &&
-                   key_has_prefix(&key, prefix.data, prefix.size)) {
-                rows[row].key_offset = offset;
-                rows[row].key_len = key.mv_size;
-                memcpy(packed.data + offset, key.mv_data, key.mv_size);
-                offset += key.mv_size;
-                rows[row].value_offset = offset;
-                rows[row].value_len = value.mv_size;
-                memcpy(packed.data + offset, value.mv_data, value.mv_size);
-                offset += value.mv_size;
-                row++;
-                rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
-            }
-            if (rc == MDB_NOTFOUND) {
-                rc = MDB_SUCCESS;
-            }
-            if (rc == MDB_SUCCESS) {
-                ERL_NIF_TERM parent = enif_make_binary(env, &packed);
-                ERL_NIF_TERM list = enif_make_list(env, 0);
-                for (size_t i = count; i > 0; i--) {
-                    ERL_NIF_TERM k = enif_make_sub_binary(
-                        env, parent, rows[i - 1].key_offset, rows[i - 1].key_len);
-                    ERL_NIF_TERM v = enif_make_sub_binary(
-                        env, parent, rows[i - 1].value_offset, rows[i - 1].value_len);
-                    list = enif_make_list_cell(env, enif_make_tuple2(env, k, v), list);
+            RowRef *rows = enif_alloc(sizeof(RowRef) * count);
+            if (rows == NULL || !enif_alloc_binary(total, &packed)) {
+                if (rows != NULL) {
+                    enif_free(rows);
                 }
-                result = enif_make_tuple2(env, ATOM_OK, list);
+                rc = ENOMEM;
             } else {
-                enif_release_binary(&packed);
+                key.mv_size = prefix.size;
+                key.mv_data = prefix.data;
+                value.mv_size = 0;
+                value.mv_data = NULL;
+                rc = prefix.size == 0
+                    ? mdb_cursor_get(cursor, &key, &value, MDB_FIRST)
+                    : mdb_cursor_get(cursor, &key, &value, MDB_SET_RANGE);
+                size_t offset = 0;
+                size_t row = 0;
+                while (rc == MDB_SUCCESS && row < count &&
+                       key_has_prefix(&key, prefix.data, prefix.size)) {
+                    rows[row].key_offset = offset;
+                    rows[row].key_len = key.mv_size;
+                    memcpy(packed.data + offset, key.mv_data, key.mv_size);
+                    offset += key.mv_size;
+                    rows[row].value_offset = offset;
+                    rows[row].value_len = value.mv_size;
+                    memcpy(packed.data + offset, value.mv_data, value.mv_size);
+                    offset += value.mv_size;
+                    row++;
+                    rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
+                }
+                if (rc == MDB_NOTFOUND) {
+                    rc = MDB_SUCCESS;
+                }
+                if (rc == MDB_SUCCESS) {
+                    ERL_NIF_TERM parent = enif_make_binary(env, &packed);
+                    ERL_NIF_TERM list = enif_make_list(env, 0);
+                    for (size_t i = count; i > 0; i--) {
+                        ERL_NIF_TERM k = enif_make_sub_binary(
+                            env, parent, rows[i - 1].key_offset, rows[i - 1].key_len);
+                        ERL_NIF_TERM v = enif_make_sub_binary(
+                            env, parent, rows[i - 1].value_offset, rows[i - 1].value_len);
+                        list = enif_make_list_cell(env, enif_make_tuple2(env, k, v), list);
+                    }
+                    result = enif_make_tuple2(env, ATOM_OK, list);
+                } else {
+                    enif_release_binary(&packed);
+                }
+                enif_free(rows);
             }
-            enif_free(rows);
         }
-    } else if (rc != MDB_SUCCESS) {
+    }
+    if (rc != MDB_SUCCESS) {
         result = error3_rc(env, ATOM_DATABASE_ERROR, "Failed to read prefix", rc);
     }
 
