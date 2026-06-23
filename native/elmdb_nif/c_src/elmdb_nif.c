@@ -258,17 +258,6 @@ static int write_op_compare(const void *left, const void *right) {
     return a->seq < b->seq ? -1 : (a->seq > b->seq ? 1 : 0);
 }
 
-static int bytes_compare(const void *left, const void *right) {
-    const Bytes *a = (const Bytes *)left;
-    const Bytes *b = (const Bytes *)right;
-    size_t min = a->len < b->len ? a->len : b->len;
-    int cmp = min == 0 ? 0 : memcmp(a->bytes, b->bytes, min);
-    if (cmp != 0) {
-        return cmp;
-    }
-    return a->len < b->len ? -1 : (a->len > b->len ? 1 : 0);
-}
-
 static ERL_NIF_TERM lmdb_error_atom(int rc) {
     switch (rc) {
     case MDB_KEYEXIST: return ATOM_KEY_EXIST;
@@ -1237,15 +1226,11 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
                 len++;
             }
             if (len != 0) {
-                int exists = 0;
-                for (size_t i = 0; i < child_count; i++) {
-                    if (children[i].len == len &&
-                        memcmp(children[i].bytes, remaining, len) == 0) {
-                        exists = 1;
-                        break;
-                    }
-                }
-                if (!exists) {
+                int is_new =
+                    child_count == 0 ||
+                    children[child_count - 1].len != len ||
+                    memcmp(children[child_count - 1].bytes, remaining, len) != 0;
+                if (is_new) {
                     if (child_count == child_cap) {
                         size_t next = child_cap == 0 ? 16 : child_cap * 2;
                         if (next < child_cap || next > SIZE_MAX / sizeof(Bytes)) {
@@ -1278,7 +1263,6 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         rc = MDB_SUCCESS;
     }
     if (rc == MDB_SUCCESS && child_count > 0) {
-        qsort(children, child_count, sizeof(Bytes), bytes_compare);
         ERL_NIF_TERM list = enif_make_list(env, 0);
         for (size_t i = child_count; i > 0; i--) {
             ERL_NIF_TERM child = binary_from_bytes(env, children[i - 1].bytes, children[i - 1].len);
