@@ -3,7 +3,7 @@
 %%% LMDB NIF bindings for Erlang
 %%% 
 %%% This module provides Erlang bindings for LMDB (Lightning Memory-Mapped Database)
-%%% through a Rust NIF implementation.
+%%% through a C NIF implementation.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(elmdb).

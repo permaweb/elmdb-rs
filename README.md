@@ -1,15 +1,15 @@
 # elmdb-rs
 
-A high-performance Erlang NIF (Native Implemented Function) for LMDB (Lightning Memory-Mapped Database) written in Rust.
+A high-performance Erlang NIF (Native Implemented Function) for LMDB (Lightning Memory-Mapped Database) written in C.
 
 ## Overview
 
-elmdb-rs provides fast, embedded key-value storage for Erlang and Elixir applications through LMDB - one of the fastest embedded databases available. By implementing the NIF in Rust, we achieve excellent performance while maintaining memory safety and crash resistance.
+elmdb-rs provides fast, embedded key-value storage for Erlang and Elixir applications through LMDB - one of the fastest embedded databases available.
 
 ### Key Features
 
-- **High Performance**: Direct LMDB access through Rust with minimal overhead
-- **Memory Safe**: Rust's ownership system prevents memory leaks and crashes
+- **High Performance**: Direct LMDB access with minimal NIF overhead
+- **Simple Build**: Vendored LMDB C source builds through Rebar3
 - **ACID Transactions**: Full transaction support with automatic rollback on errors
 - **Hierarchical Keys**: Efficient prefix-based operations for tree-like data structures
 - **Pattern Matching**: Advanced querying with multi-field pattern matching across hierarchical data
@@ -25,7 +25,7 @@ See the [Developer Setup](#developer-setup) section for detailed prerequisites a
 
 **Quick Requirements:**
 - Erlang/OTP 24+ (tested with OTP 24, 25, 26, 27)
-- Rust 1.70+ with Cargo
+- C compiler
 - Git
 
 ### From Source
@@ -47,26 +47,6 @@ Add to your `rebar.config`:
     {elmdb, {git, "<repository-url>", {branch, "main"}}}
 ]}.
 
-%% Required: Add rebar3_cargo plugin for Rust NIF compilation
-{plugins, [
-    {rebar3_cargo, "0.1.1"}
-]}.
-
-%% Required: Configure Cargo integration
-{provider_hooks, [
-    {pre, [
-        {compile, {cargo, build}}
-    ]},
-    {post, [
-        {clean, {cargo, clean}}
-    ]}
-]}.
-
-%% Optional: Cargo build configuration
-{cargo_opts, [
-    {src_dir, "native/elmdb_nif"},
-    {cargo_args, ["--release"]}
-]}.
 ```
 
 #### Complete Project Setup Example
@@ -86,24 +66,6 @@ cat > rebar.config << 'EOF'
     {elmdb, {git, "<repository-url>", {branch, "main"}}}
 ]}.
 
-{plugins, [
-    {rebar3_cargo, "0.1.1"}
-]}.
-
-{provider_hooks, [
-    {pre, [
-        {compile, {cargo, build}}
-    ]},
-    {post, [
-        {clean, {cargo, clean}}
-    ]}
-]}.
-
-{cargo_opts, [
-    {src_dir, "native/elmdb_nif"},
-    {cargo_args, ["--release"]}
-]}.
-
 {shell, [
     {apps, [my_project]}
 ]}.
@@ -116,26 +78,10 @@ rebar3 compile
 rebar3 shell
 ```
 
-#### Configuration Options for rebar.config
+#### Build Configuration
 
-```erlang
-%% Performance-optimized cargo build (recommended for production)
-{cargo_opts, [
-    {src_dir, "deps/elmdb/native/elmdb_nif"},
-    {cargo_args, ["--release", "--target-cpu=native"]}
-]}.
-
-%% Development build (faster compilation, debug symbols)
-{cargo_opts, [
-    {src_dir, "deps/elmdb/native/elmdb_nif"},
-    {cargo_args, ["--profile", "dev"]}
-]}.
-
-%% Cross-compilation example
-{cargo_opts, [
-    {src_dir, "deps/elmdb/native/elmdb_nif"},
-    {cargo_args, ["--release", "--target", "x86_64-unknown-linux-gnu"]}
-]}.
+```bash
+CC=clang CFLAGS="-O3 -std=c11 -fPIC" rebar3 compile
 ```
 
 ### Using Mix (Elixir)
@@ -161,8 +107,7 @@ This section provides comprehensive instructions for setting up a development en
 | Software | Minimum Version | Recommended | Installation Check |
 |----------|----------------|-------------|-------------------|
 | Erlang/OTP | 24.0 | 27.0+ | `erl -eval 'erlang:display(erlang:system_info(otp_release)), halt().' -noshell` |
-| Rust | 1.70.0 | 1.75+ | `rustc --version` |
-| Cargo | (with Rust) | Latest | `cargo --version` |
+| C compiler | C11 | clang/gcc | `cc --version` |
 | Git | 2.20+ | Latest | `git --version` |
 | Make | 3.81+ | 4.0+ | `make --version` |
 | Rebar3 | 3.18+ | 3.22+ | `rebar3 version` |
@@ -175,7 +120,7 @@ This section provides comprehensive instructions for setting up a development en
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
 # Install development tools
-brew install erlang rust git make rebar3
+brew install erlang git make rebar3
 
 # Optional: Install additional tools
 brew install watchman  # For auto-recompilation
@@ -196,10 +141,6 @@ sudo dpkg -i erlang-solutions_2.0_all.deb
 sudo apt-get update
 sudo apt-get install -y erlang erlang-dev
 
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
 # Install rebar3
 wget https://s3.amazonaws.com/rebar3/rebar3 -O /tmp/rebar3
 chmod +x /tmp/rebar3
@@ -217,9 +158,9 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
 
 # Install development tools
-choco install erlang rust git make
+choco install erlang git make
 
-# Install Visual Studio Build Tools (required for Rust)
+# Install Visual Studio Build Tools (required for C)
 choco install visualstudio2022buildtools
 
 # Download and install rebar3
@@ -240,8 +181,6 @@ cd elmdb-rs
 cp scripts/pre-commit .git/hooks/
 chmod +x .git/hooks/pre-commit
 
-# Verify environment
-make check-env  # If available, or manually check versions
 ```
 
 #### 2. Environment Variables
@@ -252,11 +191,9 @@ Add these to your shell configuration (`~/.bashrc`, `~/.zshrc`, etc.):
 # elmdb-rs Development Environment Variables
 export ELMDB_DEV_MODE=true
 export ELMDB_TEST_DIR="/tmp/elmdb_test"
-export RUST_BACKTRACE=1  # Enable Rust backtraces
 export ERL_AFLAGS="-kernel shell_history enabled"  # Enable Erlang shell history
 
 # Optional: Performance tuning
-export CARGO_BUILD_JOBS=4  # Adjust based on CPU cores
 export MAKEFLAGS="-j4"     # Parallel make builds
 
 # Optional: Development paths
@@ -269,11 +206,10 @@ export ELMDB_LOG_LEVEL=debug
 elmdb-rs/
 ├── src/                 # Erlang source files
 │   └── elmdb.erl       # Main Erlang module
-├── native/             # Rust NIF implementation
+├── native/             # C NIF implementation
 │   └── elmdb_nif/
-│       ├── src/
-│       │   └── lib.rs  # Rust NIF implementation
-│       └── Cargo.toml  # Rust dependencies
+│       ├── build_c_nif.sh
+│       └── c_src/
 ├── test/               # Test suites
 │   ├── elmdb_test.erl
 │   └── elmdb_benchmark.erl
@@ -291,30 +227,20 @@ elmdb-rs/
 1. **Install Extensions:**
 ```bash
 code --install-extension erlang-ls.erlang-ls
-code --install-extension rust-lang.rust-analyzer
 code --install-extension pgourlain.erlang
-code --install-extension tamasfe.even-better-toml
 ```
 
 2. **Workspace Settings** (`.vscode/settings.json`):
 ```json
 {
-  "rust-analyzer.cargo.buildScripts.enable": true,
-  "rust-analyzer.procMacro.enable": true,
-  "rust-analyzer.checkOnSave.command": "clippy",
   "erlangLS.erlangPath": "/usr/local/bin",
   "editor.formatOnSave": true,
   "[erlang]": {
     "editor.tabSize": 4,
     "editor.insertSpaces": true
   },
-  "[rust]": {
-    "editor.tabSize": 4,
-    "editor.insertSpaces": true
-  },
   "files.watcherExclude": {
     "**/_build": true,
-    "**/target": true,
     "**/priv/*.so": true
   }
 }
@@ -333,40 +259,22 @@ code --install-extension tamasfe.even-better-toml
       "cookie": "elmdb-dev",
       "cwd": "${workspaceRoot}",
       "preLaunchTask": "compile"
-    },
-    {
-      "type": "lldb",
-      "request": "launch",
-      "name": "Debug Rust NIF",
-      "cargo": {
-        "args": ["build", "--package=elmdb_nif"],
-        "filter": {
-          "name": "elmdb_nif",
-          "kind": "cdylib"
-        }
-      },
-      "cwd": "${workspaceFolder}/native/elmdb_nif"
     }
   ]
 }
 ```
 
-#### IntelliJ IDEA / RustRover
+#### IntelliJ IDEA
 
 1. **Install Plugins:**
    - Erlang Plugin
-   - Rust Plugin (or use RustRover)
-   - TOML Plugin
 
 2. **Project Configuration:**
    - Mark `src` as Sources Root
-   - Mark `native/elmdb_nif/src` as Sources Root
    - Mark `_build` as Excluded
-   - Mark `target` as Excluded
 
 3. **Run Configurations:**
    - Erlang Application: Set module to `elmdb`
-   - Cargo Command: Set to `build --release`
 
 #### Emacs
 
@@ -379,7 +287,6 @@ code --install-extension tamasfe.even-better-toml
 
 ;; Install required packages
 (package-install 'erlang)
-(package-install 'rust-mode)
 (package-install 'lsp-mode)
 (package-install 'company)
 ```
@@ -391,16 +298,11 @@ code --install-extension tamasfe.even-better-toml
 (add-to-list 'exec-path "/usr/local/lib/erlang/bin")
 (require 'erlang-start)
 
-;; Rust configuration
-(require 'rust-mode)
-(setq rust-format-on-save t)
-(add-hook 'rust-mode-hook #'lsp)
-
 ;; Project-specific settings
 (dir-locals-set-class-variables
  'elmdb-project
  '((erlang-mode . ((erlang-indent-level . 4)))
-   (rust-mode . ((rust-indent-offset . 4)))))
+   (c-mode . ((c-basic-offset . 4)))))
 ```
 
 #### Vim/Neovim
@@ -412,7 +314,6 @@ call plug#begin()
 Plug 'vim-erlang/vim-erlang-runtime'
 Plug 'vim-erlang/vim-erlang-compiler'
 Plug 'vim-erlang/vim-erlang-omnicomplete'
-Plug 'rust-lang/rust.vim'
 Plug 'neoclide/coc.nvim', {'branch': 'release'}
 call plug#end()
 ```
@@ -423,16 +324,12 @@ call plug#end()
 let g:erlang_folding = 1
 let erlang_show_errors = 1
 
-" Rust settings
-let g:rustfmt_autosave = 1
-let g:rust_clip_command = 'xclip -selection clipboard'
-
 " Project-specific settings
 autocmd FileType erlang setlocal shiftwidth=4 tabstop=4 expandtab
-autocmd FileType rust setlocal shiftwidth=4 tabstop=4 expandtab
+autocmd FileType c setlocal shiftwidth=4 tabstop=4 expandtab
 
 " CoC configuration for language servers
-let g:coc_global_extensions = ['coc-rust-analyzer', 'coc-erlang_ls']
+let g:coc_global_extensions = ['coc-erlang_ls']
 ```
 
 ### Git Workflow
@@ -494,24 +391,15 @@ Closes #123"
 
 ```bash
 # Full build (recommended)
-make                    # Compile everything (Rust NIF + Erlang)
+make                    # Compile everything (C NIF + Erlang)
 make clean             # Clean Erlang artifacts
 make distclean         # Clean all artifacts
 
-# Targeted builds
-make rust              # Build only Rust NIF
-make erlang            # Build only Erlang code
 make test              # Run all tests
 make benchmark         # Run performance benchmarks
 
-# Development build with debug symbols
-PROFILE=dev make
-
-# Release build with optimizations
-PROFILE=release make
-
 # Platform-optimized build
-RUSTFLAGS="-C target-cpu=native" make
+CFLAGS="-O3 -std=c11 -fPIC -march=native" make
 ```
 
 #### Shell Aliases (add to ~/.bashrc or ~/.zshrc)
@@ -521,7 +409,7 @@ RUSTFLAGS="-C target-cpu=native" make
 alias emake='make clean && make'
 alias etest='rebar3 eunit'
 alias eshell='rebar3 shell'
-alias ewatch='watchman-make -p "src/**/*.erl" "native/**/*.rs" --run make'
+alias ewatch='watchman-make -p "src/**/*.erl" "native/**/*.c" "native/**/*.h" --run make'
 alias edebug='erl -pa _build/default/lib/*/ebin -config config/debug'
 
 # Quick compile and test
@@ -547,12 +435,12 @@ sudo apt-get install watchman  # Linux
 # Create watchman configuration
 cat > .watchmanconfig << EOF
 {
-  "ignore_dirs": ["_build", "target", ".git"]
+  "ignore_dirs": ["_build", ".git"]
 }
 EOF
 
 # Start watching
-watchman-make -p 'src/**/*.erl' 'native/**/*.rs' --run 'make'
+watchman-make -p 'src/**/*.erl' 'native/**/*.c' 'native/**/*.h' --run 'make'
 ```
 
 **Using entr:**
@@ -622,30 +510,23 @@ dbg:stop().
 redbug:start("elmdb:get->return").
 ```
 
-#### Rust Debugging
+#### C NIF Debugging
 
 1. **Enable Debug Symbols:**
-```toml
-# In native/elmdb_nif/Cargo.toml
-[profile.dev]
-debug = true
-opt-level = 0
-
-[profile.release]
-debug = true  # Keep debug symbols even in release
+```bash
+CFLAGS="-O0 -g -std=c11 -fPIC" rebar3 compile
 ```
 
 2. **Using GDB:**
 ```bash
 # Compile with debug symbols
-cd native/elmdb_nif
-cargo build
+CFLAGS="-O0 -g -std=c11 -fPIC" rebar3 compile
 
 # Start Erlang with GDB
 gdb --args erl -pa _build/default/lib/*/ebin
 
 # In GDB
-(gdb) break elmdb_nif::put
+(gdb) break put_nif
 (gdb) run
 (gdb) bt  # Backtrace when breakpoint hit
 ```
@@ -656,58 +537,12 @@ gdb --args erl -pa _build/default/lib/*/ebin
 lldb -- erl -pa _build/default/lib/*/ebin
 
 # In LLDB
-(lldb) b elmdb_nif::put
+(lldb) b put_nif
 (lldb) run
 (lldb) bt  # Backtrace
 ```
 
-4. **Print Debugging in Rust:**
-```rust
-// In native/elmdb_nif/src/lib.rs
-use std::eprintln;
-
-#[rustler::nif]
-fn put(env_ref: EnvRef, key: Binary, value: Binary) -> Atom {
-    eprintln!("DEBUG: put called with key len: {}", key.len());
-    // ... rest of implementation
-}
-```
-
-5. **Using Rust Analyzer:**
-```bash
-# Generate rust-analyzer configuration
-cd native/elmdb_nif
-rust-analyzer diagnostics .
-```
-
 ### Code Quality Tools
-
-#### Rust Formatting and Linting
-
-1. **Setup rustfmt:**
-```toml
-# Create native/elmdb_nif/.rustfmt.toml
-edition = "2021"
-max_width = 100
-use_small_heuristics = "Max"
-imports_granularity = "Crate"
-group_imports = "StdExternalCrate"
-```
-
-2. **Run formatting:**
-```bash
-cd native/elmdb_nif
-cargo fmt        # Format code
-cargo fmt --check  # Check formatting without changes
-```
-
-3. **Setup clippy:**
-```bash
-# Run clippy
-cd native/elmdb_nif
-cargo clippy -- -D warnings  # Treat warnings as errors
-cargo clippy --fix  # Auto-fix issues
-```
 
 #### Erlang Formatting and Linting
 
@@ -748,27 +583,10 @@ set -e
 
 echo "Running pre-commit checks..."
 
-# Check Rust formatting
-echo "Checking Rust formatting..."
-cd native/elmdb_nif
-cargo fmt --check || {
-    echo "Rust code needs formatting. Run 'cargo fmt'"
-    exit 1
-}
-
-# Run Clippy
-echo "Running Clippy..."
-cargo clippy -- -D warnings || {
-    echo "Clippy found issues"
-    exit 1
-}
-
-cd ../..
-
-# Check Erlang
-echo "Checking Erlang..."
+# Check build
+echo "Checking build..."
 rebar3 compile || {
-    echo "Erlang compilation failed"
+    echo "Compilation failed"
     exit 1
 }
 
@@ -805,7 +623,7 @@ make
 
 # 4. Start development shell with auto-recompilation
 # Terminal 1: Auto-compile
-watchman-make -p "src/**/*.erl" "native/**/*.rs" --run make
+watchman-make -p "src/**/*.erl" "native/**/*.c" "native/**/*.h" --run make
 
 # Terminal 2: Erlang shell
 rebar3 shell
@@ -818,8 +636,6 @@ rebar3 shell
 # - Run tests: rebar3 eunit
 
 # 6. Check code quality
-cargo fmt
-cargo clippy
 rebar3 lint
 rebar3 dialyzer
 
@@ -881,10 +697,9 @@ erl -pa _build/default/lib/*/ebin
 > fprof:profile().
 > fprof:analyse([totals, {dest, "profile.txt"}]).
 
-# Rust profiling (Linux)
-cd native/elmdb_nif
-cargo build --release
-perf record --call-graph=dwarf cargo test
+# C NIF profiling (Linux)
+rebar3 compile
+perf record --call-graph=dwarf rebar3 eunit
 perf report
 
 # 3. Make optimizations
@@ -908,18 +723,11 @@ Benchmark results:
 
 #### Common Build Issues
 
-**Issue: Rust compilation fails**
+**Issue: C NIF compilation fails**
 ```bash
-# Solution 1: Clear Rust cache
-cd native/elmdb_nif
-cargo clean
-cargo build
-
-# Solution 2: Update Rust
-rustup update
-
-# Solution 3: Check for conflicting versions
-cargo tree | grep -i conflict
+# Rebuild the generated NIF
+rebar3 clean
+rebar3 compile
 ```
 
 **Issue: NIF fails to load**
@@ -939,15 +747,9 @@ otool -L priv/libelmdb_nif.dylib  # macOS
 V=1 make
 ```
 
-**Issue: Rebar3 plugin errors**
+**Issue: Rebar3 build errors**
 ```bash
-# Clear rebar3 cache
-rm -rf ~/.cache/rebar3
-
-# Update plugins
-rebar3 plugins upgrade rebar3_cargo
-
-# Check plugin configuration
+# Check build configuration
 rebar3 report
 ```
 
@@ -984,23 +786,11 @@ ulimit -c unlimited
 # Run with Valgrind (Linux)
 valgrind --leak-check=full --track-origins=yes erl -pa _build/default/lib/*/ebin
 
-# Use AddressSanitizer (Rust)
-cd native/elmdb_nif
-RUSTFLAGS="-Z sanitizer=address" cargo +nightly build
+# Use AddressSanitizer with a compatible C toolchain
+CFLAGS="-O1 -g -fsanitize=address -fno-omit-frame-pointer -std=c11 -fPIC" rebar3 compile
 ```
 
 #### IDE-Specific Issues
-
-**VS Code: Rust analyzer not working**
-```bash
-# Regenerate project metadata
-cd native/elmdb_nif
-cargo clean
-cargo check
-
-# Restart rust-analyzer
-# Cmd+Shift+P -> "Rust Analyzer: Restart Server"
-```
 
 **IntelliJ: Erlang modules not recognized**
 ```bash
@@ -1014,8 +804,6 @@ cargo check
 ### Additional Resources
 
 - [Erlang Documentation](https://www.erlang.org/docs)
-- [Rust Book](https://doc.rust-lang.org/book/)
-- [Rustler Documentation](https://github.com/rusterlium/rustler)
 - [LMDB Documentation](http://www.lmdb.tech/doc/)
 - [Rebar3 Documentation](https://rebar3.org/docs/)
 
@@ -1538,23 +1326,23 @@ On modern hardware (SSD, 8 cores):
 
 | Feature | elmdb-rs | Original elmdb |
 |---------|----------|----------------|
-| Implementation | ✅ Rust NIF | ⚠️ C NIF |
-| Memory Safety | ✅ Rust guarantees | ⚠️ Manual management |
+| Implementation | ✅ C NIF | ⚠️ C NIF |
+| Memory Safety | ⚠️ Manual management | ⚠️ Manual management |
 | Performance | ✅ Excellent | ✅ Excellent |
-| Build Complexity | ✅ Cargo handles deps | ❌ Manual LMDB setup |
+| Build Complexity | ✅ Vendored Rebar3 build | ❌ Manual LMDB setup |
 | Error Handling | ✅ Comprehensive | ⚠️ Basic |
 
 ## Architecture
 
 elmdb-rs uses a two-layer architecture:
 
-1. **Rust NIF Layer**: Handles LMDB operations, memory management, and error handling
+1. **C NIF Layer**: Handles LMDB operations, memory management, and error handling
 2. **Erlang Interface**: Provides idiomatic Erlang/Elixir API
 
 ### Thread Safety
 
 - **Environments**: Thread-safe, managed by global registry
-- **Databases**: Thread-safe through Rust's `Arc<>` and LMDB's internal locking
+- **Databases**: Thread-safe through NIF resources and LMDB's internal locking
 - **Transactions**: Automatically handled per operation
 
 ### Error Handling
