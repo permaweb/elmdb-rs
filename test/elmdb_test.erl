@@ -86,6 +86,11 @@ batch_operations_test_() ->
                      ok = elmdb:put(DB, <<"mixed/key">>, <<"from_put">>),
                      ok = elmdb:put_batch(DB, [{<<"mixed/key">>, <<"from_batch">>}]),
                      ?assertEqual({ok, <<"from_batch">>}, elmdb:get(DB, <<"mixed/key">>))
+                 end),
+          ?_test(begin
+                     BadBatch = [{<<"bad/key">>, <<"value">>} | <<"tail">>],
+                     ?assertMatch({error, validation_error, _}, elmdb:put_batch(DB, BadBatch)),
+                     ?assertMatch({error, validation_error, _}, elmdb:put_batch_direct(DB, BadBatch))
                  end)
          ]
      end}.

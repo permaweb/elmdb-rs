@@ -916,9 +916,17 @@ static int decode_batch(ErlNifEnv *env, ERL_NIF_TERM list, DbResource *db, Write
         index++;
     }
 
+    if (!enif_is_empty_list(env, tail)) {
+        for (size_t i = 0; i < index; i++) {
+            free_write_op(&ops[i]);
+        }
+        enif_free(ops);
+        return 0;
+    }
+
     *ops_out = ops;
     *count_out = index;
-    return enif_is_empty_list(env, tail);
+    return 1;
 }
 
 static int decode_batch_refs(ErlNifEnv *env, ERL_NIF_TERM list, WriteOp **ops_out, size_t *count_out) {
@@ -965,9 +973,14 @@ static int decode_batch_refs(ErlNifEnv *env, ERL_NIF_TERM list, WriteOp **ops_ou
         index++;
     }
 
+    if (!enif_is_empty_list(env, tail)) {
+        enif_free(ops);
+        return 0;
+    }
+
     *ops_out = ops;
     *count_out = index;
-    return enif_is_empty_list(env, tail);
+    return 1;
 }
 
 static ERL_NIF_TERM put_batch_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
@@ -1235,6 +1248,10 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
                 if (!exists) {
                     if (child_count == child_cap) {
                         size_t next = child_cap == 0 ? 16 : child_cap * 2;
+                        if (next < child_cap || next > SIZE_MAX / sizeof(Bytes)) {
+                            rc = ENOMEM;
+                            break;
+                        }
                         Bytes *grown = enif_realloc(children, sizeof(Bytes) * next);
                         if (grown == NULL) {
                             rc = ENOMEM;
