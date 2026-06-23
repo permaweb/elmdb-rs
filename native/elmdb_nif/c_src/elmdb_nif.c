@@ -457,7 +457,13 @@ static int reserve_ops(DbResource *db, size_t need) {
     }
     size_t next = db->op_cap == 0 ? 16 : db->op_cap;
     while (next < need) {
+        if (next > SIZE_MAX / 2) {
+            return 0;
+        }
         next *= 2;
+    }
+    if (next > SIZE_MAX / sizeof(WriteOp)) {
+        return 0;
     }
     WriteOp *ops = enif_realloc(db->ops, next * sizeof(WriteOp));
     if (ops == NULL) {
@@ -869,6 +875,9 @@ static int decode_batch(ErlNifEnv *env, ERL_NIF_TERM list, DbResource *db, Write
         *count_out = 0;
         return 1;
     }
+    if ((size_t)len > SIZE_MAX / sizeof(WriteOp)) {
+        return 0;
+    }
 
     WriteOp *ops = enif_alloc(sizeof(WriteOp) * len);
     if (ops == NULL) {
@@ -904,6 +913,55 @@ static int decode_batch(ErlNifEnv *env, ERL_NIF_TERM list, DbResource *db, Write
             enif_free(ops);
             return 0;
         }
+        index++;
+    }
+
+    *ops_out = ops;
+    *count_out = index;
+    return enif_is_empty_list(env, tail);
+}
+
+static int decode_batch_refs(ErlNifEnv *env, ERL_NIF_TERM list, WriteOp **ops_out, size_t *count_out) {
+    unsigned int len = 0;
+    if (!enif_get_list_length(env, list, &len)) {
+        return 0;
+    }
+    if (len == 0) {
+        *ops_out = NULL;
+        *count_out = 0;
+        return 1;
+    }
+    if ((size_t)len > SIZE_MAX / sizeof(WriteOp)) {
+        return 0;
+    }
+
+    WriteOp *ops = enif_alloc(sizeof(WriteOp) * len);
+    if (ops == NULL) {
+        return 0;
+    }
+    memset(ops, 0, sizeof(WriteOp) * len);
+
+    ERL_NIF_TERM head;
+    ERL_NIF_TERM tail = list;
+    size_t index = 0;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        const ERL_NIF_TERM *tuple;
+        int arity;
+        ErlNifBinary key;
+        ErlNifBinary value;
+        if (!enif_get_tuple(env, head, &arity, &tuple) || arity != 2 ||
+            !enif_inspect_binary(env, tuple[0], &key) ||
+            !enif_inspect_binary(env, tuple[1], &value) ||
+            key.size == 0 || key.size > MAX_KEY_SIZE) {
+            enif_free(ops);
+            return 0;
+        }
+        /* Safe only for immediate writes: inspected binaries live until return. */
+        ops[index].key = key.data;
+        ops[index].key_len = key.size;
+        ops[index].value = value.data;
+        ops[index].value_len = value.size;
+        ops[index].seq = index;
         index++;
     }
 
@@ -959,22 +1017,17 @@ static ERL_NIF_TERM put_batch_direct_nif(ErlNifEnv *env, int argc, const ERL_NIF
     }
 
     int rc = MDB_SUCCESS;
-    enif_mutex_lock(db->mutex);
-    int ok = flush_locked(db, &rc);
     WriteOp *ops = NULL;
     size_t op_count = 0;
-    if (ok) {
-        ok = decode_batch(env, argv[1], db, &ops, &op_count);
-    }
+    int ok = decode_batch_refs(env, argv[1], &ops, &op_count);
+    enif_mutex_lock(db->mutex);
+    ok = ok && flush_locked(db, &rc);
     if (ok) {
         ok = write_immediate_locked(db, ops, op_count, &rc);
     }
     enif_mutex_unlock(db->mutex);
 
     if (ops != NULL) {
-        for (size_t i = 0; i < op_count; i++) {
-            free_write_op(&ops[i]);
-        }
         enif_free(ops);
     }
     if (!ok) {
