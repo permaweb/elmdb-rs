@@ -75,6 +75,13 @@ typedef struct {
 } Bytes;
 
 typedef struct {
+    size_t key_offset;
+    size_t key_len;
+    size_t value_offset;
+    size_t value_len;
+} RowRef;
+
+typedef struct {
     const unsigned char *src;
     size_t len;
     size_t offset;
@@ -853,6 +860,207 @@ static ERL_NIF_TERM put_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return ATOM_OK;
 }
 
+static int decode_batch(ErlNifEnv *env, ERL_NIF_TERM list, DbResource *db, WriteOp **ops_out, size_t *count_out) {
+    unsigned int len = 0;
+    if (!enif_get_list_length(env, list, &len)) {
+        return 0;
+    }
+    if (len == 0) {
+        *ops_out = NULL;
+        *count_out = 0;
+        return 1;
+    }
+    if ((size_t)len > SIZE_MAX / sizeof(WriteOp)) {
+        return 0;
+    }
+
+    WriteOp *ops = enif_alloc(sizeof(WriteOp) * len);
+    if (ops == NULL) {
+        return 0;
+    }
+    memset(ops, 0, sizeof(WriteOp) * len);
+
+    ERL_NIF_TERM head;
+    ERL_NIF_TERM tail = list;
+    size_t index = 0;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        const ERL_NIF_TERM *tuple;
+        int arity;
+        ErlNifBinary key;
+        ErlNifBinary value;
+        if (!enif_get_tuple(env, head, &arity, &tuple) || arity != 2 ||
+            !enif_inspect_binary(env, tuple[0], &key) ||
+            !enif_inspect_binary(env, tuple[1], &value) ||
+            key.size == 0 || key.size > MAX_KEY_SIZE) {
+            for (size_t i = 0; i < index; i++) {
+                free_write_op(&ops[i]);
+            }
+            enif_free(ops);
+            return 0;
+        }
+        ops[index].key_len = key.size;
+        ops[index].value_len = value.size;
+        ops[index].seq = db->next_seq++;
+        if (!copy_binary(&key, &ops[index].key) ||
+            !copy_binary(&value, &ops[index].value)) {
+            for (size_t i = 0; i <= index; i++) {
+                free_write_op(&ops[i]);
+            }
+            enif_free(ops);
+            return 0;
+        }
+        index++;
+    }
+
+    if (!enif_is_empty_list(env, tail)) {
+        for (size_t i = 0; i < index; i++) {
+            free_write_op(&ops[i]);
+        }
+        enif_free(ops);
+        return 0;
+    }
+
+    *ops_out = ops;
+    *count_out = index;
+    return 1;
+}
+
+static int decode_batch_refs(ErlNifEnv *env, ERL_NIF_TERM list, WriteOp **ops_out, size_t *count_out) {
+    unsigned int len = 0;
+    if (!enif_get_list_length(env, list, &len)) {
+        return 0;
+    }
+    if (len == 0) {
+        *ops_out = NULL;
+        *count_out = 0;
+        return 1;
+    }
+    if ((size_t)len > SIZE_MAX / sizeof(WriteOp)) {
+        return 0;
+    }
+
+    WriteOp *ops = enif_alloc(sizeof(WriteOp) * len);
+    if (ops == NULL) {
+        return 0;
+    }
+    memset(ops, 0, sizeof(WriteOp) * len);
+
+    ERL_NIF_TERM head;
+    ERL_NIF_TERM tail = list;
+    size_t index = 0;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        const ERL_NIF_TERM *tuple;
+        int arity;
+        ErlNifBinary key;
+        ErlNifBinary value;
+        if (!enif_get_tuple(env, head, &arity, &tuple) || arity != 2 ||
+            !enif_inspect_binary(env, tuple[0], &key) ||
+            !enif_inspect_binary(env, tuple[1], &value) ||
+            key.size == 0 || key.size > MAX_KEY_SIZE) {
+            enif_free(ops);
+            return 0;
+        }
+        ops[index].key = key.data;
+        ops[index].key_len = key.size;
+        ops[index].value = value.data;
+        ops[index].value_len = value.size;
+        ops[index].seq = index;
+        index++;
+    }
+
+    if (!enif_is_empty_list(env, tail)) {
+        enif_free(ops);
+        return 0;
+    }
+
+    *ops_out = ops;
+    *count_out = index;
+    return 1;
+}
+
+static ERL_NIF_TERM put_batch_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    DbResource *db;
+    if (argc != 2 || !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db)) {
+        return enif_make_badarg(env);
+    }
+
+    int rc = MDB_SUCCESS;
+    enif_mutex_lock(db->mutex);
+    WriteOp *ops = NULL;
+    size_t op_count = 0;
+    int ok = decode_batch(env, argv[1], db, &ops, &op_count);
+    if (ok && op_count > 0) {
+        if (reserve_ops(db, db->op_count + op_count)) {
+            memcpy(&db->ops[db->op_count], ops, sizeof(WriteOp) * op_count);
+            db->op_count += op_count;
+            atomic_store_explicit(&db->has_pending, 1, memory_order_release);
+            ops = NULL;
+            op_count = 0;
+            if (db->op_count >= db->max_ops) {
+                ok = flush_locked(db, &rc);
+            }
+        } else {
+            ok = 0;
+        }
+    }
+    enif_mutex_unlock(db->mutex);
+
+    if (ops != NULL) {
+        for (size_t i = 0; i < op_count; i++) {
+            free_write_op(&ops[i]);
+        }
+        enif_free(ops);
+    }
+    if (!ok) {
+        return rc == MDB_SUCCESS
+            ? error3(env, ATOM_VALIDATION_ERROR, "Invalid batch")
+            : error3_rc(env, ATOM_TRANSACTION_ERROR, "Failed to write batch", rc);
+    }
+    return ATOM_OK;
+}
+
+static ERL_NIF_TERM put_batch_direct_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    DbResource *db;
+    if (argc != 2 || !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db)) {
+        return enif_make_badarg(env);
+    }
+
+    int rc = MDB_SUCCESS;
+    WriteOp *ops = NULL;
+    size_t op_count = 0;
+    int ok = decode_batch_refs(env, argv[1], &ops, &op_count);
+    enif_mutex_lock(db->mutex);
+    ok = ok && flush_locked(db, &rc);
+    if (ok) {
+        ok = write_immediate_locked(db, ops, op_count, &rc);
+    }
+    enif_mutex_unlock(db->mutex);
+
+    if (ops != NULL) {
+        enif_free(ops);
+    }
+    if (!ok) {
+        return rc == MDB_SUCCESS
+            ? error3(env, ATOM_VALIDATION_ERROR, "Invalid batch")
+            : error3_rc(env, ATOM_TRANSACTION_ERROR, "Failed to write batch", rc);
+    }
+    return ATOM_OK;
+}
+
+static ERL_NIF_TERM flush_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    DbResource *db;
+    if (argc != 1 || !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db)) {
+        return enif_make_badarg(env);
+    }
+    int rc = MDB_SUCCESS;
+    enif_mutex_lock(db->mutex);
+    int ok = flush_locked(db, &rc);
+    enif_mutex_unlock(db->mutex);
+    return ok
+        ? ATOM_OK
+        : error3_rc(env, ATOM_TRANSACTION_ERROR, "Failed to flush writes", rc);
+}
+
 static ERL_NIF_TERM get_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     DbResource *db;
     ErlNifBinary key_bin;
@@ -1016,6 +1224,123 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     if (children != NULL) {
         enif_free(children);
     }
+    return result;
+}
+
+static ERL_NIF_TERM read_prefix_rows_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    DbResource *db;
+    ErlNifBinary prefix;
+    if (argc != 2 ||
+        !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db) ||
+        !enif_inspect_binary(env, argv[1], &prefix)) {
+        return enif_make_badarg(env);
+    }
+
+    int rc = MDB_SUCCESS;
+    ERL_NIF_TERM result = ATOM_NOT_FOUND;
+    MDB_env *mdb_env;
+    MDB_dbi dbi;
+    if (!acquire_read_handles(db, &mdb_env, &dbi, &rc)) {
+        return error3_rc(env, ATOM_DATABASE_ERROR, "Failed to open database", rc);
+    }
+
+    MDB_txn *txn = NULL;
+    MDB_cursor *cursor = NULL;
+    rc = mdb_txn_begin(mdb_env, NULL, MDB_RDONLY, &txn);
+    if (rc == MDB_SUCCESS) {
+        rc = mdb_cursor_open(txn, dbi, &cursor);
+    }
+
+    MDB_val key = { prefix.size, prefix.data };
+    MDB_val value = { 0, NULL };
+    if (rc == MDB_SUCCESS) {
+        rc = prefix.size == 0
+            ? mdb_cursor_get(cursor, &key, &value, MDB_FIRST)
+            : mdb_cursor_get(cursor, &key, &value, MDB_SET_RANGE);
+    }
+
+    size_t count = 0;
+    size_t total = 0;
+    while (rc == MDB_SUCCESS && key_has_prefix(&key, prefix.data, prefix.size)) {
+        if (SIZE_MAX - total < key.mv_size ||
+            SIZE_MAX - total - key.mv_size < value.mv_size) {
+            rc = ENOMEM;
+            break;
+        }
+        total += key.mv_size + value.mv_size;
+        count++;
+        rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
+    }
+    if (rc == MDB_NOTFOUND) {
+        rc = MDB_SUCCESS;
+    }
+
+    if (rc == MDB_SUCCESS && count > 0) {
+        ErlNifBinary packed;
+        if (count > SIZE_MAX / sizeof(RowRef)) {
+            rc = ENOMEM;
+        } else {
+            RowRef *rows = enif_alloc(sizeof(RowRef) * count);
+            if (rows == NULL || !enif_alloc_binary(total, &packed)) {
+                if (rows != NULL) {
+                    enif_free(rows);
+                }
+                rc = ENOMEM;
+            } else {
+                key.mv_size = prefix.size;
+                key.mv_data = prefix.data;
+                value.mv_size = 0;
+                value.mv_data = NULL;
+                rc = prefix.size == 0
+                    ? mdb_cursor_get(cursor, &key, &value, MDB_FIRST)
+                    : mdb_cursor_get(cursor, &key, &value, MDB_SET_RANGE);
+                size_t offset = 0;
+                size_t row = 0;
+                while (rc == MDB_SUCCESS && row < count &&
+                       key_has_prefix(&key, prefix.data, prefix.size)) {
+                    rows[row].key_offset = offset;
+                    rows[row].key_len = key.mv_size;
+                    memcpy(packed.data + offset, key.mv_data, key.mv_size);
+                    offset += key.mv_size;
+                    rows[row].value_offset = offset;
+                    rows[row].value_len = value.mv_size;
+                    memcpy(packed.data + offset, value.mv_data, value.mv_size);
+                    offset += value.mv_size;
+                    row++;
+                    rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
+                }
+                if (rc == MDB_NOTFOUND) {
+                    rc = MDB_SUCCESS;
+                }
+                if (rc == MDB_SUCCESS) {
+                    ERL_NIF_TERM parent = enif_make_binary(env, &packed);
+                    ERL_NIF_TERM list = enif_make_list(env, 0);
+                    for (size_t i = count; i > 0; i--) {
+                        ERL_NIF_TERM k = enif_make_sub_binary(
+                            env, parent, rows[i - 1].key_offset, rows[i - 1].key_len);
+                        ERL_NIF_TERM v = enif_make_sub_binary(
+                            env, parent, rows[i - 1].value_offset, rows[i - 1].value_len);
+                        list = enif_make_list_cell(env, enif_make_tuple2(env, k, v), list);
+                    }
+                    result = enif_make_tuple2(env, ATOM_OK, list);
+                } else {
+                    enif_release_binary(&packed);
+                }
+                enif_free(rows);
+            }
+        }
+    }
+    if (rc != MDB_SUCCESS) {
+        result = error3_rc(env, ATOM_DATABASE_ERROR, "Failed to read prefix", rc);
+    }
+
+    if (cursor != NULL) {
+        mdb_cursor_close(cursor);
+    }
+    if (txn != NULL) {
+        mdb_txn_abort(txn);
+    }
+    release_env_use(db->env);
     return result;
 }
 
@@ -1323,8 +1648,12 @@ static ErlNifFunc nif_funcs[] = {
     {"env_close_by_name", 1, env_close_by_name_nif, 0},
     {"db_open", 2, db_open_nif, 0},
     {"put", 3, put_nif, 0},
+    {"put_batch", 2, put_batch_nif, 0},
+    {"put_batch_direct", 2, put_batch_direct_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"get", 2, get_nif, 0},
+    {"flush", 1, flush_nif, 0},
     {"list", 2, list_nif, 0},
+    {"read_prefix_rows", 2, read_prefix_rows_nif, 0},
     {"match_pattern", 2, match_pattern_nif, 0}
 };
 

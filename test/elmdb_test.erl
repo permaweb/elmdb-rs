@@ -1,7 +1,8 @@
 %%% @doc Test suite for the elmdb C NIF, covering exactly the live API that
-%%% HyperBEAM's `hb_store_lmdb' uses: env_open, db_open, put, get, list, match,
-%%% env_close_by_name -- plus the write-buffer flush-on-read behaviour and the
-%%% concurrent read / close-race safety the NIF guarantees.
+%%% HyperBEAM's `hb_store_lmdb' uses: env_open, db_open, put, put_batch,
+%%% get, list, read_prefix, match, env_close_by_name -- plus the write-buffer
+%%% flush-on-read behaviour and the concurrent read / close-race safety the
+%%% NIF guarantees.
 -module(elmdb_test).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -65,6 +66,22 @@ flush_on_read_test_() ->
                         fun(I) -> elmdb:get(DB, key(I)) =:= {ok, val(I)} end,
                         lists:seq(1, N)))
                 end)
+	     end}.
+
+put_batch_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         ?_test(begin
+                    ok = elmdb:put_batch(
+                        DB,
+                        [
+                            {<<"batch/a">>, <<"1">>},
+                            {<<"batch/b">>, <<"2">>}
+                        ]
+                    ),
+                    ?assertEqual({ok, <<"1">>}, elmdb:get(DB, <<"batch/a">>)),
+                    ?assertEqual({ok, <<"2">>}, elmdb:get(DB, <<"batch/b">>))
+                end)
      end}.
 
 %%%===================================================================
@@ -92,6 +109,34 @@ list_test_() ->
                  end),
           ?_assertEqual(not_found, elmdb:list(DB, <<"nonexistent/">>))
          ]
+	     end}.
+
+read_prefix_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         ?_test(begin
+                    ok = elmdb:put_batch(
+                        DB,
+                        [
+                            {<<"root">>, <<"group">>},
+                            {<<"root/a">>, <<"1">>},
+                            {<<"root/b">>, <<"2">>},
+                            {<<"root/b/c">>, <<"3">>}
+                        ]
+                    ),
+                    ?assertEqual(
+                        {ok,
+                            [
+                                {<<"root">>, <<"group">>},
+                                {<<"root/a">>, <<"1">>},
+                                {<<"root/b">>, <<"2">>},
+                                {<<"root/b/c">>, <<"3">>}
+                            ]
+                        },
+                        elmdb:read_prefix(DB, <<"root">>)
+                    ),
+                    ?assertEqual(not_found, elmdb:read_prefix(DB, <<"absent">>))
+                end)
      end}.
 
 %%%===================================================================

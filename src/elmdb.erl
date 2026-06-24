@@ -13,7 +13,8 @@
 -export([env_open/2, env_close_by_name/1, db_open/2]).
 
 %% Key/value operations.
--export([put/3, get/2, list/2, match/2]).
+-export([put/3, put_batch/2, put_batch_direct/2, get/2, flush/1]).
+-export([list/2, read_prefix/2, match/2]).
 
 %% NIF loading.
 -export([init/0]).
@@ -91,9 +92,27 @@ db_open(_Env, _Options) ->
 put(_DB, _Key, _Value) ->
     erlang:nif_error(nif_not_loaded).
 
+%% @doc Buffer a batch of key/value writes in one NIF call. The accumulated
+%% buffer is flushed when it reaches the environment's batch size.
+-spec put_batch(DB :: term(), KeyValuePairs :: [{binary(), binary()}]) ->
+    ok | {error, term(), binary()}.
+put_batch(_DB, _KeyValuePairs) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Flush pending writes, then write the batch in one LMDB transaction.
+-spec put_batch_direct(DB :: term(), KeyValuePairs :: [{binary(), binary()}]) ->
+    ok | {error, term(), binary()}.
+put_batch_direct(_DB, _KeyValuePairs) ->
+    erlang:nif_error(nif_not_loaded).
+
 %% @doc Read the value for `Key'. Returns `{ok, Value}' or `not_found'.
 -spec get(DB :: term(), Key :: binary()) -> {ok, binary()} | not_found.
 get(_DB, _Key) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Explicitly flush buffered writes.
+-spec flush(DB :: term()) -> ok | {error, term(), binary()}.
+flush(_DB) ->
     erlang:nif_error(nif_not_loaded).
 
 %% @doc List the distinct immediate children under a key prefix.
@@ -103,6 +122,15 @@ get(_DB, _Key) ->
 %% order. Returns `not_found' when the prefix has no children.
 -spec list(DB :: term(), Prefix :: binary()) -> {ok, [binary()]} | not_found.
 list(_DB, _Prefix) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Read every raw row whose full key begins with `Prefix'.
+-spec read_prefix(DB :: term(), Prefix :: binary()) ->
+    {ok, [{binary(), binary()}]} | not_found | {error, term(), binary()}.
+read_prefix(DB, Prefix) ->
+    read_prefix_rows(DB, Prefix).
+
+read_prefix_rows(_DB, _Prefix) ->
     erlang:nif_error(nif_not_loaded).
 
 %% @doc Return the entity ids whose `Suffix => Value' fields match ALL patterns.
