@@ -1,5 +1,5 @@
 {application, elmdb,
- [{description, "LMDB bindings for Erlang via Rust NIF"},
+ [{description, "LMDB bindings for Erlang via a C NIF"},
   {vsn, "0.1.0"},
   {registered, []},
   {applications, [

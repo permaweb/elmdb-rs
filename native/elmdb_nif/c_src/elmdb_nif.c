@@ -2,6 +2,7 @@
 
 #include <erl_nif.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <limits.h>
 #include <stdio.h>
@@ -32,9 +33,12 @@ typedef struct {
     unsigned int flags;
     unsigned long generation;
     unsigned int ref_count;
-    unsigned int active_ops;
     int close_requested;
     ErlNifMutex *mutex;
+    /* Guards the lifetime of `env`: any thread running an LMDB txn holds this as
+     * a shared read-lock so readers run concurrently; only open/close take it
+     * exclusively, which drains in-flight txns before swapping `env`. */
+    ErlNifRWLock *env_lock;
 } EnvResource;
 
 typedef struct {
@@ -49,6 +53,9 @@ typedef struct {
     size_t op_cap;
     size_t max_ops;
     uint64_t next_seq;
+    /* Lock-free "buffer is non-empty" hint so reads can skip db->mutex entirely
+     * when nothing is pending. Published under db->mutex, peeked without it. */
+    atomic_int has_pending;
     ErlNifMutex *mutex;
 } DbResource;
 
@@ -68,11 +75,10 @@ typedef struct {
 } Bytes;
 
 typedef struct {
-    size_t key_offset;
-    size_t key_len;
-    size_t value_offset;
-    size_t value_len;
-} RowRef;
+    const unsigned char *src;
+    size_t len;
+    size_t offset;
+} ChildRef;
 
 typedef struct {
     ErlNifBinary key;
@@ -91,11 +97,6 @@ static DbNode *DATABASES;
 static ERL_NIF_TERM ATOM_OK;
 static ERL_NIF_TERM ATOM_ERROR;
 static ERL_NIF_TERM ATOM_NOT_FOUND;
-static ERL_NIF_TERM ATOM_TRUE;
-static ERL_NIF_TERM ATOM_FALSE;
-static ERL_NIF_TERM ATOM_UNDEFINED;
-static ERL_NIF_TERM ATOM_ITERATOR;
-static ERL_NIF_TERM ATOM_START;
 static ERL_NIF_TERM ATOM_CREATE;
 static ERL_NIF_TERM ATOM_MAP_SIZE;
 static ERL_NIF_TERM ATOM_MAX_READERS;
@@ -355,46 +356,77 @@ static int open_env_locked(EnvResource *res, int *rc_out) {
         return 0;
     }
 
+    /* Publish the new env under the exclusive lock so a concurrent reader sees
+     * either the old state or the fully-opened one, never a torn pointer. */
+    enif_rwlock_rwlock(res->env_lock);
     res->env = mdb_env;
     res->close_requested = 0;
     res->generation++;
+    enif_rwlock_rwunlock(res->env_lock);
     return 1;
 }
 
 static void close_env_locked(EnvResource *res) {
     res->close_requested = 1;
-    if (res->active_ops == 0 && res->env != NULL) {
+    /* The exclusive lock blocks until every in-flight read/write txn has
+     * released its shared lock, so it is safe to close the env underneath them. */
+    enif_rwlock_rwlock(res->env_lock);
+    if (res->env != NULL) {
         mdb_env_close(res->env);
         res->env = NULL;
         res->generation++;
     }
+    enif_rwlock_rwunlock(res->env_lock);
 }
 
 static void release_env_use(EnvResource *res) {
-    enif_mutex_lock(res->mutex);
-    if (res->active_ops > 0) {
-        res->active_ops--;
-    }
-    if (res->active_ops == 0 && res->close_requested && res->env != NULL) {
-        mdb_env_close(res->env);
-        res->env = NULL;
-        res->generation++;
-    }
-    enif_mutex_unlock(res->mutex);
+    enif_rwlock_runlock(res->env_lock);
 }
 
+/* Acquire shared access to a live env + open dbi for a read txn. On success the
+ * caller holds the env's shared read-lock and must pair it with
+ * release_env_use(). The common case (env open, no buffered writes) takes only
+ * one shared rlock and a lockless op_count read — readers never serialize. */
 static int acquire_read_handles(DbResource *db, MDB_env **mdb_env, MDB_dbi *dbi, int *rc_out) {
-    enif_mutex_lock(db->mutex);
-    if (!flush_locked(db, rc_out) || !ensure_db_open_locked(db, rc_out)) {
+    EnvResource *env = db->env;
+
+    /* Flush buffered writes only when some exist, so read-heavy traffic never
+     * touches db->mutex. The flag is published under db->mutex by the same
+     * process's earlier write, so its own subsequent read observes and flushes
+     * it; a stale read just re-checks under the lock and no-ops. */
+    if (atomic_load_explicit(&db->has_pending, memory_order_acquire)) {
+        enif_mutex_lock(db->mutex);
+        int ok = flush_locked(db, rc_out);
         enif_mutex_unlock(db->mutex);
+        if (!ok) {
+            return 0;
+        }
+    }
+
+    enif_rwlock_rlock(env->env_lock);
+    if (env->env != NULL && db->dbi_open && db->dbi_generation == env->generation) {
+        *mdb_env = env->env;
+        *dbi = db->dbi;
+        return 1;
+    }
+    enif_rwlock_runlock(env->env_lock);
+
+    /* Slow path: env or dbi needs (re)opening. */
+    enif_mutex_lock(db->mutex);
+    int ok = ensure_db_open_locked(db, rc_out);
+    enif_mutex_unlock(db->mutex);
+    if (!ok) {
         return 0;
     }
-    enif_mutex_lock(db->env->mutex);
-    db->env->active_ops++;
-    *mdb_env = db->env->env;
+
+    enif_rwlock_rlock(env->env_lock);
+    if (env->env == NULL || !db->dbi_open) {
+        enif_rwlock_runlock(env->env_lock);
+        *rc_out = MDB_BAD_TXN;
+        return 0;
+    }
+    *mdb_env = env->env;
     *dbi = db->dbi;
-    enif_mutex_unlock(db->env->mutex);
-    enif_mutex_unlock(db->mutex);
     return 1;
 }
 
@@ -433,9 +465,15 @@ static int ensure_db_open_locked(DbResource *db, int *rc_out) {
         return 0;
     }
 
+    /* Publish the dbi handle and its validity under the exclusive lock. `db->dbi`
+     * was written above (still under env->mutex); the wlock release pairs with the
+     * reader's rlock acquire so a reader that observes dbi_open == 1 is guaranteed
+     * to also observe the matching dbi handle, without locking on the read path. */
+    enif_rwlock_rwlock(db->env->env_lock);
     db->dbi_open = 1;
     db->dbi_generation = db->env->generation;
     db->closed = 0;
+    enif_rwlock_rwunlock(db->env->env_lock);
     enif_mutex_unlock(db->env->mutex);
     return 1;
 }
@@ -481,6 +519,7 @@ static int append_op_locked(DbResource *db, ErlNifBinary *key, ErlNifBinary *val
         return 0;
     }
     db->op_count++;
+    atomic_store_explicit(&db->has_pending, 1, memory_order_release);
     return 1;
 }
 
@@ -493,6 +532,15 @@ static int write_immediate_locked(DbResource *db, WriteOp *ops, size_t op_count,
     int rc = MDB_SUCCESS;
     if (!ensure_db_open_locked(db, &rc)) {
         *rc_out = rc;
+        return 0;
+    }
+
+    /* Hold the shared lock for the txn so the env cannot be closed underneath
+     * it; LMDB serializes concurrent write txns on its own internal mutex. */
+    enif_rwlock_rlock(db->env->env_lock);
+    if (db->env->env == NULL) {
+        enif_rwlock_runlock(db->env->env_lock);
+        *rc_out = MDB_BAD_TXN;
         return 0;
     }
 
@@ -517,6 +565,7 @@ static int write_immediate_locked(DbResource *db, WriteOp *ops, size_t op_count,
     if (txn != NULL) {
         mdb_txn_abort(txn);
     }
+    enif_rwlock_runlock(db->env->env_lock);
 
     if (rc != MDB_SUCCESS) {
         *rc_out = rc;
@@ -535,6 +584,7 @@ static int flush_locked(DbResource *db, int *rc_out) {
     db->ops = NULL;
     db->op_count = 0;
     db->op_cap = 0;
+    atomic_store_explicit(&db->has_pending, 0, memory_order_release);
 
     int ok = write_immediate_locked(db, ops, op_count, rc_out);
     for (size_t i = 0; i < op_count; i++) {
@@ -611,6 +661,12 @@ static ERL_NIF_TERM env_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     res->map_size = DEFAULT_MAP_SIZE;
     res->batch_size = DEFAULT_BATCH_SIZE;
     res->mutex = enif_mutex_create("elmdb_env");
+    res->env_lock = enif_rwlock_create("elmdb_env_lock");
+    if (res->mutex == NULL || res->env_lock == NULL) {
+        enif_mutex_unlock(REGISTRY_MUTEX);
+        enif_release_resource(res);
+        return error2(env, ATOM_ENVIRONMENT_ERROR);
+    }
     parse_env_options(env, argv[1], res);
 
     int rc = MDB_SUCCESS;
@@ -641,21 +697,6 @@ static ERL_NIF_TERM env_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     return enif_make_tuple2(env, ATOM_OK, term);
 }
 
-static ERL_NIF_TERM env_sync_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    EnvResource *res;
-    if (argc != 1 || !enif_get_resource(env, argv[0], ENV_RESOURCE, (void **)&res)) {
-        return enif_make_badarg(env);
-    }
-    enif_mutex_lock(res->mutex);
-    int rc = MDB_SUCCESS;
-    int ok = open_env_locked(res, &rc);
-    if (ok) {
-        rc = mdb_env_sync(res->env, 1);
-    }
-    enif_mutex_unlock(res->mutex);
-    return rc == MDB_SUCCESS ? ATOM_OK : error3_rc(env, ATOM_ENVIRONMENT_ERROR, "Environment sync failed", rc);
-}
-
 static ERL_NIF_TERM close_env_resource_nif(ErlNifEnv *env, EnvResource *res) {
     DbResource *db = NULL;
     enif_mutex_lock(REGISTRY_MUTEX);
@@ -681,14 +722,6 @@ static ERL_NIF_TERM close_env_resource_nif(ErlNifEnv *env, EnvResource *res) {
     return ATOM_OK;
 }
 
-static ERL_NIF_TERM env_close_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    EnvResource *res;
-    if (argc != 1 || !enif_get_resource(env, argv[0], ENV_RESOURCE, (void **)&res)) {
-        return enif_make_badarg(env);
-    }
-    return close_env_resource_nif(env, res);
-}
-
 static ERL_NIF_TERM env_close_by_name_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     char *path = NULL;
     if (argc != 1 || !term_to_path(env, argv[0], &path)) {
@@ -707,25 +740,6 @@ static ERL_NIF_TERM env_close_by_name_nif(ErlNifEnv *env, int argc, const ERL_NI
     ERL_NIF_TERM result = close_env_resource_nif(env, res);
     enif_release_resource(res);
     return result;
-}
-
-static ERL_NIF_TERM env_status_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    EnvResource *res;
-    if (argc != 1 || !enif_get_resource(env, argv[0], ENV_RESOURCE, (void **)&res)) {
-        return enif_make_badarg(env);
-    }
-    enif_mutex_lock(res->mutex);
-    int closed = res->env == NULL || res->close_requested;
-    unsigned int ref_count = res->ref_count;
-    ERL_NIF_TERM path = make_string(env, res->path);
-    enif_mutex_unlock(res->mutex);
-    return enif_make_tuple4(
-        env,
-        ATOM_OK,
-        closed ? ATOM_TRUE : ATOM_FALSE,
-        enif_make_uint(env, ref_count),
-        path
-    );
 }
 
 static ERL_NIF_TERM db_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
@@ -810,21 +824,6 @@ static ERL_NIF_TERM db_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     return enif_make_tuple2(env, ATOM_OK, term);
 }
 
-static ERL_NIF_TERM db_close_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    DbResource *db;
-    if (argc != 1 || !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db)) {
-        return enif_make_badarg(env);
-    }
-
-    int rc = MDB_SUCCESS;
-    enif_mutex_lock(db->mutex);
-    flush_locked(db, &rc);
-    db->closed = 1;
-    db->dbi_open = 0;
-    enif_mutex_unlock(db->mutex);
-    return ATOM_OK;
-}
-
 static ERL_NIF_TERM put_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     DbResource *db;
     ErlNifBinary key;
@@ -852,204 +851,6 @@ static ERL_NIF_TERM put_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
             : error3_rc(env, ATOM_TRANSACTION_ERROR, "Failed to put value", rc);
     }
     return ATOM_OK;
-}
-
-static int decode_batch(ErlNifEnv *env, ERL_NIF_TERM list, DbResource *db, WriteOp **ops_out, size_t *count_out) {
-    unsigned int len = 0;
-    if (!enif_get_list_length(env, list, &len)) {
-        return 0;
-    }
-    if (len == 0) {
-        *ops_out = NULL;
-        *count_out = 0;
-        return 1;
-    }
-    if ((size_t)len > SIZE_MAX / sizeof(WriteOp)) {
-        return 0;
-    }
-
-    WriteOp *ops = enif_alloc(sizeof(WriteOp) * len);
-    if (ops == NULL) {
-        return 0;
-    }
-    memset(ops, 0, sizeof(WriteOp) * len);
-
-    ERL_NIF_TERM head;
-    ERL_NIF_TERM tail = list;
-    size_t index = 0;
-    while (enif_get_list_cell(env, tail, &head, &tail)) {
-        const ERL_NIF_TERM *tuple;
-        int arity;
-        ErlNifBinary key;
-        ErlNifBinary value;
-        if (!enif_get_tuple(env, head, &arity, &tuple) || arity != 2 ||
-            !enif_inspect_binary(env, tuple[0], &key) ||
-            !enif_inspect_binary(env, tuple[1], &value) ||
-            key.size == 0 || key.size > MAX_KEY_SIZE) {
-            for (size_t i = 0; i < index; i++) {
-                free_write_op(&ops[i]);
-            }
-            enif_free(ops);
-            return 0;
-        }
-        ops[index].key_len = key.size;
-        ops[index].value_len = value.size;
-        ops[index].seq = db->next_seq++;
-        if (!copy_binary(&key, &ops[index].key) || !copy_binary(&value, &ops[index].value)) {
-            for (size_t i = 0; i <= index; i++) {
-                free_write_op(&ops[i]);
-            }
-            enif_free(ops);
-            return 0;
-        }
-        index++;
-    }
-
-    if (!enif_is_empty_list(env, tail)) {
-        for (size_t i = 0; i < index; i++) {
-            free_write_op(&ops[i]);
-        }
-        enif_free(ops);
-        return 0;
-    }
-
-    *ops_out = ops;
-    *count_out = index;
-    return 1;
-}
-
-static int decode_batch_refs(ErlNifEnv *env, ERL_NIF_TERM list, WriteOp **ops_out, size_t *count_out) {
-    unsigned int len = 0;
-    if (!enif_get_list_length(env, list, &len)) {
-        return 0;
-    }
-    if (len == 0) {
-        *ops_out = NULL;
-        *count_out = 0;
-        return 1;
-    }
-    if ((size_t)len > SIZE_MAX / sizeof(WriteOp)) {
-        return 0;
-    }
-
-    WriteOp *ops = enif_alloc(sizeof(WriteOp) * len);
-    if (ops == NULL) {
-        return 0;
-    }
-    memset(ops, 0, sizeof(WriteOp) * len);
-
-    ERL_NIF_TERM head;
-    ERL_NIF_TERM tail = list;
-    size_t index = 0;
-    while (enif_get_list_cell(env, tail, &head, &tail)) {
-        const ERL_NIF_TERM *tuple;
-        int arity;
-        ErlNifBinary key;
-        ErlNifBinary value;
-        if (!enif_get_tuple(env, head, &arity, &tuple) || arity != 2 ||
-            !enif_inspect_binary(env, tuple[0], &key) ||
-            !enif_inspect_binary(env, tuple[1], &value) ||
-            key.size == 0 || key.size > MAX_KEY_SIZE) {
-            enif_free(ops);
-            return 0;
-        }
-        /* Safe only for immediate writes: inspected binaries live until return. */
-        ops[index].key = key.data;
-        ops[index].key_len = key.size;
-        ops[index].value = value.data;
-        ops[index].value_len = value.size;
-        ops[index].seq = index;
-        index++;
-    }
-
-    if (!enif_is_empty_list(env, tail)) {
-        enif_free(ops);
-        return 0;
-    }
-
-    *ops_out = ops;
-    *count_out = index;
-    return 1;
-}
-
-static ERL_NIF_TERM put_batch_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    DbResource *db;
-    if (argc != 2 || !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db)) {
-        return enif_make_badarg(env);
-    }
-
-    int rc = MDB_SUCCESS;
-    enif_mutex_lock(db->mutex);
-    WriteOp *ops = NULL;
-    size_t op_count = 0;
-    int ok = decode_batch(env, argv[1], db, &ops, &op_count);
-    if (ok && op_count > 0) {
-        if (reserve_ops(db, db->op_count + op_count)) {
-            memcpy(&db->ops[db->op_count], ops, sizeof(WriteOp) * op_count);
-            db->op_count += op_count;
-            ops = NULL;
-            op_count = 0;
-            if (db->op_count >= db->max_ops) {
-                ok = flush_locked(db, &rc);
-            }
-        } else {
-            ok = 0;
-        }
-    }
-    enif_mutex_unlock(db->mutex);
-
-    if (ops != NULL) {
-        for (size_t i = 0; i < op_count; i++) {
-            free_write_op(&ops[i]);
-        }
-        enif_free(ops);
-    }
-    if (!ok) {
-        return rc == MDB_SUCCESS
-            ? error3(env, ATOM_VALIDATION_ERROR, "Invalid batch")
-            : error3_rc(env, ATOM_TRANSACTION_ERROR, "Failed to write batch", rc);
-    }
-    return ATOM_OK;
-}
-
-static ERL_NIF_TERM put_batch_direct_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    DbResource *db;
-    if (argc != 2 || !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db)) {
-        return enif_make_badarg(env);
-    }
-
-    int rc = MDB_SUCCESS;
-    WriteOp *ops = NULL;
-    size_t op_count = 0;
-    int ok = decode_batch_refs(env, argv[1], &ops, &op_count);
-    enif_mutex_lock(db->mutex);
-    ok = ok && flush_locked(db, &rc);
-    if (ok) {
-        ok = write_immediate_locked(db, ops, op_count, &rc);
-    }
-    enif_mutex_unlock(db->mutex);
-
-    if (ops != NULL) {
-        enif_free(ops);
-    }
-    if (!ok) {
-        return rc == MDB_SUCCESS
-            ? error3(env, ATOM_VALIDATION_ERROR, "Invalid batch")
-            : error3_rc(env, ATOM_TRANSACTION_ERROR, "Failed to write batch", rc);
-    }
-    return ATOM_OK;
-}
-
-static ERL_NIF_TERM flush_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    DbResource *db;
-    if (argc != 1 || !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db)) {
-        return enif_make_badarg(env);
-    }
-    int rc = MDB_SUCCESS;
-    enif_mutex_lock(db->mutex);
-    int ok = flush_locked(db, &rc);
-    enif_mutex_unlock(db->mutex);
-    return ok ? ATOM_OK : error3_rc(env, ATOM_TRANSACTION_ERROR, "Failed to flush buffer", rc);
 }
 
 static ERL_NIF_TERM get_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
@@ -1096,91 +897,6 @@ static ERL_NIF_TERM get_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     return result;
 }
 
-static ERL_NIF_TERM iterator_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    DbResource *db;
-    if (argc != 1 || !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db)) {
-        return enif_make_badarg(env);
-    }
-    return enif_make_tuple2(env, ATOM_ITERATOR, ATOM_START);
-}
-
-static int decode_iterator(ErlNifEnv *env, ERL_NIF_TERM term, int *start, ErlNifBinary *key) {
-    const ERL_NIF_TERM *tuple;
-    int arity;
-    if (!enif_get_tuple(env, term, &arity, &tuple) || arity != 2 ||
-        !is_atom(env, tuple[0], ATOM_ITERATOR)) {
-        return 0;
-    }
-    if (is_atom(env, tuple[1], ATOM_START)) {
-        *start = 1;
-        return 1;
-    }
-    *start = 0;
-    return enif_inspect_binary(env, tuple[1], key);
-}
-
-static ERL_NIF_TERM iterator_next_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    DbResource *db;
-    int start = 0;
-    ErlNifBinary last_key;
-    memset(&last_key, 0, sizeof(last_key));
-    if (argc != 2 || !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db)) {
-        return enif_make_badarg(env);
-    }
-    if (!decode_iterator(env, argv[1], &start, &last_key)) {
-        return error3(env, ATOM_INVALID, "Invalid iterator cursor format");
-    }
-
-    int rc = MDB_SUCCESS;
-    ERL_NIF_TERM result = ATOM_UNDEFINED;
-    MDB_env *mdb_env;
-    MDB_dbi dbi;
-    if (!acquire_read_handles(db, &mdb_env, &dbi, &rc)) {
-        return error3_rc(env, ATOM_DATABASE_ERROR, "Failed to open database", rc);
-    }
-
-    MDB_txn *txn = NULL;
-    MDB_cursor *cursor = NULL;
-    rc = mdb_txn_begin(mdb_env, NULL, MDB_RDONLY, &txn);
-    if (rc == MDB_SUCCESS) {
-        rc = mdb_cursor_open(txn, dbi, &cursor);
-    }
-    MDB_val key;
-    MDB_val value;
-    if (rc == MDB_SUCCESS) {
-        if (start) {
-            rc = mdb_cursor_get(cursor, &key, &value, MDB_FIRST);
-        } else {
-            key.mv_size = last_key.size;
-            key.mv_data = last_key.data;
-            rc = mdb_cursor_get(cursor, &key, &value, MDB_SET_RANGE);
-            if (rc == MDB_SUCCESS &&
-                key.mv_size == last_key.size &&
-                memcmp(key.mv_data, last_key.data, last_key.size) == 0) {
-                rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
-            }
-        }
-    }
-    if (rc == MDB_SUCCESS) {
-        ERL_NIF_TERM key_term = binary_from_bytes(env, key.mv_data, key.mv_size);
-        ERL_NIF_TERM value_term = binary_from_bytes(env, value.mv_data, value.mv_size);
-        ERL_NIF_TERM next = enif_make_tuple2(env, ATOM_ITERATOR, key_term);
-        result = enif_make_tuple4(env, ATOM_OK, key_term, value_term, next);
-    } else if (rc == MDB_NOTFOUND) {
-        result = ATOM_UNDEFINED;
-    } else {
-        result = error3_rc(env, ATOM_DATABASE_ERROR, "Failed to advance iterator cursor", rc);
-    }
-    if (cursor != NULL) {
-        mdb_cursor_close(cursor);
-    }
-    if (txn != NULL) {
-        mdb_txn_abort(txn);
-    }
-    release_env_use(db->env);
-    return result;
-}
-
 static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     DbResource *db;
     ErlNifBinary prefix;
@@ -1191,9 +907,10 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     }
 
     int rc = MDB_SUCCESS;
-    Bytes *children = NULL;
+    ChildRef *children = NULL;
     size_t child_count = 0;
     size_t child_cap = 0;
+    size_t total = 0;
     ERL_NIF_TERM result = ATOM_NOT_FOUND;
 
     MDB_env *mdb_env;
@@ -1217,8 +934,11 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
             : mdb_cursor_get(cursor, &key, &value, MDB_SET_RANGE);
     }
 
+    /* Collect distinct immediate-child names. Keys are sorted so duplicates are
+     * adjacent (compare against the previous one). The names point into the
+     * mmap and are packed into one binary below, before the txn ends. */
     while (rc == MDB_SUCCESS && key_has_prefix(&key, prefix.data, prefix.size)) {
-        unsigned char *remaining = (unsigned char *)key.mv_data + prefix.size;
+        const unsigned char *remaining = (const unsigned char *)key.mv_data + prefix.size;
         size_t remaining_len = key.mv_size - prefix.size;
         if (remaining_len != 0) {
             size_t len = 0;
@@ -1229,15 +949,15 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
                 int is_new =
                     child_count == 0 ||
                     children[child_count - 1].len != len ||
-                    memcmp(children[child_count - 1].bytes, remaining, len) != 0;
+                    memcmp(children[child_count - 1].src, remaining, len) != 0;
                 if (is_new) {
                     if (child_count == child_cap) {
                         size_t next = child_cap == 0 ? 16 : child_cap * 2;
-                        if (next < child_cap || next > SIZE_MAX / sizeof(Bytes)) {
+                        if (next < child_cap || next > SIZE_MAX / sizeof(ChildRef)) {
                             rc = ENOMEM;
                             break;
                         }
-                        Bytes *grown = enif_realloc(children, sizeof(Bytes) * next);
+                        ChildRef *grown = enif_realloc(children, sizeof(ChildRef) * next);
                         if (grown == NULL) {
                             rc = ENOMEM;
                             break;
@@ -1245,13 +965,14 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
                         children = grown;
                         child_cap = next;
                     }
-                    children[child_count].bytes = enif_alloc(len);
-                    if (children[child_count].bytes == NULL) {
+                    if (SIZE_MAX - total < len) {
                         rc = ENOMEM;
                         break;
                     }
-                    memcpy(children[child_count].bytes, remaining, len);
+                    children[child_count].src = remaining;
                     children[child_count].len = len;
+                    children[child_count].offset = total;
+                    total += len;
                     child_count++;
                 }
             }
@@ -1263,13 +984,24 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         rc = MDB_SUCCESS;
     }
     if (rc == MDB_SUCCESS && child_count > 0) {
-        ERL_NIF_TERM list = enif_make_list(env, 0);
-        for (size_t i = child_count; i > 0; i--) {
-            ERL_NIF_TERM child = binary_from_bytes(env, children[i - 1].bytes, children[i - 1].len);
-            list = enif_make_list_cell(env, child, list);
+        ErlNifBinary packed;
+        if (!enif_alloc_binary(total, &packed)) {
+            rc = ENOMEM;
+        } else {
+            for (size_t i = 0; i < child_count; i++) {
+                memcpy(packed.data + children[i].offset, children[i].src, children[i].len);
+            }
+            ERL_NIF_TERM parent = enif_make_binary(env, &packed);
+            ERL_NIF_TERM list = enif_make_list(env, 0);
+            for (size_t i = child_count; i > 0; i--) {
+                ERL_NIF_TERM child = enif_make_sub_binary(
+                    env, parent, children[i - 1].offset, children[i - 1].len);
+                list = enif_make_list_cell(env, child, list);
+            }
+            result = enif_make_tuple2(env, ATOM_OK, list);
         }
-        result = enif_make_tuple2(env, ATOM_OK, list);
-    } else if (rc != MDB_SUCCESS) {
+    }
+    if (rc != MDB_SUCCESS) {
         result = error3_rc(env, ATOM_DATABASE_ERROR, "Failed to list prefix", rc);
     }
 
@@ -1281,129 +1013,9 @@ static ERL_NIF_TERM list_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     }
     release_env_use(db->env);
 
-    for (size_t i = 0; i < child_count; i++) {
-        enif_free(children[i].bytes);
-    }
     if (children != NULL) {
         enif_free(children);
     }
-    return result;
-}
-
-static ERL_NIF_TERM read_prefix_rows_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    DbResource *db;
-    ErlNifBinary prefix;
-    if (argc != 2 ||
-        !enif_get_resource(env, argv[0], DB_RESOURCE, (void **)&db) ||
-        !enif_inspect_binary(env, argv[1], &prefix)) {
-        return enif_make_badarg(env);
-    }
-
-    int rc = MDB_SUCCESS;
-    ERL_NIF_TERM result = ATOM_NOT_FOUND;
-    MDB_env *mdb_env;
-    MDB_dbi dbi;
-    if (!acquire_read_handles(db, &mdb_env, &dbi, &rc)) {
-        return error3_rc(env, ATOM_DATABASE_ERROR, "Failed to open database", rc);
-    }
-
-    MDB_txn *txn = NULL;
-    MDB_cursor *cursor = NULL;
-    rc = mdb_txn_begin(mdb_env, NULL, MDB_RDONLY, &txn);
-    if (rc == MDB_SUCCESS) {
-        rc = mdb_cursor_open(txn, dbi, &cursor);
-    }
-
-    MDB_val key = { prefix.size, prefix.data };
-    MDB_val value = { 0, NULL };
-    if (rc == MDB_SUCCESS) {
-        rc = prefix.size == 0
-            ? mdb_cursor_get(cursor, &key, &value, MDB_FIRST)
-            : mdb_cursor_get(cursor, &key, &value, MDB_SET_RANGE);
-    }
-
-    size_t count = 0;
-    size_t total = 0;
-    while (rc == MDB_SUCCESS && key_has_prefix(&key, prefix.data, prefix.size)) {
-        if (SIZE_MAX - total < key.mv_size ||
-            SIZE_MAX - total - key.mv_size < value.mv_size) {
-            rc = ENOMEM;
-            break;
-        }
-        total += key.mv_size + value.mv_size;
-        count++;
-        rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
-    }
-    if (rc == MDB_NOTFOUND) {
-        rc = MDB_SUCCESS;
-    }
-
-    if (rc == MDB_SUCCESS && count > 0) {
-        ErlNifBinary packed;
-        if (count > SIZE_MAX / sizeof(RowRef)) {
-            rc = ENOMEM;
-        } else {
-            RowRef *rows = enif_alloc(sizeof(RowRef) * count);
-            if (rows == NULL || !enif_alloc_binary(total, &packed)) {
-                if (rows != NULL) {
-                    enif_free(rows);
-                }
-                rc = ENOMEM;
-            } else {
-                key.mv_size = prefix.size;
-                key.mv_data = prefix.data;
-                value.mv_size = 0;
-                value.mv_data = NULL;
-                rc = prefix.size == 0
-                    ? mdb_cursor_get(cursor, &key, &value, MDB_FIRST)
-                    : mdb_cursor_get(cursor, &key, &value, MDB_SET_RANGE);
-                size_t offset = 0;
-                size_t row = 0;
-                while (rc == MDB_SUCCESS && row < count &&
-                       key_has_prefix(&key, prefix.data, prefix.size)) {
-                    rows[row].key_offset = offset;
-                    rows[row].key_len = key.mv_size;
-                    memcpy(packed.data + offset, key.mv_data, key.mv_size);
-                    offset += key.mv_size;
-                    rows[row].value_offset = offset;
-                    rows[row].value_len = value.mv_size;
-                    memcpy(packed.data + offset, value.mv_data, value.mv_size);
-                    offset += value.mv_size;
-                    row++;
-                    rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
-                }
-                if (rc == MDB_NOTFOUND) {
-                    rc = MDB_SUCCESS;
-                }
-                if (rc == MDB_SUCCESS) {
-                    ERL_NIF_TERM parent = enif_make_binary(env, &packed);
-                    ERL_NIF_TERM list = enif_make_list(env, 0);
-                    for (size_t i = count; i > 0; i--) {
-                        ERL_NIF_TERM k = enif_make_sub_binary(
-                            env, parent, rows[i - 1].key_offset, rows[i - 1].key_len);
-                        ERL_NIF_TERM v = enif_make_sub_binary(
-                            env, parent, rows[i - 1].value_offset, rows[i - 1].value_len);
-                        list = enif_make_list_cell(env, enif_make_tuple2(env, k, v), list);
-                    }
-                    result = enif_make_tuple2(env, ATOM_OK, list);
-                } else {
-                    enif_release_binary(&packed);
-                }
-                enif_free(rows);
-            }
-        }
-    }
-    if (rc != MDB_SUCCESS) {
-        result = error3_rc(env, ATOM_DATABASE_ERROR, "Failed to read prefix", rc);
-    }
-
-    if (cursor != NULL) {
-        mdb_cursor_close(cursor);
-    }
-    if (txn != NULL) {
-        mdb_txn_abort(txn);
-    }
-    release_env_use(db->env);
     return result;
 }
 
@@ -1449,12 +1061,18 @@ static int all_seen(unsigned char *seen, size_t count) {
     return 1;
 }
 
-static int append_result(Bytes **results, size_t *count, size_t *cap, unsigned char *id, size_t id_len) {
+/* Record a match as a pointer into the (txn-stable) mmap key plus its length.
+ * The id bytes are copied into result binaries later, while the txn is still
+ * open, so no per-entity allocation or copy happens during the scan. */
+static int append_result(Bytes **results, size_t *count, size_t *cap, const unsigned char *id, size_t id_len) {
     if (*count >= MAX_MATCH_RESULTS) {
         return 1;
     }
     if (*count == *cap) {
         size_t next = *cap == 0 ? 16 : *cap * 2;
+        if (next < *cap || next > SIZE_MAX / sizeof(Bytes)) {
+            return 0;
+        }
         Bytes *grown = enif_realloc(*results, sizeof(Bytes) * next);
         if (grown == NULL) {
             return 0;
@@ -1462,13 +1080,7 @@ static int append_result(Bytes **results, size_t *count, size_t *cap, unsigned c
         *results = grown;
         *cap = next;
     }
-    (*results)[*count].bytes = enif_alloc(id_len);
-    if ((*results)[*count].bytes == NULL && id_len != 0) {
-        return 0;
-    }
-    if (id_len != 0) {
-        memcpy((*results)[*count].bytes, id, id_len);
-    }
+    (*results)[*count].bytes = (unsigned char *)id;
     (*results)[*count].len = id_len;
     (*count)++;
     return 1;
@@ -1498,7 +1110,7 @@ static ERL_NIF_TERM match_pattern_nif(ErlNifEnv *env, int argc, const ERL_NIF_TE
     Bytes *results = NULL;
     size_t result_count = 0;
     size_t result_cap = 0;
-    unsigned char *current_id = NULL;
+    const unsigned char *current_id = NULL;
     size_t current_id_len = 0;
     int rc = MDB_SUCCESS;
     ERL_NIF_TERM result = ATOM_NOT_FOUND;
@@ -1546,17 +1158,9 @@ static ERL_NIF_TERM match_pattern_nif(ErlNifEnv *env, int argc, const ERL_NIF_TE
                     break;
                 }
             }
-            if (current_id != NULL) {
-                enif_free(current_id);
-            }
-            current_id = enif_alloc(id_len);
-            if (current_id == NULL && id_len != 0) {
-                rc = ENOMEM;
-                break;
-            }
-            if (id_len != 0) {
-                memcpy(current_id, key_bytes, id_len);
-            }
+            /* Point at the current key's id bytes; they stay valid for the txn,
+             * including the prior id we may have just recorded above. */
+            current_id = key_bytes;
             current_id_len = id_len;
             memset(seen, 0, pattern_count);
         }
@@ -1597,14 +1201,8 @@ static ERL_NIF_TERM match_pattern_nif(ErlNifEnv *env, int argc, const ERL_NIF_TE
     }
     release_env_use(db->env);
 
-    for (size_t i = 0; i < result_count; i++) {
-        enif_free(results[i].bytes);
-    }
     if (results != NULL) {
         enif_free(results);
-    }
-    if (current_id != NULL) {
-        enif_free(current_id);
     }
     enif_free(patterns);
     enif_free(seen);
@@ -1623,6 +1221,9 @@ static void env_dtor(ErlNifEnv *env, void *obj) {
     }
     if (res->mutex != NULL) {
         enif_mutex_destroy(res->mutex);
+    }
+    if (res->env_lock != NULL) {
+        enif_rwlock_destroy(res->env_lock);
     }
 }
 
@@ -1668,11 +1269,6 @@ static int load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     ATOM_OK = make_atom(env, "ok");
     ATOM_ERROR = make_atom(env, "error");
     ATOM_NOT_FOUND = make_atom(env, "not_found");
-    ATOM_TRUE = make_atom(env, "true");
-    ATOM_FALSE = make_atom(env, "false");
-    ATOM_UNDEFINED = make_atom(env, "undefined");
-    ATOM_ITERATOR = make_atom(env, "iterator");
-    ATOM_START = make_atom(env, "start");
     ATOM_CREATE = make_atom(env, "create");
     ATOM_MAP_SIZE = make_atom(env, "map_size");
     ATOM_MAX_READERS = make_atom(env, "max_readers");
@@ -1724,22 +1320,12 @@ static void unload(ErlNifEnv *env, void *priv) {
 
 static ErlNifFunc nif_funcs[] = {
     {"env_open", 2, env_open_nif, 0},
-    {"env_sync", 1, env_sync_nif, 0},
-    {"env_close", 1, env_close_nif, 0},
     {"env_close_by_name", 1, env_close_by_name_nif, 0},
-    {"env_status", 1, env_status_nif, 0},
     {"db_open", 2, db_open_nif, 0},
-    {"db_close", 1, db_close_nif, 0},
     {"put", 3, put_nif, 0},
-    {"put_batch", 2, put_batch_nif, 0},
-    {"put_batch_direct", 2, put_batch_direct_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"get", 2, get_nif, 0},
-    {"iterator", 1, iterator_nif, 0},
-    {"iterator_next", 2, iterator_next_nif, 0},
     {"list", 2, list_nif, 0},
-    {"read_prefix_rows", 2, read_prefix_rows_nif, 0},
-    {"match_pattern", 2, match_pattern_nif, 0},
-    {"flush", 1, flush_nif, 0}
+    {"match_pattern", 2, match_pattern_nif, 0}
 };
 
 ERL_NIF_INIT(elmdb, nif_funcs, load, NULL, NULL, unload)
