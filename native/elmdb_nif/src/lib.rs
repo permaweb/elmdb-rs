@@ -266,7 +266,7 @@ fn new_overlay_map() -> OverlayMap {
 }
 
 fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lmdb::Error> {
-    let mut env_builder = Environment::new();
+    let mut env_builder = Environment::builder();
 
     if let Some(map_size) = options.map_size {
         env_builder.set_map_size(map_size as usize);
@@ -308,6 +308,26 @@ fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lm
 
 impl LmdbEnv {
     fn set_options(&self, options: EnvOptions) -> Result<(), String> {
+        let existing = self
+            .options
+            .read()
+            .map_err(|_| "Failed to read environment options".to_string())?
+            .clone();
+        let has_live_env = self
+            .state
+            .read()
+            .map_err(|_| "Failed to read environment state".to_string())?
+            .env
+            .is_some();
+
+        if has_live_env {
+            if let Some(option_name) = existing.immutable_mismatch(&options) {
+                return Err(format!(
+                    "Cannot change immutable environment option {option_name} for an open path"
+                ));
+            }
+        }
+
         let mut stored = self
             .options
             .write()
@@ -691,7 +711,7 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
         }
         if has_options {
             if let Err(error_msg) = existing_env.set_options(parsed_options) {
-                return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
+                return Ok((atoms::error(), atoms::validation_error(), error_msg).encode(env));
             }
         }
         if let Err(error_msg) = existing_env.ensure_open() {
@@ -1963,14 +1983,13 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
                     }
                 }
                 "encrypt" => {
-                    if let Ok(key) = value.decode::<Binary>() {
-                        if key.as_slice().len() != 32 {
-                            return Err(Error::BadArg);
-                        }
-                        let mut encrypt_key = [0u8; 32];
-                        encrypt_key.copy_from_slice(key.as_slice());
-                        env_opts.encrypt_key = Some(encrypt_key);
+                    let key = value.decode::<Binary>().map_err(|_| Error::BadArg)?;
+                    if key.as_slice().len() != 32 {
+                        return Err(Error::BadArg);
                     }
+                    let mut encrypt_key = [0u8; 32];
+                    encrypt_key.copy_from_slice(key.as_slice());
+                    env_opts.encrypt_key = Some(encrypt_key);
                 }
                 _ => {}
             }
@@ -2020,6 +2039,33 @@ struct EnvOptions {
     no_subdir: bool,
     write_map: bool,
     no_readahead: bool,
+}
+
+impl EnvOptions {
+    fn immutable_mismatch(&self, other: &Self) -> Option<&'static str> {
+        if self.encrypt_key != other.encrypt_key {
+            return Some("encrypt");
+        }
+        if self.no_lock != other.no_lock {
+            return Some("no_lock");
+        }
+        if self.no_subdir != other.no_subdir {
+            return Some("no_subdir");
+        }
+        if self.write_map != other.write_map {
+            return Some("write_map");
+        }
+        if self.no_mem_init != other.no_mem_init {
+            return Some("no_mem_init");
+        }
+        if self.no_sync != other.no_sync {
+            return Some("no_sync");
+        }
+        if self.no_readahead != other.no_readahead {
+            return Some("no_readahead");
+        }
+        None
+    }
 }
 
 #[derive(Default)]

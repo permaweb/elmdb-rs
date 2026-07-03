@@ -199,6 +199,58 @@ encrypted_environment_test_() ->
             end)
     ].
 
+encrypted_environment_option_validation_test_() ->
+    [
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                try
+                    ?assertError(badarg, elmdb:env_open(Dir, [{encrypt, not_a_key}])),
+                    ?assertError(badarg, elmdb:env_open(Dir, [{encrypt, <<"short">>}]))
+                after
+                    file:del_dir_r(Dir)
+                end
+            end)
+    ].
+
+encrypted_environment_rejects_incompatible_reopen_test_() ->
+    [
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                Key = <<0:256>>,
+                try
+                    {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}]),
+                    ?assertMatch({error, validation_error, _},
+                                 elmdb:env_open(Dir, [{map_size, 10485760}, {encrypt, Key}])),
+                    ok = elmdb:env_close(Env)
+                after
+                    file:del_dir_r(Dir)
+                end
+            end),
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                Key = <<0:256>>,
+                OtherKey = <<1:256>>,
+                try
+                    {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {encrypt, Key}]),
+                    {ok, EnvAgain} = elmdb:env_open(Dir, [{map_size, 20971520}, {encrypt, Key}]),
+                    ?assertEqual(Env, EnvAgain),
+                    ?assertMatch({error, validation_error, _},
+                                 elmdb:env_open(Dir, [{map_size, 10485760}, {encrypt, OtherKey}])),
+                    ?assertMatch({error, validation_error, _},
+                                 elmdb:env_open(Dir, [{map_size, 10485760}])),
+                    ok = elmdb:env_close(Env)
+                after
+                    file:del_dir_r(Dir)
+                end
+            end)
+    ].
+
 %%%===================================================================
 %%% List Operation Tests  
 %%%===================================================================

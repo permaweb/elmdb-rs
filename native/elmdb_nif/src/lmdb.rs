@@ -183,7 +183,7 @@ pub struct Environment {
 }
 
 impl Environment {
-    pub fn new() -> EnvironmentBuilder {
+    pub fn builder() -> EnvironmentBuilder {
         EnvironmentBuilder {
             flags: EnvironmentFlags::empty(),
             max_readers: None,
