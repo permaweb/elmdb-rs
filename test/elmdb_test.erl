@@ -139,6 +139,67 @@ singleton_reopen_test_() ->
     ].
 
 %%%===================================================================
+%%% Environment Option Tests
+%%%===================================================================
+
+no_subdir_environment_test_() ->
+    [
+     ?_test(begin
+                Path = filename:join(
+                    ["/tmp", "elmdb_no_subdir_" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".mdb"]
+                ),
+                LockPath = Path ++ "-lock",
+                _ = file:delete(Path),
+                _ = file:delete(LockPath),
+                try
+                    ok = filelib:ensure_dir(Path),
+                    {ok, Env} = elmdb:env_open(Path, [no_subdir, {map_size, 10485760}]),
+                    {ok, DB} = elmdb:db_open(Env, [create]),
+                    ok = elmdb:put(DB, <<"file-key">>, <<"file-value">>),
+                    ok = elmdb:flush(DB),
+                    ?assertEqual({ok, <<"file-value">>}, elmdb:get(DB, <<"file-key">>)),
+                    ?assert(filelib:is_file(Path)),
+                    ?assert(filelib:is_file(LockPath)),
+                    ok = elmdb:db_close(DB),
+                    ok = elmdb:env_close(Env)
+                after
+                    _ = file:delete(Path),
+                    _ = file:delete(LockPath)
+                end
+            end)
+    ].
+
+encrypted_environment_test_() ->
+    [
+     ?_test(begin
+                Dir = test_dir(),
+                file:del_dir_r(Dir),
+                filelib:ensure_dir(Dir ++ "/"),
+                Key = <<0, 1, 2, 3, 4, 5, 6, 7,
+                        8, 9, 10, 11, 12, 13, 14, 15,
+                        16, 17, 18, 19, 20, 21, 22, 23,
+                        24, 25, 26, 27, 28, 29, 30, 31>>,
+                PlainKey = <<"secret-key-for-plaintext-scan">>,
+                PlainValue = <<"secret-value-for-plaintext-scan">>,
+                try
+                    {ok, Env} = elmdb:env_open(Dir, [{map_size, 10485760}, {encrypt, Key}]),
+                    {ok, DB} = elmdb:db_open(Env, [create]),
+                    ok = elmdb:put(DB, PlainKey, PlainValue),
+                    ok = elmdb:flush(DB),
+                    ok = elmdb:env_sync(Env),
+                    ?assertEqual({ok, PlainValue}, elmdb:get(DB, PlainKey)),
+                    {ok, Bytes} = file:read_file(filename:join(Dir, "data.mdb")),
+                    ?assertEqual(nomatch, binary:match(Bytes, PlainKey)),
+                    ?assertEqual(nomatch, binary:match(Bytes, PlainValue)),
+                    ok = elmdb:db_close(DB),
+                    ok = elmdb:env_close(Env)
+                after
+                    file:del_dir_r(Dir)
+                end
+            end)
+    ].
+
+%%%===================================================================
 %%% List Operation Tests  
 %%%===================================================================
 

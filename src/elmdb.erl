@@ -79,8 +79,13 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %% @param Options Configuration options:
 %%   - {map_size, integer()}: Maximum database size in bytes
 %%   - {max_readers, integer()}: Maximum number of reader slots (default: 126)
+%%   - {batch_size, integer()}: Buffered write batch size
+%%   - {encrypt, <<_:256>>}: Enable LMDB page encryption with a 32-byte key
 %%   - no_mem_init: Don't initialize malloc'd memory before writing to disk
 %%   - no_sync: Don't flush system buffers to disk when committing
+%%   - no_lock: Don't use LMDB's lock file
+%%   - no_readahead: Disable OS readahead for random reads
+%%   - no_subdir: Treat Path as the database file, not a directory
 %%   - write_map: Use a writeable memory map for better performance
 %% @returns {ok, Env} where Env is an opaque environment handle
 %%          {error, directory_not_found} if the directory doesn't exist
