@@ -23,9 +23,27 @@ cleanup({Dir, _Env, _DB}) ->
     catch elmdb:env_close_by_name(Dir),
     file:del_dir_r(Dir).
 
+setup_encrypted() ->
+    Dir = test_dir(),
+    file:del_dir_r(Dir),
+    ok = filelib:ensure_dir(Dir ++ "/"),
+    {ok, Env} = elmdb:env_open(
+        Dir,
+        [
+            {map_size, 64 * 1024 * 1024},
+            {batch_size, 1000},
+            {encrypt, encrypted_key()}
+        ]
+    ),
+    {ok, DB} = elmdb:db_open(Env, [create]),
+    {Dir, Env, DB}.
+
 test_dir() ->
     Unique = erlang:unique_integer([positive]),
     filename:join(["/tmp", "elmdb_test_" ++ integer_to_list(Unique)]).
+
+encrypted_key() ->
+    <<"01234567890123456789012345678901">>.
 
 %%%===================================================================
 %%% put / get
@@ -187,6 +205,55 @@ reopen_test_() ->
                     ?assertEqual({error, not_found}, elmdb:env_close_by_name(<<"/tmp/nope-elmdb">>))
                 end)
      end}.
+
+encrypted_env_test_() ->
+    {setup, fun setup_encrypted/0, fun cleanup/1,
+     fun({Dir, _Env, DB}) ->
+         ?_test(begin
+                    Key = <<"secret-key-for-plaintext-scan">>,
+                    Value = <<"secret-value-for-plaintext-scan">>,
+                    ok = elmdb:put(DB, Key, Value),
+                    ok = elmdb:flush(DB),
+                    ?assertEqual({ok, Value}, elmdb:get(DB, Key)),
+                    {ok, Bytes} = file:read_file(filename:join(Dir, "data.mdb")),
+                    ?assertEqual(nomatch, binary:match(Bytes, Key)),
+                    ?assertEqual(nomatch, binary:match(Bytes, Value)),
+                    ok = elmdb:env_close_by_name(Dir),
+                    ?assertEqual({ok, Value}, elmdb:get(DB, Key))
+                end)
+     end}.
+
+encrypted_env_rejects_bad_key_test() ->
+    Dir = test_dir(),
+    file:del_dir_r(Dir),
+    ok = filelib:ensure_dir(Dir ++ "/"),
+    try
+        ?assertError(
+            badarg,
+            elmdb:env_open(Dir, [{map_size, 64 * 1024 * 1024}, {encrypt, <<"short">>}])
+        )
+    after
+        file:del_dir_r(Dir)
+    end.
+
+no_subdir_file_env_test() ->
+    Path = test_dir(),
+    file:delete(Path),
+    file:delete(Path ++ "-lock"),
+    try
+        {ok, Env} = elmdb:env_open(
+            Path,
+            [{map_size, 64 * 1024 * 1024}, no_subdir, no_lock]
+        ),
+        {ok, DB} = elmdb:db_open(Env, [create]),
+        ok = elmdb:put(DB, <<"hello">>, <<"world">>),
+        ?assertEqual({ok, <<"world">>}, elmdb:get(DB, <<"hello">>)),
+        ?assert(filelib:is_file(Path))
+    after
+        catch elmdb:env_close_by_name(Path),
+        file:delete(Path),
+        file:delete(Path ++ "-lock")
+    end.
 
 %%%===================================================================
 %%% Concurrency: parallel reads + close-vs-read race

@@ -1,3 +1,4 @@
+#include "lmdb/chacha8.h"
 #include "lmdb/lmdb.h"
 
 #include <erl_nif.h>
@@ -31,6 +32,8 @@ typedef struct {
     unsigned int max_readers;
     size_t batch_size;
     unsigned int flags;
+    int encrypted;
+    unsigned char encryption_key[CHACHA8_KEY_SIZE];
     unsigned long generation;
     unsigned int ref_count;
     int close_requested;
@@ -111,8 +114,10 @@ static ERL_NIF_TERM ATOM_BATCH_SIZE;
 static ERL_NIF_TERM ATOM_NO_MEM_INIT;
 static ERL_NIF_TERM ATOM_NO_SYNC;
 static ERL_NIF_TERM ATOM_NO_LOCK;
+static ERL_NIF_TERM ATOM_NO_SUBDIR;
 static ERL_NIF_TERM ATOM_WRITE_MAP;
 static ERL_NIF_TERM ATOM_NO_READAHEAD;
+static ERL_NIF_TERM ATOM_ENCRYPT;
 static ERL_NIF_TERM ATOM_INVALID;
 static ERL_NIF_TERM ATOM_INVALID_PATH;
 static ERL_NIF_TERM ATOM_PERMISSION_DENIED;
@@ -135,6 +140,8 @@ static ERL_NIF_TERM ATOM_NO_SPACE;
 static ERL_NIF_TERM ATOM_IO_ERROR;
 static ERL_NIF_TERM ATOM_CORRUPTED;
 static ERL_NIF_TERM ATOM_VERSION_MISMATCH;
+static ERL_NIF_TERM ATOM_CRYPTO_FAIL;
+static ERL_NIF_TERM ATOM_ENV_ENCRYPTION;
 static ERL_NIF_TERM ATOM_MAP_RESIZED;
 static ERL_NIF_TERM ATOM_INCOMPATIBLE;
 static ERL_NIF_TERM ATOM_BAD_RSLOT;
@@ -274,6 +281,8 @@ static ERL_NIF_TERM lmdb_error_atom(int rc) {
     case MDB_CORRUPTED: return ATOM_CORRUPTED;
     case MDB_PANIC: return ATOM_PANIC;
     case MDB_VERSION_MISMATCH: return ATOM_VERSION_MISMATCH;
+    case MDB_CRYPTO_FAIL: return ATOM_CRYPTO_FAIL;
+    case MDB_ENV_ENCRYPTION: return ATOM_ENV_ENCRYPTION;
     case MDB_INVALID: return ATOM_INVALID;
     case MDB_MAP_FULL: return ATOM_MAP_FULL;
     case MDB_DBS_FULL: return ATOM_DBS_FULL;
@@ -299,9 +308,61 @@ static int path_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
-static int path_is_dir(const char *path) {
+static int path_is_dir_or_raw(const char *path) {
     struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    return stat(path, &st) == 0 &&
+        (S_ISDIR(st.st_mode) || S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode));
+}
+
+static int parent_path_is_dir(const char *path) {
+    const char *slash = strrchr(path, '/');
+    size_t len;
+    char *parent;
+    int ok;
+
+    if (slash == NULL) {
+        return 1;
+    }
+    len = (size_t)(slash - path);
+    if (len == 0) {
+        len = 1;
+    }
+    parent = enif_alloc(len + 1);
+    if (parent == NULL) {
+        return 0;
+    }
+    memcpy(parent, path, len);
+    parent[len] = '\0';
+    ok = path_is_dir_or_raw(parent);
+    enif_free(parent);
+    return ok;
+}
+
+static int path_is_valid_lmdb_target(const char *path, unsigned int flags) {
+    if (path_is_dir_or_raw(path)) {
+        return 1;
+    }
+    return (flags & MDB_NOSUBDIR) && parent_path_is_dir(path);
+}
+
+static int elmdb_chacha8_encrypt(
+    const MDB_val *src,
+    MDB_val *dst,
+    const MDB_val *key,
+    int encdec
+) {
+    (void)encdec;
+    if (key[0].mv_size != CHACHA8_KEY_SIZE || key[1].mv_size < CHACHA8_IV_SIZE) {
+        return EINVAL;
+    }
+    chacha8(
+        src->mv_data,
+        src->mv_size,
+        key[0].mv_data,
+        key[1].mv_data,
+        dst->mv_data
+    );
+    return 0;
 }
 
 static int parse_env_options(ErlNifEnv *env, ERL_NIF_TERM list, EnvResource *target) {
@@ -321,6 +382,14 @@ static int parse_env_options(ErlNifEnv *env, ERL_NIF_TERM list, EnvResource *tar
             } else if (is_atom(env, tuple[0], ATOM_BATCH_SIZE) &&
                        get_ulong(env, tuple[1], &value) && value > 0) {
                 target->batch_size = (size_t)value;
+            } else if (is_atom(env, tuple[0], ATOM_ENCRYPT)) {
+                ErlNifBinary key;
+                if (!enif_inspect_binary(env, tuple[1], &key) ||
+                    key.size != CHACHA8_KEY_SIZE) {
+                    return 0;
+                }
+                memcpy(target->encryption_key, key.data, CHACHA8_KEY_SIZE);
+                target->encrypted = 1;
             }
         } else if (is_atom(env, head, ATOM_NO_MEM_INIT)) {
             target->flags |= MDB_NOMEMINIT;
@@ -328,6 +397,8 @@ static int parse_env_options(ErlNifEnv *env, ERL_NIF_TERM list, EnvResource *tar
             target->flags |= MDB_NOSYNC;
         } else if (is_atom(env, head, ATOM_NO_LOCK)) {
             target->flags |= MDB_NOLOCK;
+        } else if (is_atom(env, head, ATOM_NO_SUBDIR)) {
+            target->flags |= MDB_NOSUBDIR;
         } else if (is_atom(env, head, ATOM_WRITE_MAP)) {
             target->flags |= MDB_WRITEMAP;
         } else if (is_atom(env, head, ATOM_NO_READAHEAD)) {
@@ -336,6 +407,23 @@ static int parse_env_options(ErlNifEnv *env, ERL_NIF_TERM list, EnvResource *tar
     }
 
     return enif_is_empty_list(env, tail);
+}
+
+static int env_encryption_matches(EnvResource *left, EnvResource *right) {
+    if (left->encrypted != right->encrypted) {
+        return 0;
+    }
+    return !left->encrypted ||
+        memcmp(left->encryption_key, right->encryption_key, CHACHA8_KEY_SIZE) == 0;
+}
+
+static void apply_env_options(EnvResource *target, EnvResource *source) {
+    target->map_size = source->map_size;
+    target->max_readers = source->max_readers;
+    target->batch_size = source->batch_size;
+    target->flags = source->flags;
+    target->encrypted = source->encrypted;
+    memcpy(target->encryption_key, source->encryption_key, CHACHA8_KEY_SIZE);
 }
 
 static int open_env_locked(EnvResource *res, int *rc_out) {
@@ -353,6 +441,10 @@ static int open_env_locked(EnvResource *res, int *rc_out) {
     rc = mdb_env_set_mapsize(mdb_env, res->map_size == 0 ? DEFAULT_MAP_SIZE : res->map_size);
     if (rc == MDB_SUCCESS && res->max_readers > 0) {
         rc = mdb_env_set_maxreaders(mdb_env, res->max_readers);
+    }
+    if (rc == MDB_SUCCESS && res->encrypted) {
+        MDB_val key = { CHACHA8_KEY_SIZE, res->encryption_key };
+        rc = mdb_env_set_encrypt(mdb_env, elmdb_chacha8_encrypt, &key, 0);
     }
     if (rc == MDB_SUCCESS) {
         rc = mdb_env_open(mdb_env, res->path, res->flags, DEFAULT_MODE);
@@ -624,6 +716,14 @@ static ERL_NIF_TERM env_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     if (argc != 2 || !term_to_path(env, argv[0], &path) || !enif_is_list(env, argv[1])) {
         return enif_make_badarg(env);
     }
+    EnvResource requested;
+    memset(&requested, 0, sizeof(requested));
+    requested.map_size = DEFAULT_MAP_SIZE;
+    requested.batch_size = DEFAULT_BATCH_SIZE;
+    if (!parse_env_options(env, argv[1], &requested)) {
+        enif_free(path);
+        return enif_make_badarg(env);
+    }
 
     enif_mutex_lock(REGISTRY_MUTEX);
     EnvResource *existing = find_env_by_path(path);
@@ -633,7 +733,18 @@ static ERL_NIF_TERM env_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         enif_free(path);
 
         enif_mutex_lock(existing->mutex);
-        parse_env_options(env, argv[1], existing);
+        EnvResource merged = *existing;
+        if (!parse_env_options(env, argv[1], &merged)) {
+            enif_mutex_unlock(existing->mutex);
+            enif_release_resource(existing);
+            return enif_make_badarg(env);
+        }
+        if (existing->env != NULL && !env_encryption_matches(existing, &merged)) {
+            enif_mutex_unlock(existing->mutex);
+            enif_release_resource(existing);
+            return error2(env, ATOM_ENV_ENCRYPTION);
+        }
+        apply_env_options(existing, &merged);
         int rc = MDB_SUCCESS;
         int ok = open_env_locked(existing, &rc);
         enif_mutex_unlock(existing->mutex);
@@ -646,12 +757,13 @@ static ERL_NIF_TERM env_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         return enif_make_tuple2(env, ATOM_OK, term);
     }
 
-    if (!path_exists(path)) {
+    if (!path_exists(path) &&
+        !((requested.flags & MDB_NOSUBDIR) && parent_path_is_dir(path))) {
         enif_mutex_unlock(REGISTRY_MUTEX);
         enif_free(path);
         return error2(env, ATOM_DIRECTORY_NOT_FOUND);
     }
-    if (!path_is_dir(path)) {
+    if (!path_is_valid_lmdb_target(path, requested.flags)) {
         enif_mutex_unlock(REGISTRY_MUTEX);
         enif_free(path);
         return error2(env, ATOM_INVALID_PATH);
@@ -665,8 +777,7 @@ static ERL_NIF_TERM env_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     }
     memset(res, 0, sizeof(*res));
     res->path = path;
-    res->map_size = DEFAULT_MAP_SIZE;
-    res->batch_size = DEFAULT_BATCH_SIZE;
+    apply_env_options(res, &requested);
     res->mutex = enif_mutex_create("elmdb_env");
     res->env_lock = enif_rwlock_create("elmdb_env_lock");
     if (res->mutex == NULL || res->env_lock == NULL) {
@@ -674,8 +785,6 @@ static ERL_NIF_TERM env_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         enif_release_resource(res);
         return error2(env, ATOM_ENVIRONMENT_ERROR);
     }
-    parse_env_options(env, argv[1], res);
-
     int rc = MDB_SUCCESS;
     enif_mutex_lock(res->mutex);
     int ok = open_env_locked(res, &rc);
@@ -870,15 +979,16 @@ static int decode_batch(ErlNifEnv *env, ERL_NIF_TERM list, DbResource *db, Write
         *count_out = 0;
         return 1;
     }
-    if ((size_t)len > SIZE_MAX / sizeof(WriteOp)) {
+    size_t bytes = (size_t)len * sizeof(WriteOp);
+    if (bytes / sizeof(WriteOp) != (size_t)len) {
         return 0;
     }
 
-    WriteOp *ops = enif_alloc(sizeof(WriteOp) * len);
+    WriteOp *ops = enif_alloc(bytes);
     if (ops == NULL) {
         return 0;
     }
-    memset(ops, 0, sizeof(WriteOp) * len);
+    memset(ops, 0, bytes);
 
     ERL_NIF_TERM head;
     ERL_NIF_TERM tail = list;
@@ -935,15 +1045,16 @@ static int decode_batch_refs(ErlNifEnv *env, ERL_NIF_TERM list, WriteOp **ops_ou
         *count_out = 0;
         return 1;
     }
-    if ((size_t)len > SIZE_MAX / sizeof(WriteOp)) {
+    size_t bytes = (size_t)len * sizeof(WriteOp);
+    if (bytes / sizeof(WriteOp) != (size_t)len) {
         return 0;
     }
 
-    WriteOp *ops = enif_alloc(sizeof(WriteOp) * len);
+    WriteOp *ops = enif_alloc(bytes);
     if (ops == NULL) {
         return 0;
     }
-    memset(ops, 0, sizeof(WriteOp) * len);
+    memset(ops, 0, bytes);
 
     ERL_NIF_TERM head;
     ERL_NIF_TERM tail = list;
@@ -1601,8 +1712,10 @@ static int load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     ATOM_NO_MEM_INIT = make_atom(env, "no_mem_init");
     ATOM_NO_SYNC = make_atom(env, "no_sync");
     ATOM_NO_LOCK = make_atom(env, "no_lock");
+    ATOM_NO_SUBDIR = make_atom(env, "no_subdir");
     ATOM_WRITE_MAP = make_atom(env, "write_map");
     ATOM_NO_READAHEAD = make_atom(env, "no_readahead");
+    ATOM_ENCRYPT = make_atom(env, "encrypt");
     ATOM_INVALID = make_atom(env, "invalid");
     ATOM_INVALID_PATH = make_atom(env, "invalid_path");
     ATOM_PERMISSION_DENIED = make_atom(env, "permission_denied");
@@ -1625,6 +1738,8 @@ static int load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     ATOM_IO_ERROR = make_atom(env, "io_error");
     ATOM_CORRUPTED = make_atom(env, "corrupted");
     ATOM_VERSION_MISMATCH = make_atom(env, "version_mismatch");
+    ATOM_CRYPTO_FAIL = make_atom(env, "crypto_fail");
+    ATOM_ENV_ENCRYPTION = make_atom(env, "env_encryption");
     ATOM_MAP_RESIZED = make_atom(env, "map_resized");
     ATOM_INCOMPATIBLE = make_atom(env, "incompatible");
     ATOM_BAD_RSLOT = make_atom(env, "bad_rslot");

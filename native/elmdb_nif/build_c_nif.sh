@@ -8,10 +8,10 @@ LMDB_SRC="$C_SRC/lmdb"
 
 mkdir -p "$PRIV"
 
-ERTS_INCLUDE=$(erl -noshell -eval \
-    'io:format("~s/erts-~s/include", [code:root_dir(), erlang:system_info(version)]), halt().')
+ERTS_INCLUDE=${ELMDB_NIF_ERTS_INCLUDE:-$(erl -noshell -eval \
+    'io:format("~s/erts-~s/include", [code:root_dir(), erlang:system_info(version)]), halt().')}
 
-CC=${CC:-cc}
+CC=${ELMDB_NIF_CC:-${CC:-cc}}
 
 # Probe whether the compiler/linker accepts a flag; echo it back if so. Keeps
 # the aggressive flags below portable across the arm64 Macs and x86 appliances
@@ -32,7 +32,7 @@ probe() {
 # -fno-semantic-interposition: let intra-library calls to exported symbols be
 #        inlined despite -fPIC, instead of going through the PLT.
 # native tuning: this NIF is compiled on the machine it runs on.
-BASE_CFLAGS=${CFLAGS:-"-O3 -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter"}
+BASE_CFLAGS=${ELMDB_NIF_CFLAGS:-${CFLAGS:-"-O3 -std=c11 -fPIC -Wall -Wextra -Wno-unused-parameter"}}
 OPT_CFLAGS="-DNDEBUG"
 OPT_CFLAGS="$OPT_CFLAGS $(probe -flto)"
 OPT_CFLAGS="$OPT_CFLAGS $(probe -fno-semantic-interposition)"
@@ -53,6 +53,11 @@ case "$(uname -s)" in
         SHARED_FLAGS="-shared"
         ;;
 esac
+if [ -n "${ELMDB_NIF_OUT:-}" ]; then
+    OUT="$ELMDB_NIF_OUT"
+    SHARED_FLAGS=${ELMDB_NIF_SHARED_FLAGS:-"-shared"}
+fi
+mkdir -p "$(dirname "$OUT")"
 
 "$CC" $BASE_CFLAGS $OPT_CFLAGS $LOCK_FLAGS \
     -I"$ERTS_INCLUDE" \
@@ -61,19 +66,22 @@ esac
     "$C_SRC/elmdb_nif.c" \
     "$LMDB_SRC/mdb.c" \
     "$LMDB_SRC/midl.c" \
+    "$LMDB_SRC/chacha8.c" \
     $SHARED_FLAGS \
     -pthread
 
-(
-    cd "$PRIV"
-    case "$(basename "$OUT")" in
-        *.dylib)
-            ln -sf "$(basename "$OUT")" elmdb_nif.so
-            ln -sf "$(basename "$OUT")" libelmdb_nif.so
-            ;;
-        *.so)
-            ln -sf "$(basename "$OUT")" elmdb_nif.so
-            ln -sf "$(basename "$OUT")" libelmdb_nif.dylib
-            ;;
-    esac
-)
+if [ "${ELMDB_NIF_OUT:-}" = "" ]; then
+    (
+        cd "$PRIV"
+        case "$(basename "$OUT")" in
+            *.dylib)
+                ln -sf "$(basename "$OUT")" elmdb_nif.so
+                ln -sf "$(basename "$OUT")" libelmdb_nif.so
+                ;;
+            *.so)
+                ln -sf "$(basename "$OUT")" elmdb_nif.so
+                ln -sf "$(basename "$OUT")" libelmdb_nif.dylib
+                ;;
+        esac
+    )
+fi

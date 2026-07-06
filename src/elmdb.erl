@@ -62,8 +62,10 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %%   `no_mem_init'          skip zeroing freshly malloc'd pages
 %%   `no_sync'              don't fsync on commit
 %%   `no_lock'              skip the LMDB reader lock table
+%%   `no_subdir'            use Path as the data file, not an env directory
 %%   `write_map'            use a writeable memory map
 %%   `no_readahead'         disable OS readahead
+%%   `{encrypt, Key}'       enable LMDB 1.0 page encryption with a 32-byte key
 -spec env_open(Path :: binary() | string(), Options :: list()) ->
     {ok, term()} | {error, term()}.
 env_open(_Path, _Options) ->
