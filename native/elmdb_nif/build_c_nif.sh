@@ -12,6 +12,7 @@ ERTS_INCLUDE=${ELMDB_NIF_ERTS_INCLUDE:-$(erl -noshell -eval \
     'io:format("~s/erts-~s/include", [code:root_dir(), erlang:system_info(version)]), halt().')}
 
 CC=${ELMDB_NIF_CC:-${CC:-cc}}
+TARGET_OS=${ELMDB_NIF_TARGET_OS:-$(uname -s)}
 
 # Probe whether the compiler/linker accepts a flag; echo it back if so. Keeps
 # the aggressive flags below portable across the arm64 Macs and x86 appliances
@@ -42,7 +43,7 @@ OPT_CFLAGS="$OPT_CFLAGS $NATIVE"
 
 LOCK_FLAGS=""
 
-case "$(uname -s)" in
+case "$TARGET_OS" in
     Darwin)
         OUT="$PRIV/libelmdb_nif.dylib"
         SHARED_FLAGS="-dynamiclib -undefined dynamic_lookup"

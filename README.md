@@ -26,6 +26,8 @@ make test       # run the EUnit suite
 
 Requires Erlang/OTP 24+ and a C11 compiler. The NIF is compiled on the host by
 `build_c_nif.sh` with `-O3 -flto` and native tuning (`-mcpu=native`/`-march=native`).
+Cross builds can set `ELMDB_NIF_CC`, `ELMDB_NIF_ERTS_INCLUDE`,
+`ELMDB_NIF_OUT`, `ELMDB_NIF_SHARED_FLAGS`, and `ELMDB_NIF_TARGET_OS`.
 
 ## API
 
