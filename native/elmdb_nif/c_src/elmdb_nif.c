@@ -171,6 +171,13 @@ static ERL_NIF_TERM error3_rc(ErlNifEnv *env, ERL_NIF_TERM type, const char *con
     return error3(env, type, buffer);
 }
 
+static void secure_zero(void *ptr, size_t len) {
+    volatile unsigned char *p = ptr;
+    while (len-- > 0) {
+        *p++ = 0;
+    }
+}
+
 static int term_to_path(ErlNifEnv *env, ERL_NIF_TERM term, char **out) {
     ErlNifBinary bin;
     if (enif_inspect_binary(env, term, &bin)) {
@@ -1655,6 +1662,7 @@ static void env_dtor(ErlNifEnv *env, void *obj) {
     if (res->path != NULL) {
         enif_free(res->path);
     }
+    secure_zero(res->encryption_key, sizeof(res->encryption_key));
     if (res->mutex != NULL) {
         enif_mutex_destroy(res->mutex);
     }
