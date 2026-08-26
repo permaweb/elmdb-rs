@@ -226,6 +226,16 @@ positioned_read_test_() ->
                         elmdb:read_dups(DB, <<"k">>,
                                         [{from, item(99)}, {direction, backward},
                                          {limit, 2}])),
+          % Empty bounds resolve to their mathematical meaning rather than
+          % LMDB's zero-size-data error: everything is >= <<>> and carries
+          % the empty prefix, while nothing is =< <<>>.
+          ?_assertEqual({ok, [item(2), item(4), item(6), item(8), item(10)]},
+                        elmdb:read_dups(DB, <<"k">>, [{from, <<>>}])),
+          ?_assertEqual({ok, []},
+                        elmdb:read_dups(DB, <<"k">>,
+                                        [{from, <<>>}, {direction, backward}])),
+          ?_assertEqual({ok, [item(2), item(4), item(6), item(8), item(10)]},
+                        elmdb:read_dups(DB, <<"k">>, [{prefix, <<>>}])),
           % Key presence separates an empty selection from a missing set.
           ?_assertEqual(not_found, elmdb:read_dups(DB, <<"missing">>, [])),
           % Malformed options are refused.

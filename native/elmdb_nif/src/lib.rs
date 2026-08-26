@@ -1120,13 +1120,11 @@ impl LmdbDatabase {
             return Err("Database dup flags do not match the existing database".to_string());
         }
 
-        let db = if state.create_if_missing {
-            live_env.create_db(None, self.db_flags)
-        } else {
-            match live_env.create_db(None, self.db_flags) {
-                Ok(db) => Ok(db),
-                Err(_) => live_env.open_db(None),
-            }
+        // create_db also serves read_only environments: its write transaction
+        // fails there and the fallback opens the existing database.
+        let db = match live_env.create_db(None, self.db_flags) {
+            Ok(db) => Ok(db),
+            Err(_) => live_env.open_db(None),
         }
         .map_err(|e| format!("Failed to open database: {:?}", e))?;
 
@@ -2175,7 +2173,18 @@ fn read_dups<'a>(
     key: Binary,
     options: Vec<Term<'a>>,
 ) -> NifResult<Term<'a>> {
-    let read_opts = parse_dup_read_options(options)?;
+    let mut read_opts = parse_dup_read_options(options)?;
+    // LMDB refuses zero-size data, so empty bounds are resolved here: an
+    // empty prefix matches everything, an empty from bounds nothing going
+    // forward and everything going backward.
+    let empty_backward_from = read_opts.backward
+        && read_opts.from.as_deref().map_or(false, |from| from.is_empty());
+    if read_opts.prefix.as_deref().map_or(false, |prefix| prefix.is_empty()) {
+        read_opts.prefix = None;
+    }
+    if read_opts.from.as_deref().map_or(false, |from| from.is_empty()) {
+        read_opts.from = None;
+    }
     if let Err(error_msg) = db_handle.validate_database() {
         return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
     }
@@ -2244,7 +2253,10 @@ fn read_dups<'a>(
     // Position on the first duplicate of the selection. GET_BOTH_RANGE seeks
     // within the key's duplicate set to the first value >= its data argument;
     // MDB_NOTFOUND from it means every duplicate sorts below that bound.
-    let positioned = if !read_opts.backward {
+    let positioned = if empty_backward_from {
+        // No duplicate can sort at or below the empty binary.
+        false
+    } else if !read_opts.backward {
         let target = match (&read_opts.from, &read_opts.prefix) {
             (Some(from), Some(prefix)) => Some(std::cmp::max(from, prefix).clone()),
             (Some(from), None) => Some(from.clone()),
