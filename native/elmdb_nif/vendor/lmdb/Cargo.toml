@@ -1,0 +1,12 @@
+[package]
+name = "lmdb"
+version = "0.8.0"
+authors = ["Dan Burkert <dan@danburkert.com>"]
+edition = "2015"
+description = "Idiomatic and safe LMDB wrapper over the vendored LMDB 1.0 sources."
+license = "Apache-2.0"
+
+[dependencies]
+bitflags = "1"
+libc = "0.2"
+lmdb-sys = { path = "../lmdb-sys" }

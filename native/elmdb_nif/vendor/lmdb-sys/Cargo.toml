@@ -1,0 +1,14 @@
+[package]
+name = "lmdb-sys"
+version = "0.8.0"
+authors = ["Dan Burkert <dan@danburkert.com>"]
+edition = "2015"
+build = "build.rs"
+description = "Rust bindings for liblmdb, building vendored LMDB 1.0 sources."
+license = "Apache-2.0"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
