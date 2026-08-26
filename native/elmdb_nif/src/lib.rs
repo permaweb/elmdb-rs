@@ -44,6 +44,7 @@ use lmdb_sys as ffi;
 // LMDB cursor operation constants (instead of importing lmdb-sys only for constants from lmdb_sys::ffi).
 // To be improved in the future.
 const MDB_FIRST: u32 = 0;
+const MDB_LAST: u32 = 6;
 const MDB_NEXT: u32 = 8;
 const MDB_SET_RANGE: u32 = 17;
 // Default LMDB max key size. This is controlled by LMDB's compile-time MDB_MAXKEYSIZE.
@@ -103,6 +104,19 @@ impl Drop for RawCursor {
             ffi::mdb_cursor_close(self.cursor);
         }
     }
+}
+
+fn raw_cursor_get(
+    cursor: &RawCursor,
+    key: &mut ffi::MDB_val,
+    data: &mut ffi::MDB_val,
+    op: ffi::MDB_cursor_op,
+) -> i32 {
+    unsafe { ffi::mdb_cursor_get(cursor.cursor, key, data, op) }
+}
+
+fn val_bytes(val: &ffi::MDB_val) -> &[u8] {
+    unsafe { slice::from_raw_parts(val.mv_data as *const u8, val.mv_size) }
 }
 
 mod atoms {
@@ -205,6 +219,8 @@ pub struct LmdbEnv {
 /// Uses a dual-map overlay for lock-free writes with a background flush worker.
 pub struct LmdbDatabase {
     env: ResourceArc<LmdbEnv>,
+    /// LMDB database flags the dbi is opened with (dup behavior derives from these)
+    db_flags: DatabaseFlags,
     /// Active overlay map: all new puts land here
     active: ArcSwap<OverlayMap>,
     /// Draining map: set during flush, readable for get consistency
@@ -261,6 +277,49 @@ fn new_overlay_map() -> OverlayMap {
     SccHashMap::with_hasher(ahash::RandomState::default())
 }
 
+/// Overlay key for a dup database entry: the (Key, Value) pair encoded as a
+/// u32 big-endian key length, the key, then the value. Plain databases key
+/// the overlay by Key alone with replace semantics; dup databases must keep
+/// one overlay entry per pair.
+fn encode_dup_overlay_key(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut composite = Vec::with_capacity(4 + key.len() + value.len());
+    composite.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    composite.extend_from_slice(key);
+    composite.extend_from_slice(value);
+    composite
+}
+
+/// Split a dup overlay composite back into its (Key, Value) parts.
+fn decode_dup_overlay_key(composite: &[u8]) -> (&[u8], &[u8]) {
+    let key_len = u32::from_be_bytes(composite[..4].try_into().unwrap()) as usize;
+    (&composite[4..4 + key_len], &composite[4 + key_len..])
+}
+
+/// Smallest value pending in the overlay maps for `key` in a dup database.
+/// mdb_get returns the first duplicate, so the dup get must consider both
+/// the committed first duplicate and the pending overlay entries.
+fn overlay_min_dup(db: &LmdbDatabase, key: &[u8]) -> Option<Vec<u8>> {
+    let mut min: Option<Vec<u8>> = None;
+    let mut scan = |map: &OverlayMap| {
+        map.iter_sync(|k, _v| {
+            if k.len() >= 4 + key.len() {
+                let (entry_key, value) = decode_dup_overlay_key(k);
+                if entry_key == key
+                    && min.as_deref().map_or(true, |current| value < current)
+                {
+                    min = Some(value.to_vec());
+                }
+            }
+            true
+        });
+    };
+    scan(&db.active.load());
+    if let Some(ref old_map) = **db.draining.load() {
+        scan(old_map);
+    }
+    min
+}
+
 fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lmdb::Error> {
     let mut env_builder = Environment::new();
 
@@ -272,6 +331,10 @@ fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lm
 
     if let Some(max_readers) = options.max_readers {
         env_builder.set_max_readers(max_readers);
+    }
+
+    if let Some(page_size) = options.page_size {
+        env_builder.set_page_size(page_size);
     }
 
     let mut flags = EnvironmentFlags::empty();
@@ -289,6 +352,12 @@ fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lm
     }
     if options.no_readahead {
         flags |= EnvironmentFlags::NO_READAHEAD;
+    }
+    if options.read_only {
+        flags |= EnvironmentFlags::READ_ONLY;
+    }
+    if options.no_subdir {
+        flags |= EnvironmentFlags::NO_SUB_DIR;
     }
     env_builder.set_flags(flags);
 
@@ -419,12 +488,18 @@ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
         }
     };
 
+    let dup = db.is_dup();
     let mut entries = Vec::with_capacity(old_map.len());
     (*old_map).iter_sync(|k, v| {
-        entries.push((k.clone(), v.clone()));
+        let key = if dup {
+            decode_dup_overlay_key(k).0.to_vec()
+        } else {
+            k.clone()
+        };
+        entries.push((key, v.clone()));
         true
     });
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
 
     let mut cursor = match txn.open_rw_cursor(live_db) {
         Ok(cursor) => cursor,
@@ -709,7 +784,11 @@ fn env_open<'a>(env: Env<'a>, path: Term<'a>, options: Vec<Term<'a>>) -> NifResu
         Err(e) => {
             let path = Path::new(path_str);
 
-            let error_atom = if !path.exists() {
+            // A no_subdir path names the data file itself, so the directory
+            // probing below does not apply.
+            let error_atom = if parsed_options.no_subdir {
+                lmdb_error_to_atom(e)
+            } else if !path.exists() {
                 atoms::directory_not_found()
             } else if path.is_file() {
                 atoms::invalid_path()
@@ -839,6 +918,13 @@ fn db_open<'a>(
     options: Vec<Term<'a>>,
 ) -> NifResult<Term<'a>> {
     let parsed_options = parse_db_options(options)?;
+    let db_flags = if parsed_options.dupfixed {
+        DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED
+    } else if parsed_options.dupsort {
+        DatabaseFlags::DUP_SORT
+    } else {
+        DatabaseFlags::empty()
+    };
     if let Err(error_msg) = env_handle.ensure_open() {
         return Ok((atoms::error(), atoms::environment_error(), error_msg).encode(env));
     }
@@ -854,6 +940,14 @@ fn db_open<'a>(
         let databases = DATABASES.lock().map_err(|_| Error::BadArg)?;
         databases.get(&db_key).cloned()
     } {
+        if existing_db.db_flags != db_flags {
+            return Ok((
+                atoms::error(),
+                atoms::incompatible(),
+                "Database is already open with different flags".to_string(),
+            )
+                .encode(env));
+        }
         if parsed_options.create {
             if let Err(error_msg) = existing_db.set_create_if_missing(true) {
                 return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
@@ -897,6 +991,7 @@ fn db_open<'a>(
 
     let lmdb_db = LmdbDatabase {
         env: env_handle.clone(),
+        db_flags,
         active: ArcSwap::from_pointee(new_overlay_map()),
         draining: ArcSwap::from_pointee(None),
         op_count: AtomicUsize::new(0),
@@ -947,6 +1042,10 @@ fn db_open<'a>(
 }
 
 impl LmdbDatabase {
+    fn is_dup(&self) -> bool {
+        self.db_flags.contains(DatabaseFlags::DUP_SORT)
+    }
+
     fn set_create_if_missing(&self, create: bool) -> Result<(), String> {
         if !create {
             return Ok(());
@@ -1005,10 +1104,26 @@ impl LmdbDatabase {
             }
         }
 
+        // mdb_dbi_open ORs requested flags into the main DB without
+        // validation, so a dup-mode mismatch against a non-empty database
+        // must be refused here, before the flags could be committed.
+        let dup_mask = DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED;
+        let persisted = live_env
+            .open_db(None)
+            .and_then(|db| live_env.get_db_flags(db))
+            .map_err(|e| format!("Failed to read database flags: {:?}", e))?;
+        let entries = live_env
+            .stat()
+            .map_err(|e| format!("Failed to read database stat: {:?}", e))?
+            .entries();
+        if entries > 0 && (persisted & dup_mask) != (self.db_flags & dup_mask) {
+            return Err("Database dup flags do not match the existing database".to_string());
+        }
+
         let db = if state.create_if_missing {
-            live_env.create_db(None, DatabaseFlags::empty())
+            live_env.create_db(None, self.db_flags)
         } else {
-            match live_env.create_db(None, DatabaseFlags::empty()) {
+            match live_env.create_db(None, self.db_flags) {
                 Ok(db) => Ok(db),
                 Err(_) => live_env.open_db(None),
             }
@@ -1145,9 +1260,26 @@ fn put<'a>(
         }
     }
 
+    let dup = db_handle.is_dup();
+    if dup && value_vec.is_empty() {
+        // LMDB sizes dup data as keys; a zero-size value would only fail
+        // later inside the background flush, poisoning the worker.
+        return Ok((
+            atoms::error(),
+            atoms::bad_val_size(),
+            "Empty value not supported on dup databases".to_string(),
+        )
+            .encode(env));
+    }
+    let overlay_key = if dup {
+        encode_dup_overlay_key(&key_vec, &value_vec)
+    } else {
+        key_vec
+    };
+
     loop {
         let map = db_handle.active.load();
-        let _ = map.upsert_sync(key_vec.clone(), value_vec.clone());
+        let _ = map.upsert_sync(overlay_key.clone(), value_vec.clone());
         if Arc::ptr_eq(&map, &db_handle.active.load()) {
             break;
         }
@@ -1188,24 +1320,29 @@ fn get<'a>(
     }
 
     let key_bytes = key.as_slice();
+    let dup = db_handle.is_dup();
 
-    // Fast path: skip overlay checks if both maps are empty
-    let active_guard = db_handle.active.load();
-    if !active_guard.is_empty() {
-        if let Some(value) = active_guard.read_sync(key_bytes, |_, v| v.clone()) {
-            let mut binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
-            binary.as_mut_slice().copy_from_slice(&value);
-            return Ok((atoms::ok(), binary.release(env)).encode(env));
-        }
-    }
-
-    {
-        let draining_guard = db_handle.draining.load();
-        if let Some(ref old_map) = **draining_guard {
-            if let Some(value) = old_map.read_sync(key_bytes, |_, v| v.clone()) {
+    // Fast path: skip overlay checks if both maps are empty. A dup database
+    // keys its overlay by (Key, Value) composite, so the bare-key lookups do
+    // not apply there; its pending entries are merged after the LMDB read.
+    if !dup {
+        let active_guard = db_handle.active.load();
+        if !active_guard.is_empty() {
+            if let Some(value) = active_guard.read_sync(key_bytes, |_, v| v.clone()) {
                 let mut binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
                 binary.as_mut_slice().copy_from_slice(&value);
                 return Ok((atoms::ok(), binary.release(env)).encode(env));
+            }
+        }
+
+        {
+            let draining_guard = db_handle.draining.load();
+            if let Some(ref old_map) = **draining_guard {
+                if let Some(value) = old_map.read_sync(key_bytes, |_, v| v.clone()) {
+                    let mut binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
+                    binary.as_mut_slice().copy_from_slice(&value);
+                    return Ok((atoms::ok(), binary.release(env)).encode(env));
+                }
             }
         }
     }
@@ -1231,11 +1368,33 @@ fn get<'a>(
 
     match txn.get(live_db, &key_bytes) {
         Ok(value_bytes) => {
+            // A dup get returns the first duplicate, which may still be
+            // pending in the overlay.
+            if dup {
+                if let Some(pending) = overlay_min_dup(db_handle, key_bytes) {
+                    if pending.as_slice() < value_bytes {
+                        let mut binary =
+                            OwnedBinary::new(pending.len()).ok_or(Error::BadArg)?;
+                        binary.as_mut_slice().copy_from_slice(&pending);
+                        return Ok((atoms::ok(), binary.release(env)).encode(env));
+                    }
+                }
+            }
             let mut binary = OwnedBinary::new(value_bytes.len()).unwrap();
             binary.as_mut_slice().copy_from_slice(value_bytes);
             Ok((atoms::ok(), binary.release(env)).encode(env))
         }
-        Err(lmdb::Error::NotFound) => Ok(atoms::not_found().encode(env)),
+        Err(lmdb::Error::NotFound) => {
+            if dup {
+                if let Some(pending) = overlay_min_dup(db_handle, key_bytes) {
+                    let mut binary =
+                        OwnedBinary::new(pending.len()).ok_or(Error::BadArg)?;
+                    binary.as_mut_slice().copy_from_slice(&pending);
+                    return Ok((atoms::ok(), binary.release(env)).encode(env));
+                }
+            }
+            Ok(atoms::not_found().encode(env))
+        }
         Err(_) => Ok(
             (atoms::error(), atoms::database_error(), "Failed to get value".to_string())
                 .encode(env),
@@ -1287,7 +1446,8 @@ fn put_batch<'a>(
         }
     }
 
-    for (key, _value) in key_value_pairs.iter() {
+    let dup = db_handle.is_dup();
+    for (key, value) in key_value_pairs.iter() {
         let klen = key.as_slice().len();
         if klen == 0 {
             return Ok((atoms::error(), atoms::validation_error(), "Empty key in batch".to_string()).encode(env));
@@ -1295,13 +1455,21 @@ fn put_batch<'a>(
         if klen > LMDB_DEFAULT_MAX_KEY_SIZE {
             return Ok((atoms::error(), atoms::validation_error(), format!("Key size {klen} exceeds limit {LMDB_DEFAULT_MAX_KEY_SIZE}")).encode(env));
         }
+        if dup && value.as_slice().is_empty() {
+            return Ok((atoms::error(), atoms::validation_error(), "Empty value in dup batch".to_string()).encode(env));
+        }
     }
 
     loop {
         let m = db_handle.active.load();
         let _reserved = m.reserve(key_value_pairs.len());
         for (key, value) in key_value_pairs.iter() {
-            let _ = m.upsert_sync(key.as_slice().to_vec(), value.as_slice().to_vec());
+            let overlay_key = if dup {
+                encode_dup_overlay_key(key.as_slice(), value.as_slice())
+            } else {
+                key.as_slice().to_vec()
+            };
+            let _ = m.upsert_sync(overlay_key, value.as_slice().to_vec());
         }
         if Arc::ptr_eq(&m, &db_handle.active.load()) {
             break;
@@ -1412,6 +1580,151 @@ fn put_batch_direct<'a>(
                 format!("Failed to put batch value: {:?}", lmdb_err),
             )
                 .encode(env));
+        }
+    }
+    drop(cursor);
+
+    match txn.commit() {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(lmdb_err) => Ok((
+            atoms::error(),
+            lmdb_error_to_atom(lmdb_err),
+            format!("Failed to commit batch transaction: {:?}", lmdb_err),
+        )
+            .encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn put_batch_append<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>,
+    key_value_pairs: Vec<(Binary, Binary)>,
+) -> NifResult<Term<'a>> {
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+    ensure_worker(&db_handle);
+
+    if key_value_pairs.is_empty() {
+        return Ok(atoms::ok().encode(env));
+    }
+
+    if db_handle.has_fatal_error.load(Ordering::Acquire) {
+        if let Ok(guard) = db_handle.fatal_error.lock() {
+            if let Some(ref err) = *guard {
+                return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
+            }
+        }
+    }
+
+    let dup = db_handle.is_dup();
+    for (key, value) in key_value_pairs.iter() {
+        let klen = key.as_slice().len();
+        if klen == 0 {
+            return Ok((atoms::error(), atoms::validation_error(), "Empty key in batch".to_string()).encode(env));
+        }
+        if klen > LMDB_DEFAULT_MAX_KEY_SIZE {
+            return Ok((atoms::error(), atoms::validation_error(), format!("Key size {klen} exceeds limit {LMDB_DEFAULT_MAX_KEY_SIZE}")).encode(env));
+        }
+        if dup && value.as_slice().is_empty() {
+            return Ok((atoms::error(), atoms::validation_error(), "Empty value in dup batch".to_string()).encode(env));
+        }
+    }
+    // Appends require the batch in strictly ascending order: by key for a
+    // plain database, by (Key, Value) pair for a dup database.
+    let out_of_order = key_value_pairs.windows(2).any(|pair| {
+        let (ka, va) = (pair[0].0.as_slice(), pair[0].1.as_slice());
+        let (kb, vb) = (pair[1].0.as_slice(), pair[1].1.as_slice());
+        if dup {
+            (ka, va) >= (kb, vb)
+        } else {
+            ka >= kb
+        }
+    });
+    if out_of_order {
+        return Ok((
+            atoms::error(),
+            atoms::validation_error(),
+            "Append batch is not in strictly ascending order".to_string(),
+        )
+            .encode(env));
+    }
+
+    let active_empty = db_handle.active.load().is_empty();
+    let draining_empty = db_handle.draining.load().is_none();
+    if !active_empty || !draining_empty {
+        if let Err(error_msg) = flush_sync(&db_handle) {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    }
+
+    let (live_env, live_db) = match db_handle.fast_get_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
+    let mut txn = match live_env.begin_rw_txn() {
+        Ok(txn) => txn,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::transaction_error(),
+                "Failed to begin write transaction".to_string(),
+            )
+                .encode(env));
+        }
+    };
+
+    let mut cursor = match txn.open_rw_cursor(live_db) {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to open write cursor".to_string(),
+            )
+                .encode(env));
+        }
+    };
+
+    // Prime the cursor on the database tail: a dup batch whose first key
+    // continues the tail key's duplicate set must append with
+    // CURRENT|APPEND_DUP from an initialized cursor, exactly as mdb_load
+    // does after each transaction rollover.
+    let mut prev_key: Option<Vec<u8>> = match cursor.get(None, None, MDB_LAST) {
+        Ok((Some(last_key), _)) => Some(last_key.to_vec()),
+        Ok((None, _)) | Err(lmdb::Error::NotFound) => None,
+        Err(lmdb_err) => {
+            return Ok((
+                atoms::error(),
+                lmdb_error_to_atom(lmdb_err),
+                format!("Failed to position append cursor: {:?}", lmdb_err),
+            )
+                .encode(env));
+        }
+    };
+
+    for (key, value) in key_value_pairs.iter() {
+        let continues_dup_set =
+            dup && prev_key.as_deref() == Some(key.as_slice());
+        let flags = if continues_dup_set {
+            WriteFlags::CURRENT | WriteFlags::APPEND_DUP
+        } else {
+            WriteFlags::APPEND
+        };
+        if let Err(lmdb_err) = cursor.put(&key.as_slice(), &value.as_slice(), flags) {
+            let message = match lmdb_err {
+                lmdb::Error::KeyExist =>
+                    "Append batch is not ordered after the existing database".to_string(),
+                _ => format!("Failed to append batch value: {:?}", lmdb_err),
+            };
+            return Ok((atoms::error(), lmdb_error_to_atom(lmdb_err), message).encode(env));
+        }
+        if !continues_dup_set {
+            prev_key = Some(key.as_slice().to_vec());
         }
     }
     drop(cursor);
@@ -1840,6 +2153,279 @@ fn read_prefix_rows<'a>(
     Ok((atoms::ok(), result).encode(env))
 }
 
+/// Smallest binary greater than every value carrying `prefix`, or None when
+/// no such bound exists (an all-0xff prefix).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut successor = prefix.to_vec();
+    while let Some(last) = successor.last_mut() {
+        if *last == 0xff {
+            successor.pop();
+        } else {
+            *last += 1;
+            return Some(successor);
+        }
+    }
+    None
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn read_dups<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>,
+    key: Binary,
+    options: Vec<Term<'a>>,
+) -> NifResult<Term<'a>> {
+    let read_opts = parse_dup_read_options(options)?;
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+    ensure_worker(&db_handle);
+    if !db_handle.is_dup() {
+        return Ok((
+            atoms::error(),
+            atoms::incompatible(),
+            "read_dups requires a dupsort database".to_string(),
+        )
+            .encode(env));
+    }
+
+    let active_empty = db_handle.active.load().is_empty();
+    let draining_empty = db_handle.draining.load().is_none();
+    if !active_empty || !draining_empty {
+        if let Err(error_msg) = flush_sync(&db_handle) {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    }
+
+    let (live_env, live_db) = match db_handle.fast_get_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
+    let txn = match RawReadTxn::begin(&live_env) {
+        Ok(txn) => txn,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    };
+
+    let cursor = match RawCursor::open(&txn, live_db) {
+        Ok(cursor) => cursor,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
+    // MDB_SET both proves the key exists and lands on its first duplicate.
+    let key_bytes = key.as_slice();
+    let mut key_val = ffi::MDB_val {
+        mv_size: key_bytes.len(),
+        mv_data: key_bytes.as_ptr() as *mut _,
+    };
+    let mut data_val = ffi::MDB_val {
+        mv_size: 0,
+        mv_data: std::ptr::null_mut(),
+    };
+    let rc = raw_cursor_get(&cursor, &mut key_val, &mut data_val, ffi::MDB_SET);
+    if rc == ffi::MDB_NOTFOUND {
+        return Ok(atoms::not_found().encode(env));
+    }
+    if rc != ffi::MDB_SUCCESS {
+        return Ok((
+            atoms::error(),
+            atoms::database_error(),
+            "Failed to position dup cursor".to_string(),
+        )
+            .encode(env));
+    }
+
+    // Position on the first duplicate of the selection. GET_BOTH_RANGE seeks
+    // within the key's duplicate set to the first value >= its data argument;
+    // MDB_NOTFOUND from it means every duplicate sorts below that bound.
+    let positioned = if !read_opts.backward {
+        let target = match (&read_opts.from, &read_opts.prefix) {
+            (Some(from), Some(prefix)) => Some(std::cmp::max(from, prefix).clone()),
+            (Some(from), None) => Some(from.clone()),
+            (None, Some(prefix)) => Some(prefix.clone()),
+            (None, None) => None,
+        };
+        match target {
+            // A selection without a lower bound starts on the first
+            // duplicate, where MDB_SET already landed.
+            None => true,
+            Some(target) => {
+                data_val = ffi::MDB_val {
+                    mv_size: target.len(),
+                    mv_data: target.as_ptr() as *mut _,
+                };
+                let rc = raw_cursor_get(
+                    &cursor,
+                    &mut key_val,
+                    &mut data_val,
+                    ffi::MDB_GET_BOTH_RANGE,
+                );
+                if rc == ffi::MDB_SUCCESS {
+                    true
+                } else if rc == ffi::MDB_NOTFOUND {
+                    false
+                } else {
+                    return Ok((
+                        atoms::error(),
+                        atoms::database_error(),
+                        "Failed to seek dup cursor".to_string(),
+                    )
+                        .encode(env));
+                }
+            }
+        }
+    } else {
+        // A backward walk starts on the last duplicate at or below its bound:
+        // `from` bounds inclusively, a prefix bounds exclusively at the
+        // prefix's successor, and the tighter of the two wins.
+        let bound = match (&read_opts.from, &read_opts.prefix) {
+            (from, Some(prefix)) => match (from, prefix_successor(prefix)) {
+                (Some(from), Some(successor)) if *from >= successor => {
+                    Some((successor, false))
+                }
+                (Some(from), _) => Some((from.clone(), true)),
+                (None, Some(successor)) => Some((successor, false)),
+                (None, None) => None,
+            },
+            (Some(from), None) => Some((from.clone(), true)),
+            (None, None) => None,
+        };
+        match bound {
+            None => {
+                let rc =
+                    raw_cursor_get(&cursor, &mut key_val, &mut data_val, ffi::MDB_LAST_DUP);
+                if rc != ffi::MDB_SUCCESS {
+                    return Ok((
+                        atoms::error(),
+                        atoms::database_error(),
+                        "Failed to seek last duplicate".to_string(),
+                    )
+                        .encode(env));
+                }
+                true
+            }
+            Some((bound, inclusive)) => {
+                data_val = ffi::MDB_val {
+                    mv_size: bound.len(),
+                    mv_data: bound.as_ptr() as *mut _,
+                };
+                let rc = raw_cursor_get(
+                    &cursor,
+                    &mut key_val,
+                    &mut data_val,
+                    ffi::MDB_GET_BOTH_RANGE,
+                );
+                if rc == ffi::MDB_SUCCESS {
+                    if inclusive && val_bytes(&data_val) == bound.as_slice() {
+                        true
+                    } else {
+                        let rc = raw_cursor_get(
+                            &cursor,
+                            &mut key_val,
+                            &mut data_val,
+                            ffi::MDB_PREV_DUP,
+                        );
+                        if rc == ffi::MDB_SUCCESS {
+                            true
+                        } else if rc == ffi::MDB_NOTFOUND {
+                            false
+                        } else {
+                            return Ok((
+                                atoms::error(),
+                                atoms::database_error(),
+                                "Failed to step dup cursor".to_string(),
+                            )
+                                .encode(env));
+                        }
+                    }
+                } else if rc == ffi::MDB_NOTFOUND {
+                    // Every duplicate sorts below the bound: restart on the
+                    // set's last duplicate.
+                    let rc =
+                        raw_cursor_get(&cursor, &mut key_val, &mut data_val, ffi::MDB_SET);
+                    let rc = if rc == ffi::MDB_SUCCESS {
+                        raw_cursor_get(&cursor, &mut key_val, &mut data_val, ffi::MDB_LAST_DUP)
+                    } else {
+                        rc
+                    };
+                    if rc != ffi::MDB_SUCCESS {
+                        return Ok((
+                            atoms::error(),
+                            atoms::database_error(),
+                            "Failed to seek last duplicate".to_string(),
+                        )
+                            .encode(env));
+                    }
+                    true
+                } else {
+                    return Ok((
+                        atoms::error(),
+                        atoms::database_error(),
+                        "Failed to seek dup cursor".to_string(),
+                    )
+                        .encode(env));
+                }
+            }
+        }
+    };
+
+    if !positioned {
+        let empty: Vec<Term> = Vec::new();
+        return Ok((atoms::ok(), empty).encode(env));
+    }
+
+    // Walk the duplicate set. Duplicates are sorted, so the first value that
+    // breaks the prefix constraint ends the selection in either direction.
+    let step_op = if read_opts.backward {
+        ffi::MDB_PREV_DUP
+    } else {
+        ffi::MDB_NEXT_DUP
+    };
+    let mut values_buf: Vec<u8> = Vec::new();
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    loop {
+        if read_opts.limit != 0 && rows.len() == read_opts.limit {
+            break;
+        }
+        let value = val_bytes(&data_val);
+        if let Some(ref prefix) = read_opts.prefix {
+            if !value.starts_with(prefix) {
+                break;
+            }
+        }
+        rows.push((values_buf.len(), value.len()));
+        values_buf.extend_from_slice(value);
+        let rc = raw_cursor_get(&cursor, &mut key_val, &mut data_val, step_op);
+        if rc == ffi::MDB_NOTFOUND {
+            break;
+        }
+        if rc != ffi::MDB_SUCCESS {
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to advance dup cursor".to_string(),
+            )
+                .encode(env));
+        }
+    }
+
+    let mut binary = NewBinary::new(env, values_buf.len());
+    binary.as_mut_slice().copy_from_slice(&values_buf);
+    let packed = Term::from(binary).into_binary()?;
+    let mut result = Vec::with_capacity(rows.len());
+    for (offset, len) in rows {
+        result.push(packed.make_subbinary(offset, len)?);
+    }
+
+    Ok((atoms::ok(), result).encode(env))
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn match_pattern<'a>(
     env: Env<'a>,
@@ -2069,6 +2655,20 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
                         }
                     }
                 }
+                "page_size" => {
+                    // A misconfigured page size would silently create the
+                    // data file with the default size, so it is rejected
+                    // rather than ignored.
+                    match value.decode::<u64>() {
+                        Ok(size)
+                            if size.is_power_of_two()
+                                && (512..=65536).contains(&size) =>
+                        {
+                            env_opts.page_size = Some(size as i32);
+                        }
+                        _ => return Err(Error::BadArg),
+                    }
+                }
                 _ => {}
             }
         } else if let Ok(atom) = option.decode::<rustler::Atom>() {
@@ -2080,6 +2680,8 @@ fn parse_env_options(options: Vec<Term>) -> NifResult<EnvOptions> {
                 "no_lock" => env_opts.no_lock = true,
                 "write_map" => env_opts.write_map = true,
                 "no_readahead" => env_opts.no_readahead = true,
+                "read_only" => env_opts.read_only = true,
+                "no_subdir" => env_opts.no_subdir = true,
                 _ => {}
             }
         }
@@ -2095,8 +2697,11 @@ fn parse_db_options(options: Vec<Term>) -> NifResult<DbOptions> {
         if let Ok(atom) = option.decode::<rustler::Atom>() {
             let name = format!("{:?}", atom);
             let name = name.trim_start_matches('"').trim_end_matches('"');
-            if name == "create" {
-                db_opts.create = true;
+            match name {
+                "create" => db_opts.create = true,
+                "dupsort" => db_opts.dupsort = true,
+                "dupfixed" => db_opts.dupfixed = true,
+                _ => {}
             }
         }
     }
@@ -2109,16 +2714,67 @@ struct EnvOptions {
     map_size: Option<u64>,
     max_readers: Option<u32>,
     batch_size: Option<usize>,
+    page_size: Option<i32>,
     no_mem_init: bool,
     no_sync: bool,
     no_lock: bool,
     write_map: bool,
     no_readahead: bool,
+    read_only: bool,
+    no_subdir: bool,
 }
 
 #[derive(Default)]
 struct DbOptions {
     create: bool,
+    dupsort: bool,
+    dupfixed: bool,
+}
+
+#[derive(Default)]
+struct DupReadOptions {
+    from: Option<Vec<u8>>,
+    prefix: Option<Vec<u8>>,
+    limit: usize,
+    backward: bool,
+}
+
+fn parse_dup_read_options(options: Vec<Term>) -> NifResult<DupReadOptions> {
+    let mut read_opts = DupReadOptions::default();
+    for option in options {
+        if let Ok((atom, value)) = option.decode::<(rustler::Atom, Term)>() {
+            let name = format!("{:?}", atom);
+            let name = name.trim_start_matches('"').trim_end_matches('"');
+            match name {
+                "from" => {
+                    let from = value.decode::<Binary>().map_err(|_| Error::BadArg)?;
+                    read_opts.from = Some(from.as_slice().to_vec());
+                }
+                "prefix" => {
+                    let prefix = value.decode::<Binary>().map_err(|_| Error::BadArg)?;
+                    read_opts.prefix = Some(prefix.as_slice().to_vec());
+                }
+                "limit" => {
+                    let limit = value.decode::<u64>().map_err(|_| Error::BadArg)?;
+                    read_opts.limit = limit as usize;
+                }
+                "direction" => {
+                    let direction =
+                        value.decode::<rustler::Atom>().map_err(|_| Error::BadArg)?;
+                    let name = format!("{:?}", direction);
+                    match name.trim_start_matches('"').trim_end_matches('"') {
+                        "forward" => read_opts.backward = false,
+                        "backward" => read_opts.backward = true,
+                        _ => return Err(Error::BadArg),
+                    }
+                }
+                _ => return Err(Error::BadArg),
+            }
+        } else {
+            return Err(Error::BadArg);
+        }
+    }
+    Ok(read_opts)
 }
 
 ///===================================================================

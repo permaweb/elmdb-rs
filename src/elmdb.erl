@@ -15,7 +15,8 @@
 -export([db_open/2, db_close/1]).
 
 %% Key-value operations
--export([put/3, put_batch/2, put_batch_direct/2, get/2, flush/1]).
+-export([put/3, put_batch/2, put_batch_direct/2, put_batch_append/2, get/2,
+         flush/1]).
 
 %% Diagnostics
 -export([overlay_count/1]).
@@ -24,7 +25,7 @@
 -export([iterator/1, iterator_next/2, foreach/2, fold/3, map/2]).
 
 %% List operations
--export([list/2, read_prefix/2]).
+-export([list/2, read_prefix/2, read_dups/3]).
 
 %% Pattern matching operations
 -export([match/2]).
@@ -79,9 +80,14 @@ load_nif_from_list(PrivDir, [LibName | Rest]) ->
 %% @param Options Configuration options:
 %%   - {map_size, integer()}: Maximum database size in bytes
 %%   - {max_readers, integer()}: Maximum number of reader slots (default: 126)
+%%   - {page_size, integer()}: Database page size in bytes, a power of two
+%%     between 512 and 65536. Applies when the data file is created; an
+%%     existing file keeps the page size it was created with.
 %%   - no_mem_init: Don't initialize malloc'd memory before writing to disk
 %%   - no_sync: Don't flush system buffers to disk when committing
 %%   - write_map: Use a writeable memory map for better performance
+%%   - read_only: Open the environment read-only
+%%   - no_subdir: Path names the data file itself rather than a directory
 %% @returns {ok, Env} where Env is an opaque environment handle
 %%          {error, directory_not_found} if the directory doesn't exist
 %%          {error, permission_denied} if lacking permissions
@@ -131,6 +137,10 @@ env_status(_Env) ->
 %% @param Env Environment handle
 %% @param Options Configuration options:
 %%   - create: Create the database if it doesn't exist
+%%   - dupsort: Keys may carry multiple values, stored in sorted order
+%%   - dupfixed: All values of a key have the same size (implies dupsort)
+%% The dup options must match the database on disk: opening a non-empty
+%% database in a different dup mode returns an error.
 %% @returns {ok, DBInstance} where DBInstance is an opaque database handle
 -spec db_open(Env :: term(), Options :: list()) -> 
     {ok, term()} | {error, term()}.
@@ -176,11 +186,25 @@ put_batch(_DBInstance, _KeyValuePairs) ->
     ok | {error, term(), binary()}.
 put_batch_direct(_DBInstance, _KeyValuePairs) ->
     erlang:nif_error(nif_not_loaded).
- 
+
+%% @doc Append key-value pairs at the end of the database in one transaction.
+%%      Writes with MDB_APPEND (and MDB_APPENDDUP on dup databases), skipping
+%%      the page-split search, so the batch must be in strictly ascending
+%%      order -- by key, or by {Key, Value} pair on a dup database -- and must
+%%      sort after everything already stored. Out-of-order input within the
+%%      batch returns a validation_error; input that does not extend the
+%%      database tail returns key_exist. The buffered overlay is flushed
+%%      first so older queued writes cannot later overwrite this batch.
+-spec put_batch_append(DBInstance :: term(), KeyValuePairs :: [{binary(), binary()}]) ->
+    ok | {error, term(), binary()}.
+put_batch_append(_DBInstance, _KeyValuePairs) ->
+    erlang:nif_error(nif_not_loaded).
+
 %% @doc Read a value by key from the database
 %% @param DBInstance Database handle
 %% @param Key The key to read (binary)
-%% @returns {ok, Value} where Value is a binary, or not_found if key doesn't exist
+%% @returns {ok, Value} where Value is a binary, or not_found if key doesn't exist.
+%%          On a dup database the first (smallest) duplicate is returned.
 -spec get(DBInstance :: term(), Key :: binary()) ->
     {ok, binary()} | not_found.
 get(_DBInstance, _Key) ->
@@ -280,6 +304,23 @@ read_prefix(DBInstance, Key) ->
     read_prefix_rows(DBInstance, Key).
 
 read_prefix_rows(_DBInstance, _Key) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc Read values from one key's duplicate set on a dup database.
+%% @param DBInstance Database handle (opened with dupsort or dupfixed)
+%% @param Key The key whose duplicate set is read (binary)
+%% @param Options Selection options:
+%%   - {from, binary()}: Start at the first value >= from (forward) or the
+%%     last value =< from (backward)
+%%   - {prefix, binary()}: Only values carrying this byte prefix
+%%   - {limit, integer()}: Maximum number of values to return (0 = all)
+%%   - {direction, forward | backward}: Walk order (default: forward)
+%% @returns {ok, Values} in walk order -- descending for backward reads --
+%%          where an empty list means the key exists but no value matched;
+%%          not_found when the key is absent.
+-spec read_dups(DBInstance :: term(), Key :: binary(), Options :: list()) ->
+    {ok, [binary()]} | not_found | {error, term(), binary()}.
+read_dups(_DBInstance, _Key, _Options) ->
     erlang:nif_error(nif_not_loaded).
 
 %%%===================================================================
