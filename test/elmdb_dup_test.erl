@@ -625,6 +625,76 @@ read_dups_fuzz_test_() ->
                 cleanup(State)
             end)}.
 
+%% The same model against a dupfixed set: fixed-width items spanning many
+%% 512-byte LEAF2 pages, so positioned queries constantly cross leaf
+%% boundaries in both directions.
+read_dups_fixed_fuzz_test_() ->
+    {timeout, 120,
+     ?_test(begin
+                State = {_, _, DB} = setup([{page_size, 512}],
+                                           [create, dupfixed]),
+                rand:seed(exsss, {7, 8, 9}),
+                Values = [<<N:120/big>> || N <- lists:seq(1, 2000), N rem 3 =/= 0],
+                ok = elmdb:put_batch_append(DB, [{<<0>>, V} || V <- Values]),
+                lists:foreach(
+                    fun(_) ->
+                        From = case rand:uniform(3) of
+                            1 -> [];
+                            2 -> [{from, <<(rand:uniform(2100)):120/big>>}];
+                            3 -> [{from, lists:nth(rand:uniform(length(Values)),
+                                                   Values)}]
+                        end,
+                        Limit = case rand:uniform(2) of
+                            1 -> [];
+                            2 -> [{limit, rand:uniform(40)}]
+                        end,
+                        Direction = case rand:uniform(2) of
+                            1 -> [];
+                            2 -> [{direction, backward}]
+                        end,
+                        Opts = From ++ Limit ++ Direction,
+                        Expected = model_read(Values, Opts),
+                        ?assertEqual({ok, Expected},
+                                     elmdb:read_dups(DB, <<0>>, Opts))
+                    end,
+                    lists:seq(1, 400)),
+                cleanup(State)
+            end)}.
+
+%% Concurrent buffered writers on one dup set: the composite-keyed overlay
+%% must not lose or collapse entries under contention.
+concurrent_dup_writers_test_() ->
+    {timeout, 60,
+     ?_test(begin
+                State = {_, _, DB} = setup([{batch_size, 100}],
+                                           [create, dupsort]),
+                Parent = self(),
+                Writers = 4,
+                PerWriter = 250,
+                lists:foreach(
+                    fun(W) ->
+                        spawn_link(fun() ->
+                            lists:foreach(
+                                fun(N) ->
+                                    Value = <<W:32/big, N:32/big>>,
+                                    ok = elmdb:put(DB, <<"set">>, Value)
+                                end,
+                                lists:seq(1, PerWriter)),
+                            Parent ! {done, W}
+                        end)
+                    end,
+                    lists:seq(1, Writers)),
+                lists:foreach(
+                    fun(W) -> receive {done, W} -> ok end end,
+                    lists:seq(1, Writers)),
+                Expected = lists:sort(
+                    [<<W:32/big, N:32/big>> || W <- lists:seq(1, Writers),
+                                               N <- lists:seq(1, PerWriter)]),
+                ?assertEqual({ok, Expected},
+                             elmdb:read_dups(DB, <<"set">>, [])),
+                cleanup(State)
+            end)}.
+
 rand_value() ->
     rand:bytes(rand:uniform(6)).
 
