@@ -29,6 +29,100 @@ test_dir() ->
     filename:join(["/tmp", "elmdb_test_" ++ integer_to_list(Unique)]).
 
 %%%===================================================================
+%%% Positioned List Tests
+%%%===================================================================
+
+positioned_list_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_test(begin
+                     ok = elmdb:put_batch(DB, [
+                         {<<"g/a">>, <<"1">>},
+                         {<<"g/b">>, <<"2">>},
+                         {<<"g/c/x">>, <<"3">>},
+                         {<<"g/c/y">>, <<"4">>},
+                         {<<"g/d">>, <<"5">>},
+                         {<<"h/z">>, <<"6">>}
+                     ]),
+                     % Forward from a child, inclusive, bounded.
+                     ?assertEqual({ok, [<<"b">>, <<"c">>]},
+                                  elmdb:list(DB, <<"g/">>, [{from, <<"b">>}, {limit, 2}])),
+                     ?assertEqual({ok, [<<"a">>, <<"b">>, <<"c">>, <<"d">>]},
+                                  elmdb:list(DB, <<"g/">>, [])),
+                     % A batch over keys is every child; a count of zero, none.
+                     ?assertEqual({ok, [<<"b">>, <<"c">>, <<"d">>]},
+                                  elmdb:list(DB, <<"g/">>, [{from, <<"b">>}, {limit, batch}])),
+                     ?assertEqual({ok, []}, elmdb:list(DB, <<"g/">>, [{limit, 0}])),
+                     % Backward from a child, and from the end.
+                     ?assertEqual({ok, [<<"c">>, <<"b">>, <<"a">>]},
+                                  elmdb:list(DB, <<"g/">>,
+                                             [{from, <<"c">>}, {direction, backward}])),
+                     ?assertEqual({ok, [<<"d">>, <<"c">>]},
+                                  elmdb:list(DB, <<"g/">>,
+                                             [{direction, backward}, {limit, 2}])),
+                     % A from between children lands on the next one in
+                     % walk order; one past the end names nothing.
+                     ?assertEqual({ok, [<<"c">>, <<"d">>]},
+                                  elmdb:list(DB, <<"g/">>, [{from, <<"bb">>}])),
+                     ?assertEqual({ok, [<<"b">>, <<"a">>]},
+                                  elmdb:list(DB, <<"g/">>,
+                                             [{from, <<"bb">>}, {direction, backward}])),
+                     ?assertEqual({ok, []},
+                                  elmdb:list(DB, <<"g/">>, [{from, <<"e">>}])),
+                     % Backward from past every child -- with `h/z' above
+                     % the prefix -- walks every child; from before them,
+                     % none.
+                     ?assertEqual({ok, [<<"d">>, <<"c">>, <<"b">>, <<"a">>]},
+                                  elmdb:list(DB, <<"g/">>,
+                                             [{from, <<"zz">>}, {direction, backward}])),
+                     ?assertEqual({ok, []},
+                                  elmdb:list(DB, <<"g/">>,
+                                             [{from, <<"0">>}, {direction, backward}])),
+                     % A prefix without keys.
+                     ?assertEqual({ok, []}, elmdb:list(DB, <<"none/">>, []))
+                 end),
+          ?_test(begin
+                     % A child's subtree sorts after a sibling that extends
+                     % its name with a byte below `/', so components arrive
+                     % out of walk order; a child known by its subtree alone
+                     % (`i') arrives after every such sibling.
+                     ok = elmdb:put_batch(DB, [
+                         {<<"z/a">>, <<>>},
+                         {<<"z/b">>, <<>>},
+                         {<<"z/b-x">>, <<>>},
+                         {<<"z/b/q">>, <<>>},
+                         {<<"z/c">>, <<>>},
+                         {<<"z/i!">>, <<>>},
+                         {<<"z/i-x">>, <<>>},
+                         {<<"z/i/q">>, <<>>}
+                     ]),
+                     All = [<<"a">>, <<"b">>, <<"b-x">>, <<"c">>, <<"i">>, <<"i!">>, <<"i-x">>],
+                     ?assertEqual({ok, All}, elmdb:list(DB, <<"z/">>, [])),
+                     ?assertEqual({ok, lists:reverse(All)},
+                                  elmdb:list(DB, <<"z/">>, [{direction, backward}])),
+                     ?assertEqual({ok, [<<"b-x">>, <<"c">>]},
+                                  elmdb:list(DB, <<"z/">>, [{from, <<"b-x">>}, {limit, 2}])),
+                     ?assertEqual({ok, [<<"a">>, <<"b">>]},
+                                  elmdb:list(DB, <<"z/">>, [{limit, 2}])),
+                     ?assertEqual({ok, [<<"i">>]},
+                                  elmdb:list(DB, <<"z/">>, [{from, <<"i">>}, {limit, 1}])),
+                     ?assertEqual({ok, [<<"i-x">>, <<"i!">>, <<"i">>]},
+                                  elmdb:list(DB, <<"z/">>,
+                                             [{direction, backward}, {limit, 3}])),
+                     ?assertEqual({ok, [<<"c">>, <<"b-x">>]},
+                                  elmdb:list(DB, <<"z/">>,
+                                             [{from, <<"c">>}, {direction, backward}, {limit, 2}])),
+                     ?assertEqual({ok, [<<"i!">>, <<"i">>, <<"c">>, <<"b-x">>, <<"b">>, <<"a">>]},
+                                  elmdb:list(DB, <<"z/">>,
+                                             [{from, <<"i!">>}, {direction, backward}]))
+                 end)
+         ]
+     end}.
+
+%%%===================================================================
 %%% Basic Operation Tests
 %%%===================================================================
 

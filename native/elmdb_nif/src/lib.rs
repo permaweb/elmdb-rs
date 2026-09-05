@@ -46,6 +46,8 @@ use lmdb_sys as ffi;
 const MDB_FIRST: u32 = 0;
 const MDB_NEXT: u32 = 8;
 const MDB_SET_RANGE: u32 = 17;
+const MDB_PREV: u32 = 12;
+const MDB_LAST: u32 = 6;
 // Default LMDB max key size. This is controlled by LMDB's compile-time MDB_MAXKEYSIZE.
 // If the Rust lmdb crate exposes mdb_env_get_maxkeysize safely in the future, prefer that.
 const LMDB_DEFAULT_MAX_KEY_SIZE: usize = 511;
@@ -1560,6 +1562,241 @@ fn list<'a>(
     }
 
     Ok((atoms::ok(), result_binaries).encode(env))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn list_from<'a>(
+    env: Env<'a>,
+    db_handle: ResourceArc<LmdbDatabase>,
+    key_prefix: Binary,
+    from: Binary,
+    limit: Term<'a>,
+    backward: bool,
+) -> NifResult<Term<'a>> {
+    if let Err(error_msg) = db_handle.validate_database() {
+        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+    }
+    ensure_worker(&db_handle);
+
+    // The most children to name: a count, or none for `all' and for
+    // `batch' -- the children found without further work. LMDB reads a
+    // page at a time (MDB_GET_MULTIPLE) only from a key's fixed-size
+    // duplicate values, and this NIF opens no such database, so a batch
+    // over keys is every child.
+    let limit: Option<usize> = match limit.decode::<usize>() {
+        Ok(count) => Some(count),
+        Err(_) => match limit.atom_to_string()?.as_str() {
+            "all" | "batch" => None,
+            _ => return Err(Error::BadArg),
+        },
+    };
+    if limit == Some(0) {
+        let none: Vec<Term<'a>> = Vec::new();
+        return Ok((atoms::ok(), none).encode(env));
+    }
+
+    let prefix_bytes = key_prefix.as_slice();
+    let active_empty = db_handle.active.load().is_empty();
+    let draining_empty = db_handle.draining.load().is_none();
+    if !active_empty || !draining_empty {
+        if let Err(error_msg) = flush_sync(&db_handle) {
+            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
+        }
+    }
+
+    let (live_env, live_db) = match db_handle.fast_get_handles() {
+        Ok(handles) => handles,
+        Err(error_msg) => {
+            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
+        }
+    };
+
+    let txn = match live_env.begin_ro_txn() {
+        Ok(txn) => txn,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::transaction_error(),
+                "Failed to begin read transaction".to_string(),
+            )
+                .encode(env));
+        }
+    };
+
+    let cursor = match txn.open_ro_cursor(live_db) {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to open cursor".to_string(),
+            )
+                .encode(env));
+        }
+    };
+
+    // Land on the first key of the walk. Forward, the first key at or after
+    // `prefix ++ from`. Backward, the last key below the zone in which a
+    // component at or before `from` can still sort: that of the shortest
+    // prefix of `from` followed by a byte below `/`, whose subtree sorts
+    // above the siblings extending it, or of `from` itself; an empty `from`
+    // lands on the last key under the prefix.
+    let prefix_len = prefix_bytes.len();
+    let from_bytes = from.as_slice();
+    let landed: Option<Vec<u8>> = if !backward {
+        let mut target = prefix_bytes.to_vec();
+        target.extend_from_slice(from_bytes);
+        cursor
+            .get(Some(target.as_slice()), None, MDB_SET_RANGE)
+            .ok()
+            .and_then(|(key, _)| key.map(|k| k.to_vec()))
+    } else {
+        let bound = if from_bytes.is_empty() {
+            prefix_successor(prefix_bytes)
+        } else {
+            let cut = (1..from_bytes.len())
+                .find(|&i| from_bytes[i] < b'/')
+                .unwrap_or(from_bytes.len());
+            let mut bound = prefix_bytes.to_vec();
+            bound.extend_from_slice(&from_bytes[..cut]);
+            bound.push(b'0');
+            Some(bound)
+        };
+        let landing = match bound {
+            Some(bound) => match cursor.get(Some(bound.as_slice()), None, MDB_SET_RANGE) {
+                Ok(_) => cursor.get(None, None, MDB_PREV),
+                Err(_) => cursor.get(None, None, MDB_LAST),
+            },
+            None => cursor.get(None, None, MDB_LAST),
+        };
+        landing.ok().and_then(|(key, _)| key.map(|k| k.to_vec()))
+    };
+
+    // Walk the keys under the prefix, naming each key's next path component
+    // once and keeping the `limit` components nearest the landing in walk
+    // order. A component sorts before a sibling extending it with a byte
+    // below `/`, and its subtree sorts after that sibling, so components can
+    // arrive out of walk order: the window is kept in walk order, and once
+    // full the walk goes on only while a key may still name a component
+    // inside it --
+    // forward, through the zone of the shortest prefix the arriving
+    // component shares with the window's last, whose subtree could name it;
+    // backward, through the arriving component's own zone, where its
+    // extensions sort. The rest of a subtree names nothing new: it is
+    // skipped.
+    let step = if backward { MDB_PREV } else { MDB_NEXT };
+    let mut children: Vec<Vec<u8>> = Vec::new();
+    let mut zone: Option<Vec<u8>> = None;
+    let mut current = landed;
+    while let Some(key) = current {
+        if !key.starts_with(prefix_bytes) {
+            break;
+        }
+        if let Some(zone) = &zone {
+            let inside = if backward {
+                key.starts_with(zone)
+            } else {
+                key.as_slice() < zone.as_slice()
+            };
+            if !inside {
+                break;
+            }
+        }
+        let remaining = &key[prefix_len..];
+        let (component, in_subtree) = match remaining.iter().position(|&b| b == b'/') {
+            Some(sep_pos) => (&remaining[..sep_pos], true),
+            None => (remaining, false),
+        };
+        let mut seek: Option<Vec<u8>> = None;
+        if !component.is_empty() {
+            let behind = !from_bytes.is_empty()
+                && if backward { component > from_bytes } else { component < from_bytes };
+            if !behind {
+                let order = |kept: &Vec<u8>| {
+                    if backward {
+                        component.cmp(kept.as_slice())
+                    } else {
+                        kept.as_slice().cmp(component)
+                    }
+                };
+                if let Err(pos) = children.binary_search_by(order) {
+                    let full = limit == Some(children.len());
+                    let beyond = pos == children.len();
+                    if !full {
+                        children.insert(pos, component.to_vec());
+                    } else if !beyond {
+                        children.insert(pos, component.to_vec());
+                        children.pop();
+                    } else if zone.is_none() {
+                        zone = if backward {
+                            Some([prefix_bytes, component].concat())
+                        } else {
+                            let last = children.last().unwrap();
+                            let lcp = component
+                                .iter()
+                                .zip(last.iter())
+                                .take_while(|(a, b)| a == b)
+                                .count();
+                            (1..=lcp)
+                                .find(|&i| {
+                                    i < component.len()
+                                        && i < last.len()
+                                        && component[i] < b'/'
+                                        && last[i] < b'/'
+                                })
+                                .map(|i| {
+                                    let mut zone = prefix_bytes.to_vec();
+                                    zone.extend_from_slice(&component[..i]);
+                                    zone.push(b'0');
+                                    zone
+                                })
+                        };
+                        if zone.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+            if in_subtree {
+                let mut edge = prefix_bytes.to_vec();
+                edge.extend_from_slice(component);
+                edge.push(if backward { b'/' } else { b'0' });
+                seek = Some(edge);
+            }
+        }
+        current = match seek {
+            Some(target) if backward => {
+                match cursor.get(Some(target.as_slice()), None, MDB_SET_RANGE) {
+                    Ok(_) => cursor.get(None, None, MDB_PREV).ok(),
+                    Err(_) => cursor.get(None, None, MDB_LAST).ok(),
+                }
+            }
+            Some(target) => cursor.get(Some(target.as_slice()), None, MDB_SET_RANGE).ok(),
+            None => cursor.get(None, None, step).ok(),
+        }
+        .and_then(|(key, _)| key.map(|k| k.to_vec()));
+    }
+
+    let mut result_binaries = Vec::with_capacity(children.len());
+    for child in children {
+        let mut binary = OwnedBinary::new(child.len()).ok_or(Error::BadArg)?;
+        binary.as_mut_slice().copy_from_slice(&child);
+        result_binaries.push(binary.release(env));
+    }
+    Ok((atoms::ok(), result_binaries).encode(env))
+}
+
+/// The smallest key sorting after every key carrying the prefix, if any:
+/// the prefix with its last byte below 0xFF incremented and the rest cut.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut successor = prefix.to_vec();
+    while let Some(last) = successor.pop() {
+        if last < 0xFF {
+            successor.push(last + 1);
+            return Some(successor);
+        }
+    }
+    None
 }
 
 #[rustler::nif]

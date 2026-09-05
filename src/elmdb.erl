@@ -24,7 +24,7 @@
 -export([iterator/1, iterator_next/2, foreach/2, fold/3, map/2]).
 
 %% List operations
--export([list/2, read_prefix/2]).
+-export([list/2, list/3, read_prefix/2]).
 
 %% Pattern matching operations
 -export([match/2]).
@@ -260,6 +260,35 @@ map(DBInstance, Fun) when is_function(Fun, 2) ->
 -spec list(DBInstance :: term(), Key :: binary()) ->
     {ok, [binary()]} | not_found.
 list(_DBInstance, _Key) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% @doc List a group's direct children from a position, in either order,
+%%      up to a limit. A child's subtree is walked once.
+%% @param DBInstance Database handle
+%% @param Key The key prefix to search for (binary)
+%% @param Options Selection options:
+%%   - {from, binary()}: Start at the child named at or after from (forward)
+%%     or at or before it (backward), a name without `/'; empty starts at
+%%     the walk's end
+%%   - {limit, integer() | batch}: Maximum number of children to return, or
+%%     `batch' for the children LMDB finds without further work -- every
+%%     child, as LMDB reads a page at a time only from a key's fixed-size
+%%     duplicate values, and this NIF opens no such database. Absent,
+%%     every child.
+%%   - {direction, forward | backward}: Walk order (default: forward)
+%% @returns {ok, Children} in walk order
+-spec list(DBInstance :: term(), Key :: binary(), Options :: list()) ->
+    {ok, [binary()]} | {error, term(), binary()}.
+list(DBInstance, Key, Options) ->
+    list_from(
+        DBInstance,
+        Key,
+        proplists:get_value(from, Options, <<>>),
+        proplists:get_value(limit, Options, all),
+        proplists:get_value(direction, Options, forward) =:= backward
+    ).
+
+list_from(_DBInstance, _Key, _From, _Limit, _Backward) ->
     erlang:nif_error(nif_not_loaded).
 
 %% @doc Read all raw row entries under a prefix.
