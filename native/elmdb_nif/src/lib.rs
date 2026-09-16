@@ -1496,49 +1496,25 @@ fn list<'a>(
     let mut children = Vec::with_capacity(64);
     let prefix_len = prefix_bytes.len();
 
-    let cursor_positioned = cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok();
-
-    if !cursor_positioned {
-        return Ok(atoms::not_found().encode(env));
-    }
-
-    let cursor_iter = cursor.iter_from(prefix_bytes);
-
-    for (key, _value) in cursor_iter {
-        if !key.starts_with(prefix_bytes) {
-            break;
+    let first_key = match cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE) {
+        Ok((Some(key), _value)) => key.to_vec(),
+        Ok((None, _)) | Err(lmdb::Error::NotFound) => {
+            return Ok(atoms::not_found().encode(env));
         }
-
-        let remaining = &key[prefix_len..];
-
-        if remaining.is_empty() {
-            continue;
+        Err(_) => {
+            return Ok((
+                atoms::error(),
+                atoms::database_error(),
+                "Failed to position list cursor".to_string(),
+            )
+                .encode(env));
         }
+    };
 
-        let next_component = if let Some(sep_pos) = remaining.iter().position(|&b| b == b'/') {
-            &remaining[..sep_pos]
-        } else {
-            remaining
-        };
-
-        if next_component.is_empty() {
-            continue;
-        }
-
-        let component_exists = if children.len() < 16 {
-            children
-                .iter()
-                .any(|existing: &Vec<u8>| existing.as_slice() == next_component)
-        } else {
-            children.binary_search(&next_component.to_vec()).is_ok()
-        };
-
-        if !component_exists {
-            let component_vec = next_component.to_vec();
-            if children.len() < 16 {
-                children.push(component_vec);
-            } else if let Err(pos) = children.binary_search(&component_vec) {
-                children.insert(pos, component_vec);
+    if add_list_child(&mut children, &first_key, prefix_bytes, prefix_len) {
+        for (key, _value) in cursor.iter() {
+            if !add_list_child(&mut children, key, prefix_bytes, prefix_len) {
+                break;
             }
         }
     }
@@ -1784,7 +1760,9 @@ fn match_pattern<'a>(
     let mut seen_patterns: HashSet<usize> = HashSet::new();
     let total_patterns = patterns_vec.len();
 
-    let iter = cursor.iter_start();
+    // A fresh cursor's `iter` starts at the first item and returns an empty
+    // iterator for an empty database. `iter_start` unwraps MDB_NOTFOUND.
+    let iter = cursor.iter();
     for (key_bytes, value_bytes) in iter {
         let last_slash_pos = key_bytes.iter().rposition(|&b| b == b'/');
 
@@ -1844,6 +1822,48 @@ fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
     let mut binary = OwnedBinary::new(bytes.len()).ok_or(Error::BadArg)?;
     binary.as_mut_slice().copy_from_slice(bytes);
     Ok(binary.release(env).encode(env))
+}
+
+fn add_list_child(
+    children: &mut Vec<Vec<u8>>,
+    key: &[u8],
+    prefix: &[u8],
+    prefix_len: usize,
+) -> bool {
+    if !key.starts_with(prefix) {
+        return false;
+    }
+
+    let remaining = &key[prefix_len..];
+    if remaining.is_empty() {
+        return true;
+    }
+
+    let next_component = if let Some(sep_pos) = remaining.iter().position(|&b| b == b'/') {
+        &remaining[..sep_pos]
+    } else {
+        remaining
+    };
+    if next_component.is_empty() {
+        return true;
+    }
+
+    let component_exists = if children.len() < 16 {
+        children
+            .iter()
+            .any(|existing| existing.as_slice() == next_component)
+    } else {
+        children.binary_search_by(|existing| existing.as_slice().cmp(next_component)).is_ok()
+    };
+    if !component_exists {
+        let component_vec = next_component.to_vec();
+        if children.len() < 16 {
+            children.push(component_vec);
+        } else if let Err(pos) = children.binary_search(&component_vec) {
+            children.insert(pos, component_vec);
+        }
+    }
+    true
 }
 
 fn raw_key_has_prefix(key: &ffi::MDB_val, prefix: &[u8]) -> bool {

@@ -185,13 +185,21 @@ list_operations_test_() ->
                      
                      % List non-existent prefix
                      ?assertEqual(not_found, elmdb:list(DB, <<"nonexistent/">>))
-                 end),
-          
-          % Skip empty database test due to lmdb-rs panic issue
-         {"Empty database list", 
-           ?_test(begin
-                      skip
-                  end)}
+                 end)
+         ]
+     end}.
+
+empty_database_scans_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     fun({_Dir, _Env, DB}) ->
+         [
+          ?_assertEqual(not_found, elmdb:list(DB, <<"missing/">>)),
+          ?_assertEqual(
+              not_found,
+              elmdb:match(DB, [{<<"field">>, <<"value">>}])
+          )
          ]
      end}.
 
