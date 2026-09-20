@@ -1635,14 +1635,29 @@ fn list_from<'a>(
         }
     };
 
-    // Land on the first key of the walk. Forward, the first key at or after
-    // `prefix ++ from`. Backward, the last key below the zone in which a
-    // component at or before `from` can still sort: that of the shortest
-    // prefix of `from` followed by a byte below `/`, whose subtree sorts
-    // above the siblings extending it, or of `from` itself; an empty `from`
-    // lands on the last key under the prefix.
+    // An implicit parent's subtree can sort above `from` while its name
+    // sorts below it. Probe those parents before seeking backward directly
+    // to the bound, rather than walking every intervening sibling.
     let prefix_len = prefix_bytes.len();
     let from_bytes = from.as_slice();
+    let mut children: Vec<Vec<u8>> = Vec::new();
+    if backward {
+        let end = from_bytes.iter().position(|&b| b == b'/').unwrap_or(from_bytes.len());
+        for i in (1..=end).rev() {
+            if i == from_bytes.len() || from_bytes[i] <= b'/' {
+                let target = [prefix_bytes, &from_bytes[..i], b"/"].concat();
+                if let Ok((Some(key), _)) = cursor.get(Some(&target), None, MDB_SET_RANGE) {
+                    if key.starts_with(&target) {
+                        children.push(from_bytes[..i].to_vec());
+                        if limit == Some(children.len()) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Empty bounds start at the corresponding end of the prefix.
     let landed: Option<Vec<u8>> = if !backward {
         let mut target = prefix_bytes.to_vec();
         target.extend_from_slice(from_bytes);
@@ -1654,16 +1669,13 @@ fn list_from<'a>(
         let bound = if from_bytes.is_empty() {
             prefix_successor(prefix_bytes)
         } else {
-            let cut = (1..from_bytes.len())
-                .find(|&i| from_bytes[i] < b'/')
-                .unwrap_or(from_bytes.len());
-            let mut bound = prefix_bytes.to_vec();
-            bound.extend_from_slice(&from_bytes[..cut]);
-            bound.push(b'0');
-            Some(bound)
+            Some([prefix_bytes, from_bytes].concat())
         };
         let landing = match bound {
             Some(bound) => match cursor.get(Some(bound.as_slice()), None, MDB_SET_RANGE) {
+                Ok((Some(key), value)) if !from_bytes.is_empty() && key == bound => {
+                    Ok((Some(key), value))
+                }
                 Ok(_) => cursor.get(None, None, MDB_PREV),
                 Err(_) => cursor.get(None, None, MDB_LAST),
             },
@@ -1685,7 +1697,6 @@ fn list_from<'a>(
     // extensions sort. The rest of a subtree names nothing new: it is
     // skipped.
     let step = if backward { MDB_PREV } else { MDB_NEXT };
-    let mut children: Vec<Vec<u8>> = Vec::new();
     let mut zone: Option<Vec<u8>> = None;
     let mut current = landed;
     while let Some(key) = current {
@@ -1743,6 +1754,7 @@ fn list_from<'a>(
                                         && i < last.len()
                                         && component[i] < b'/'
                                         && last[i] < b'/'
+                                        && &component[..i] >= from_bytes
                                 })
                                 .map(|i| {
                                     let mut zone = prefix_bytes.to_vec();

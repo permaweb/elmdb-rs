@@ -126,6 +126,75 @@ positioned_list_test_() ->
 %%% Basic Operation Tests
 %%%===================================================================
 
+%% @doc Cursor bounds apply to child names, including implicit parents.
+positioned_child_order_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+        fun({_Dir, _Env, DB}) ->
+            ?_test(begin
+                Children = lists:sort([
+                    <<"a">>, <<"a!">>, <<"a-x">>, <<"a-x!">>,
+                    <<"a-x-y">>, <<"a-x.y">>, <<"a.x">>, <<"a0">>,
+                    <<"b">>, <<"b!">>, <<"b-x">>, <<"b-x.y">>, <<255>>
+                ]),
+                ok = elmdb:put_batch(DB,
+                    [{<<"order/", K/binary, "/child">>, <<>>} || K <- Children]),
+                lists:foreach(
+                    fun({From, Direction, Limit}) ->
+                        Eligible = [K || K <- Children,
+                            From =:= <<>> orelse
+                                (Direction =:= forward andalso K >= From) orelse
+                                (Direction =:= backward andalso K =< From)],
+                        Ordered = case Direction of
+                            forward -> Eligible;
+                            backward -> lists:reverse(Eligible)
+                        end,
+                        Expected = case Limit of
+                            N when is_integer(N) -> lists:sublist(Ordered, N);
+                            _ -> Ordered
+                        end,
+                        ?assertEqual({ok, Expected}, elmdb:list(DB, <<"order/">>,
+                            [{from, From}, {direction, Direction}, {limit, Limit}]))
+                    end,
+                    [{From, Direction, Limit}
+                        || From <- [<<>>, <<"0">>, <<"a-x-y!">>, <<"a/child">>,
+                               <<"a-x/">>, <<"zz">> | Children],
+                           Direction <- [forward, backward],
+                           Limit <- [0, 1, 2, 3, 7, all, batch]]
+                )
+            end)
+        end}.
+
+%% @doc A bounded seek must not scan the rest of a punctuation-prefixed index.
+positioned_list_cost_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+        fun({_Dir, _Env, DB}) ->
+            {timeout, 30, fun() ->
+                Key = fun(N) ->
+                    iolist_to_binary(io_lib:format("part-name=~8..0B", [N]))
+                end,
+                ok = elmdb:put_batch(DB,
+                    [{<<"cost/", (Key(N))/binary>>, <<>>}
+                        || N <- lists:seq(1, 50000)]),
+                ok = elmdb:flush(DB),
+                lists:foreach(fun(Direction) ->
+                    At = Key(25000),
+                    <<"part-name=", Suffix/binary>> = At,
+                    Run = fun(Prefix, From, Expected) ->
+                        timer:tc(fun() ->
+                            lists:foreach(fun(_) ->
+                                ?assertEqual({ok, [Expected]}, elmdb:list(DB, Prefix,
+                                    [{from, From}, {direction, Direction}, {limit, 1}]))
+                            end, lists:seq(1, 64))
+                        end)
+                    end,
+                    {Control, _} = Run(<<"cost/part-name=">>, Suffix, Suffix),
+                    {Bounded, _} = Run(<<"cost/">>, At, At),
+                    ?assert(Bounded < Control * 20 + 20000,
+                        {Direction, Bounded, Control})
+                end, [forward, backward])
+            end}
+        end}.
+
 basic_operations_test_() ->
     {setup,
      fun setup/0,
