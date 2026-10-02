@@ -251,12 +251,47 @@ lazy_static::lazy_static! {
         Arc::new(Mutex::new(HashMap::new()));
 }
 
+// Rustler's `enif_set_option` takes no variadic argument, so it cannot pass
+// the `ERL_NIF_OPT_ON_HALT` callback.
+extern "C" {
+    fn enif_set_option(
+        env: *mut rustler::sys::ErlNifEnv,
+        opt: rustler::sys::ErlNifOption,
+        ...
+    ) -> std::ffi::c_int;
+}
+
 /// Initialize the NIF module
 ///
-/// Registers resource types with the Erlang runtime.
+/// Registers resource types with the Erlang runtime, and `on_halt` with the
+/// runtime system.
 /// This function is called automatically when the NIF is loaded.
 fn init(env: Env, _info: Term) -> bool {
-    rustler::resource!(LmdbEnv, env) && rustler::resource!(LmdbDatabase, env)
+    rustler::resource!(LmdbEnv, env)
+        && rustler::resource!(LmdbDatabase, env)
+        && unsafe {
+            enif_set_option(
+                env.as_c_arg(),
+                rustler::sys::ErlNifOption::ERL_NIF_OPT_ON_HALT,
+                on_halt as extern "C" fn(*mut std::ffi::c_void),
+            )
+        } == 0
+}
+
+/// Close every open environment, after its database flushes its buffered
+/// writes, when the VM halts with flushing (`erlang:halt/0,1`, `init:stop/0`).
+/// LMDB unlinks an environment's two named semaphores (macOS and BSD) only
+/// when the environment closes; otherwise they outlive the VM. An
+/// environment that an operation still holds stays open.
+extern "C" fn on_halt(_priv_data: *mut std::ffi::c_void) {
+    if let (Ok(environments), Ok(databases)) = (ENVIRONMENTS.lock(), DATABASES.lock()) {
+        for (path, env_handle) in environments.iter() {
+            if let Some(db_handle) = databases.get(path) {
+                let _ = soft_close_db(db_handle);
+            }
+            let _ = env_handle.request_close();
+        }
+    }
 }
 
 fn new_overlay_map() -> OverlayMap {
