@@ -1201,19 +1201,15 @@ fn get<'a>(
         }
     }
 
-    if db_handle.has_fatal_error.load(Ordering::Relaxed) {
-        if let Ok(guard) = db_handle.fatal_error.lock() {
-            if let Some(ref err) = *guard {
-                return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
-            }
-        }
-    }
+    // After a failed flush the overlay holds writes that were not committed:
+    // read only the committed data.
+    let failed = db_handle.has_fatal_error.load(Ordering::Relaxed);
 
     let key_bytes = key.as_slice();
 
     // Fast path: skip overlay checks if both maps are empty
     let active_guard = db_handle.active.load();
-    if !active_guard.is_empty() {
+    if !failed && !active_guard.is_empty() {
         if let Some(value) = active_guard.read_sync(key_bytes, |_, v| v.clone()) {
             let mut binary = OwnedBinary::new(value.len()).ok_or(Error::BadArg)?;
             binary.as_mut_slice().copy_from_slice(&value);
@@ -1221,7 +1217,7 @@ fn get<'a>(
         }
     }
 
-    {
+    if !failed {
         let draining_guard = db_handle.draining.load();
         if let Some(ref old_map) = **draining_guard {
             if let Some(value) = old_map.read_sync(key_bytes, |_, v| v.clone()) {
@@ -1374,9 +1370,8 @@ fn iterator_next<'a>(
     let active_empty = db_handle.active.load().is_empty();
     let draining_empty = db_handle.draining.load().is_none();
     if !active_empty || !draining_empty {
-        if let Err(error_msg) = flush_sync(&db_handle) {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
-        }
+        // A failed flush fails later writes, not this read.
+        let _ = flush_sync(&db_handle);
     }
 
     let (live_env, live_db) = match db_handle.fast_get_handles() {
@@ -1494,9 +1489,8 @@ fn list<'a>(
     let active_empty = db_handle.active.load().is_empty();
     let draining_empty = db_handle.draining.load().is_none();
     if !active_empty || !draining_empty {
-        if let Err(error_msg) = flush_sync(&db_handle) {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
-        }
+        // A failed flush fails later writes, not this read.
+        let _ = flush_sync(&db_handle);
     }
 
     let (live_env, live_db) = match db_handle.fast_get_handles() {
@@ -1634,9 +1628,8 @@ fn list_from<'a>(
     let active_empty = db_handle.active.load().is_empty();
     let draining_empty = db_handle.draining.load().is_none();
     if !active_empty || !draining_empty {
-        if let Err(error_msg) = flush_sync(&db_handle) {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
-        }
+        // A failed flush fails later writes, not this read.
+        let _ = flush_sync(&db_handle);
     }
 
     let (live_env, live_db) = match db_handle.fast_get_handles() {
@@ -1861,9 +1854,8 @@ fn read_prefix_rows<'a>(
     let active_empty = db_handle.active.load().is_empty();
     let draining_empty = db_handle.draining.load().is_none();
     if !active_empty || !draining_empty {
-        if let Err(error_msg) = flush_sync(&db_handle) {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
-        }
+        // A failed flush fails later writes, not this read.
+        let _ = flush_sync(&db_handle);
     }
 
     let (live_env, live_db) = match db_handle.fast_get_handles() {
@@ -2026,9 +2018,8 @@ fn match_pattern<'a>(
     let active_empty = db_handle.active.load().is_empty();
     let draining_empty = db_handle.draining.load().is_none();
     if !active_empty || !draining_empty {
-        if let Err(error_msg) = flush_sync(&db_handle) {
-            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
-        }
+        // A failed flush fails later writes, not this read.
+        let _ = flush_sync(&db_handle);
     }
 
     let (live_env, live_db) = match db_handle.fast_get_handles() {

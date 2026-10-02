@@ -1272,7 +1272,7 @@ flush_sync_waiter_on_worker_death_test_() ->
                     receive {'DOWN', Ref, process, _, _} -> ok after 1000 -> ok end
                 end, Flushers),
 
-                ?assertMatch({error, _, _}, elmdb:get(DB, <<"trigger_1">>)),
+                ?assertEqual(not_found, elmdb:get(DB, <<"trigger_1">>)),
 
                 _ = elmdb:db_close(DB),
                 _ = elmdb:env_close(Env),
@@ -1572,7 +1572,7 @@ flush_pending_resets_after_recovery_test_() ->
                     ok = elmdb:put(DB2, K, <<"v">>)
                 end, lists:seq(1, 6)),
                 timer:sleep(500),
-                ?assertMatch({error, _, _}, elmdb:get(DB2, <<"fp_1">>)),
+                ?assertEqual(not_found, elmdb:get(DB2, <<"fp_1">>)),
 
                 _ = elmdb:db_close(DB2),
                 _ = elmdb:env_close(Env),
